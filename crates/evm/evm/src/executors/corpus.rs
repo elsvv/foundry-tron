@@ -2676,12 +2676,12 @@ mod tests {
             EdgeKey { address: Address::ZERO, depth: None, pc: 0, jump_dest: U256::from(10) };
 
         // First-time edge starts the timer.
-        assert!(manager.merge_edge_coverage(&mut edge_call(edge, 1)));
+        assert!(manager.merge_edge_coverage_with_edges_into(&mut edge_call(edge, 1), &mut vec![]));
         let first = manager.last_new_edge_at.expect("timer set after first new edge");
         assert_eq!(manager.metrics.cumulative_edges_seen, 1);
 
         // Same edge, higher bucket = a feature, not an edge: timer must not advance.
-        assert!(manager.merge_edge_coverage(&mut edge_call(edge, 8)));
+        assert!(manager.merge_edge_coverage_with_edges_into(&mut edge_call(edge, 8), &mut vec![]));
         assert_eq!(manager.last_new_edge_at, Some(first));
         assert_eq!(manager.metrics.cumulative_edges_seen, 1);
         assert_eq!(manager.metrics.cumulative_features_seen, 1);
@@ -2689,7 +2689,7 @@ mod tests {
         // A distinct edge advances the timer.
         let other =
             EdgeKey { address: Address::ZERO, depth: None, pc: 1, jump_dest: U256::from(20) };
-        assert!(manager.merge_edge_coverage(&mut edge_call(other, 1)));
+        assert!(manager.merge_edge_coverage_with_edges_into(&mut edge_call(other, 1), &mut vec![]));
         let second = manager.last_new_edge_at.expect("timer present");
         assert!(second >= first);
         assert_eq!(manager.metrics.cumulative_edges_seen, 2);
