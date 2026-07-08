@@ -3,10 +3,6 @@ name: Foundry Benchmarks
 permissions: {}
 
 on:
-  # Comment "derek bench" on a PR to compare it against a source-built master
-  # baseline (authorized maintainers only).
-  issue_comment:
-    types: [created]
   workflow_dispatch:
     inputs:
       versions:
