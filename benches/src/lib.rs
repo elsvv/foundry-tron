@@ -820,8 +820,8 @@ pub fn switch_foundry_version(version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build and activate the local workspace resolved from
-/// [`WORKSPACE_ROOT_ENV`] (or the compiled-in default).
+/// Build and activate the local workspace resolved from the
+/// `FOUNDRY_BENCH_WORKSPACE_ROOT` env var (or the compiled-in default).
 pub fn install_local_version() -> Result<()> {
     install_local_workspace(&workspace_root()?)
 }

@@ -196,18 +196,29 @@ inconclusive.
 
 ### Automated PR comments
 
-The [Foundry Benchmarks workflow](../../.github/workflows/benchmarks.yml)
-(`workflow_dispatch`) posts this comparison directly to a PR when its `versions`
-input includes `local` (the default is `master,local`, where `master` is built
-from source at the merge-base of `HEAD` and `origin/master`). Each benchmark step
-writes a per-version JSON summary (`<file>-<version>.json`); the workflow merges
-them into `base-summary.json` and `candidate-summary.json`, runs
-`compare-bench.sh`, and then
+The [Foundry Benchmarks workflow](../../.github/workflows/benchmarks.yml) posts
+this comparison directly to a PR. It is triggered two ways:
+
+- **Comment `derek bench` on a PR.** An authorized maintainer (org
+  `OWNER`/`MEMBER`/`COLLABORATOR`) comments `derek bench`; the workflow posts a
+  "queued" acknowledgement, benchmarks the PR head against a source-built
+  `master` baseline, and updates that same comment with the results.
+- **`workflow_dispatch`.** Run it manually; when `versions` includes `local`
+  (the default is `master,local`) it resolves the open PR for the dispatched
+  branch and comments there.
+
+In both cases `master` is built from source at the merge-base of the PR head and
+`origin/master`. Each benchmark step writes a per-version JSON summary
+(`<file>-<version>.json`); the workflow merges them into `base-summary.json` and
+`candidate-summary.json`, runs `compare-bench.sh`, and then
 [`post-bench-comment.sh`](../../.github/scripts/post-bench-comment.sh) publishes
-a single **sticky** comment (updated in place on re-runs). The comment leads with
-the regression/improvement table, links back to the workflow run, and keeps the
-full absolute-time tables in a dropdown. A dashboard-run link is included when
-`DASHBOARD_URL` is provided.
+a single **sticky** comment (updated in place on re-runs, keyed by a hidden
+marker). The comment leads with the regression/improvement table, links back to
+the workflow run, and keeps the full absolute-time tables in a dropdown. A
+dashboard-run link is included when `DASHBOARD_URL` is provided.
+
+Omit `local` on a `workflow_dispatch` run (e.g. `versions=stable,nightly`) to
+track released versions and commit results instead of commenting.
 
 ## Running scfuzzbench Campaigns
 

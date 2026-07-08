@@ -3,6 +3,10 @@ name: Foundry Benchmarks
 permissions: {}
 
 on:
+  # Comment "derek bench" on a PR to compare it against a source-built master
+  # baseline (authorized maintainers only).
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       versions:
@@ -57,8 +61,107 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
+  # Gate and resolve the request for both triggers. For a "derek bench" PR
+  # comment this authorizes the commenter, resolves the PR head to benchmark,
+  # and posts a queued acknowledgement that the results run later updates in
+  # place. No third-party code runs here, so it can hold write scope.
+  authorize:
+    name: Authorize request
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && startsWith(github.event.comment.body, 'derek bench'))
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      versions: ${{ steps.req.outputs.versions }}
+      repos: ${{ steps.req.outputs.repos }}
+      baseline_ref: ${{ steps.req.outputs.baseline_ref }}
+      checkout_ref: ${{ steps.req.outputs.checkout_ref }}
+      pr_number: ${{ steps.req.outputs.pr_number }}
+      actor: ${{ steps.req.outputs.actor }}
+    steps:
+      # Base repo default branch only; never the PR head in this write-scoped job.
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check commenter permissions
+        if: github.event_name == 'issue_comment'
+        env:
+          ASSOC: ${{ github.event.comment.author_association }}
+          ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          case "$ASSOC" in
+            OWNER | MEMBER | COLLABORATOR)
+              echo "@$ACTOR is authorized ($ASSOC)." ;;
+            *)
+              echo "::error::@$ACTOR ($ASSOC) is not allowed to trigger benchmarks." >&2
+              exit 1 ;;
+          esac
+
+      - name: Resolve request
+        id: req
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          DEFAULT_VERSIONS: ${{ env.DEFAULT_VERSIONS }}
+          IN_VERSIONS: ${{ github.event.inputs.versions }}
+          IN_BASELINE: ${{ github.event.inputs.baseline_ref }}
+          IN_REPOS: ${{ github.event.inputs.repos }}
+          DISPATCH_REF: ${{ github.ref_name }}
+          DISPATCH_SHA: ${{ github.sha }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          if [ "$EVENT" = "issue_comment" ]; then
+            # Comment triggers always compare the PR head against master.
+            versions="$DEFAULT_VERSIONS"
+            baseline=""
+            repos=""
+            pr_number="$ISSUE_NUMBER"
+            actor="$COMMENT_ACTOR"
+            checkout_ref="refs/pull/${ISSUE_NUMBER}/head"
+          else
+            versions="${IN_VERSIONS:-$DEFAULT_VERSIONS}"
+            baseline="${IN_BASELINE:-}"
+            repos="${IN_REPOS:-}"
+            checkout_ref="$DISPATCH_SHA"
+            owner="${GH_REPO%%/*}"
+            pr_json="$(gh api --method GET "repos/${GH_REPO}/pulls" \
+              -f state=open -f "head=${owner}:${DISPATCH_REF}" --jq '.[0]')"
+            pr_number="$(printf '%s' "$pr_json" | jq -r '.number // empty')"
+            actor="$(printf '%s' "$pr_json" | jq -r '.user.login // empty')"
+          fi
+          {
+            echo "versions=$versions"
+            echo "baseline_ref=$baseline"
+            echo "repos=$repos"
+            echo "checkout_ref=$checkout_ref"
+            echo "pr_number=$pr_number"
+            echo "actor=$actor"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post queued acknowledgement
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.req.outputs.pr_number }}
+          ACTOR: ${{ steps.req.outputs.actor }}
+          JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_PREFIX: "⏳ Benchmark queued…"
+          CONFIG: "trigger=comment; versions=${{ steps.req.outputs.versions }}"
+        run: ./.github/scripts/post-bench-comment.sh
+
   run-benchmarks:
     name: Run All Benchmarks
+    needs: authorize
     runs-on: depot-ubuntu-24.04-32
     # Source-built baseline/candidate use the profiling profile, forge only.
     env:
@@ -70,6 +173,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # The PR head (comment trigger) or dispatched ref, resolved upstream.
+          ref: ${{ needs.authorize.outputs.checkout_ref }}
           persist-credentials: false
           # Full history so the baseline merge-base can be resolved.
           fetch-depth: 0
@@ -111,8 +216,8 @@ jobs:
       - name: Prepare comparison
         id: prep
         env:
-          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
-          BASELINE_REF_INPUT: ${{ github.event.inputs.baseline_ref }}
+          VERSIONS: ${{ needs.authorize.outputs.versions }}
+          BASELINE_REF_INPUT: ${{ needs.authorize.outputs.baseline_ref }}
         run: |
           if printf '%s' "$VERSIONS" | grep -q 'local'; then
             git fetch --no-tags origin master:refs/remotes/origin/master
@@ -132,7 +237,7 @@ jobs:
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
           VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ github.event.inputs.repos || env.TEST_REPOS }}
+          REPOS: ${{ needs.authorize.outputs.repos || env.TEST_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches --force-install \
             --versions "$VERSIONS" \
@@ -146,7 +251,7 @@ jobs:
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
           VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ github.event.inputs.repos || env.ISOLATE_TEST_REPOS }}
+          REPOS: ${{ needs.authorize.outputs.repos || env.ISOLATE_TEST_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
             --versions "$VERSIONS" \
@@ -175,7 +280,7 @@ jobs:
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
           VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ github.event.inputs.repos || env.BUILD_REPOS }}
+          REPOS: ${{ needs.authorize.outputs.repos || env.BUILD_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
             --versions "$VERSIONS" \
@@ -189,7 +294,7 @@ jobs:
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
           VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ github.event.inputs.repos || env.COVERAGE_REPOS }}
+          REPOS: ${{ needs.authorize.outputs.repos || env.COVERAGE_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
             --versions "$VERSIONS" \
@@ -205,7 +310,7 @@ jobs:
       # Branch runs: merge the per-version summaries into baseline/candidate
       # files for the publish job to diff.
       - name: Merge per-version JSON summaries
-        if: contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')
+        if: contains(needs.authorize.outputs.versions, 'local')
         env:
           BASELINE_REF: ${{ steps.prep.outputs.baseline_ref }}
         run: |
@@ -242,7 +347,7 @@ jobs:
 
   publish-results:
     name: Publish Results
-    needs: run-benchmarks
+    needs: [authorize, run-benchmarks]
     runs-on: ubuntu-latest
     # All git writes happen here, on a clean ubuntu-latest runner that has
     # never executed third-party benchmark code.
@@ -264,7 +369,7 @@ jobs:
 
       - name: Commit benchmark results
         id: commit_results
-        if: "!contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')"
+        if: "!contains(needs.authorize.outputs.versions, 'local')"
         env:
           GITHUB_HEAD_REF: ${{ github.head_ref }}
         run: ./.github/scripts/commit-benchmark-results.sh benches "${{ github.event_name }}" "${{ github.repository }}"
@@ -295,44 +400,20 @@ jobs:
 
             console.log(`Created PR #${pr.number}: ${pr.html_url}`);
 
-      # Resolve the open PR for this branch (owner-qualified) and its author.
-      - name: Resolve PR number
-        id: pr
-        if: contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          OWNER="${GH_REPO%%/*}"
-          BRANCH="${GITHUB_REF#refs/heads/}"
-          PR_JSON="$(gh api --method GET "repos/${GH_REPO}/pulls" \
-            -f state=open -f "head=${OWNER}:${BRANCH}" --jq '.[0]')"
-          PR_NUMBER="$(printf '%s' "$PR_JSON" | jq -r '.number // empty')"
-          if [ -z "$PR_NUMBER" ]; then
-            echo "No open PR found for '${OWNER}:${BRANCH}', skipping comment."
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          else
-            PR_AUTHOR="$(printf '%s' "$PR_JSON" | jq -r '.user.login // empty')"
-            {
-              echo "found=true"
-              echo "number=$PR_NUMBER"
-              echo "author=$PR_AUTHOR"
-            } >> "$GITHUB_OUTPUT"
-          fi
-
-      # Diff the summaries and post the report as a sticky PR comment.
+      # Diff the summaries and post (or update the queued ack) as a sticky
+      # comment on the PR resolved by the authorize job.
       - name: Post benchmark summary to PR
         if: >-
-          contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')
-          && steps.pr.outputs.found == 'true'
+          contains(needs.authorize.outputs.versions, 'local')
+          && needs.authorize.outputs.pr_number != ''
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
           JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          ACTOR: ${{ steps.pr.outputs.author }}
-          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
-          REPOS: ${{ github.event.inputs.repos || 'per-benchmark defaults' }}
+          ACTOR: ${{ needs.authorize.outputs.actor }}
+          VERSIONS: ${{ needs.authorize.outputs.versions }}
+          REPOS: ${{ needs.authorize.outputs.repos || 'per-benchmark defaults' }}
           BASE_LABEL: master
           CANDIDATE_LABEL: this PR
         run: |
