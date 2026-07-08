@@ -206,6 +206,8 @@ jobs:
       # files for the publish job to diff.
       - name: Merge per-version JSON summaries
         if: contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')
+        env:
+          BASELINE_REF: ${{ steps.prep.outputs.baseline_ref }}
         run: |
           shopt -s nullglob
           base_parts=( benches/*_bench-master.json )
@@ -218,7 +220,7 @@ jobs:
             jq -s 'add' "${cand_parts[@]}" > benches/candidate-summary.json
             echo "Merged ${#cand_parts[@]} candidate summary file(s)."
           fi
-          printf '%s\n' "${{ steps.prep.outputs.baseline_ref }}" > benches/baseline-ref.txt
+          printf '%s\n' "$BASELINE_REF" > benches/baseline-ref.txt
 
       - name: Print benchmark results
         run: cat benches/LATEST.md
