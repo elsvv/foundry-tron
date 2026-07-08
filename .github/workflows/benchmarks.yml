@@ -312,9 +312,12 @@ jobs:
             echo "No open PR found for '${OWNER}:${BRANCH}', skipping comment."
             echo "found=false" >> "$GITHUB_OUTPUT"
           else
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-            echo "author=$(printf '%s' "$PR_JSON" | jq -r '.user.login // empty')" >> "$GITHUB_OUTPUT"
+            PR_AUTHOR="$(printf '%s' "$PR_JSON" | jq -r '.user.login // empty')"
+            {
+              echo "found=true"
+              echo "number=$PR_NUMBER"
+              echo "author=$PR_AUTHOR"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       # Diff the summaries and post the report as a sticky PR comment.
