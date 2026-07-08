@@ -34,6 +34,8 @@ pub struct SymbolicConfig {
     pub enabled: bool,
     /// Whether fuzz tests should be symbolically concretized into fuzz corpus seeds.
     pub seed_corpus: bool,
+    /// Whether fuzz tests should race one symbolic worker against generated fuzz inputs.
+    pub fuzz_worker: bool,
     /// Whether fuzz corpus seeds should guide symbolic fuzz-test exploration.
     pub use_fuzz_corpus: bool,
     /// Maximum number of fuzz corpus seeds to import for one symbolic run.
@@ -111,6 +113,7 @@ impl Default for SymbolicConfig {
         Self {
             enabled: false,
             seed_corpus: false,
+            fuzz_worker: false,
             use_fuzz_corpus: false,
             corpus_seed_limit: 32,
             use_fuzz_frontiers: false,
@@ -171,6 +174,7 @@ mod tests {
         let value = serde_json::json!({
             "enabled": false,
             "seed_corpus": false,
+            "fuzz_worker": false,
             "use_fuzz_corpus": false,
             "corpus_seed_limit": 32,
             "use_fuzz_frontiers": false,

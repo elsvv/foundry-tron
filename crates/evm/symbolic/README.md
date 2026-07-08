@@ -103,6 +103,14 @@ forge test --symbolic-seed-corpus --fuzz-corpus-dir fuzz_corpus
 Forge symbolically executes matching fuzz tests, reuses their normal corpus
 layout, and writes a successful concrete input as a seed for later fuzz runs.
 
+For hard fuzz predicates, Forge can also race one symbolic worker against the
+normal fuzz campaign and report a replay-confirmed symbolic counterexample as a
+fuzz failure if the worker finds one first:
+
+```sh
+forge test --match-test test_hard_branch --symbolic-fuzz-worker
+```
+
 Symbolic execution can import the same Foundry fuzz corpus as path-priority
 hints for fuzz tests:
 

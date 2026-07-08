@@ -34,7 +34,7 @@ use serde_json::json;
 use std::{
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -135,10 +135,17 @@ struct SharedFuzzState {
     global_early_exit: EarlyExit,
     /// Local fuzz early exit.
     local_early_exit: EarlyExit,
+    /// External stop flag for callers that race fuzzing with another worker.
+    external_stop: Option<Arc<AtomicBool>>,
 }
 
 impl SharedFuzzState {
-    fn new(state: EvmFuzzState, timeout: Option<u32>, early_exit: EarlyExit) -> Self {
+    fn new(
+        state: EvmFuzzState,
+        timeout: Option<u32>,
+        early_exit: EarlyExit,
+        external_stop: Option<Arc<AtomicBool>>,
+    ) -> Self {
         Self {
             state,
             total_runs: Arc::new(AtomicU32::new(0)),
@@ -148,6 +155,7 @@ impl SharedFuzzState {
             global_corpus_metrics: GlobalCorpusMetrics::default(),
             global_early_exit: early_exit,
             local_early_exit: EarlyExit::new(true),
+            external_stop,
         }
     }
 
@@ -165,6 +173,7 @@ impl SharedFuzzState {
     fn should_continue(&self) -> bool {
         !(self.global_early_exit.should_stop()
             || self.local_early_exit.should_stop()
+            || self.external_stop.as_ref().is_some_and(|stop| stop.load(Ordering::Relaxed))
             || self.timer.is_timed_out())
     }
 
@@ -237,9 +246,11 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
         rd: &RevertDecoder,
         progress: Option<&ProgressBar>,
         early_exit: &EarlyExit,
+        external_stop: Option<Arc<AtomicBool>>,
         tokio_handle: &tokio::runtime::Handle,
     ) -> Result<FuzzTestResult> {
-        let shared_state = SharedFuzzState::new(state, self.config.timeout, early_exit.clone());
+        let shared_state =
+            SharedFuzzState::new(state, self.config.timeout, early_exit.clone(), external_stop);
 
         let worker_ids = self.worker_ids();
         debug!(n = worker_ids.len(), "spawning workers");

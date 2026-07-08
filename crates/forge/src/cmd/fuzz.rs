@@ -44,7 +44,13 @@ impl FuzzArgs {
     pub async fn run(self) -> Result<TestOutcome> {
         match self.command {
             FuzzSubcommands::Run(args) => TestArgs::from_fuzz_run(args).run().await,
-            FuzzSubcommands::Replay(args) => args.run().await,
+            FuzzSubcommands::Replay(args) => {
+                Box::pin(async move {
+                    let args = *args;
+                    args.run().await
+                })
+                .await
+            }
             FuzzSubcommands::Show(args) => {
                 args.run()?;
                 Ok(TestOutcome::empty(None, true))
@@ -75,7 +81,7 @@ pub enum FuzzSubcommands {
     /// Run only fuzz and invariant tests.
     Run(FuzzRunArgs),
     /// Replay persisted fuzz failures, or corpus entries with `--corpus-dir`.
-    Replay(FuzzReplayArgs),
+    Replay(Box<FuzzReplayArgs>),
     /// Print persisted corpus entries.
     Show(FuzzShowArgs),
     /// Minimize a corpus by keeping entries that contribute new coverage.

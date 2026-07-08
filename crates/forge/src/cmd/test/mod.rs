@@ -814,6 +814,10 @@ pub struct TestArgs {
     #[arg(long, env = "FOUNDRY_SYMBOLIC_SEED_CORPUS")]
     pub symbolic_seed_corpus: bool,
 
+    /// Race one symbolic worker against generated fuzz inputs.
+    #[arg(long, env = "FOUNDRY_SYMBOLIC_FUZZ_WORKER")]
+    pub symbolic_fuzz_worker: bool,
+
     /// Run fuzz tests symbolically using existing fuzz corpus entries as path-priority hints.
     #[arg(long, env = "FOUNDRY_SYMBOLIC_USE_FUZZ_CORPUS")]
     pub symbolic_use_fuzz_corpus: bool,
@@ -3276,6 +3280,9 @@ impl Provider for TestArgs {
         if self.symbolic_seed_corpus {
             symbolic_dict.insert("seed_corpus".to_string(), true.into());
         }
+        if self.symbolic_fuzz_worker {
+            symbolic_dict.insert("fuzz_worker".to_string(), true.into());
+        }
         if self.symbolic_use_fuzz_corpus {
             symbolic_dict.insert("use_fuzz_corpus".to_string(), true.into());
         }
@@ -4136,6 +4143,7 @@ mod tests {
             "3",
             "--fuzz-mutation-weight-cmp",
             "5",
+            "--symbolic-fuzz-worker",
             "--symbolic-use-fuzz-frontiers",
             "--symbolic-frontier-limit",
             "3",
@@ -4201,6 +4209,7 @@ mod tests {
         assert_eq!(figment.extract_inner::<u32>("fuzz.mutation_weight_splice").unwrap(), 4);
         assert_eq!(figment.extract_inner::<u32>("fuzz.mutation_weight_abi").unwrap(), 3);
         assert_eq!(figment.extract_inner::<u32>("fuzz.mutation_weight_cmp").unwrap(), 5);
+        assert!(figment.extract_inner::<bool>("symbolic.fuzz_worker").unwrap());
         assert!(figment.extract_inner::<bool>("symbolic.use_fuzz_frontiers").unwrap());
         assert_eq!(figment.extract_inner::<usize>("symbolic.frontier_limit").unwrap(), 3);
         assert_eq!(figment.extract_inner::<Vec<u64>>("symbolic.frontier_ids").unwrap(), vec![4, 9]);
@@ -4256,6 +4265,7 @@ mod tests {
         assert_eq!(config.fuzz.corpus.mutation_weights.mutation_weight_splice, 4);
         assert_eq!(config.fuzz.corpus.mutation_weights.mutation_weight_abi, 3);
         assert_eq!(config.fuzz.corpus.mutation_weights.mutation_weight_cmp, 5);
+        assert!(config.symbolic.fuzz_worker);
         assert!(config.symbolic.use_fuzz_frontiers);
         assert_eq!(config.symbolic.frontier_limit, 3);
         assert_eq!(config.symbolic.frontier_ids, vec![4, 9]);

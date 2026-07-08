@@ -30,6 +30,7 @@ use foundry_common::{TestFunctionExt, TestFunctionKind, contracts::ContractsByAd
 use foundry_compilers::utils::canonicalized;
 use foundry_config::{
     Config, FuzzConfig, FuzzCorpusConfig, FuzzDictionaryConfig, InlineConfig, InvariantConfig,
+    SymbolicConfig,
 };
 use foundry_evm::{
     constants::{CALLER, CHEATCODE_ADDRESS, MAGIC_ASSUME},
@@ -72,7 +73,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Deref,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Instant,
 };
 use tokio::signal;
@@ -87,6 +91,10 @@ pub const LIBRARY_DEPLOYER: Address = address!("0x1F95D37F27EA0dEA9C252FC09D5A6e
 
 fn should_symbolically_seed_fuzz_corpus(config: &Config, func: &Function) -> bool {
     config.symbolic.seed_corpus && func.test_function_kind().is_fuzz_test()
+}
+
+fn should_run_symbolic_fuzz_worker(config: &Config, func: &Function) -> bool {
+    config.symbolic.fuzz_worker && func.test_function_kind().is_fuzz_test()
 }
 
 fn should_symbolically_import_fuzz_corpus(config: &Config, func: &Function) -> bool {
@@ -2912,6 +2920,99 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         if success { SymbolicFuzzSeedReplay::Success } else { SymbolicFuzzSeedReplay::Failure }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_symbolic_fuzz_worker(
+        executor: Executor<FEN>,
+        address: Address,
+        sender: Address,
+        symbolic_config: SymbolicConfig,
+        ffi_enabled: bool,
+        fuzz_config: FuzzConfig,
+        func: &Function,
+        rd: &RevertDecoder,
+        stop: Arc<AtomicBool>,
+    ) -> Option<FuzzTestResult> {
+        let mut symbolic = SymbolicExecutor::new(symbolic_config);
+        let result = symbolic.run(SymbolicRunInput {
+            executor: &executor,
+            target: address,
+            sender,
+            function: func,
+            value: U256::ZERO,
+            ffi_enabled,
+            collect_success_input: false,
+            corpus_seeds: Vec::new(),
+            branch_target: None,
+        });
+        let SymbolicRunResult::Counterexample { args, calldata, .. } = result else {
+            return None;
+        };
+
+        let Ok(raw_call_result) = executor.call_raw(sender, address, calldata.clone(), U256::ZERO)
+        else {
+            return None;
+        };
+        if raw_call_result.result.as_ref() == MAGIC_ASSUME {
+            return None;
+        }
+
+        let success = if !fuzz_config.fail_on_revert
+            && raw_call_result
+                .reverter
+                .is_some_and(|reverter| reverter != address && reverter != CHEATCODE_ADDRESS)
+        {
+            true
+        } else {
+            executor.is_raw_call_success(
+                address,
+                Cow::Borrowed(&raw_call_result.state_changeset),
+                &raw_call_result,
+                false,
+            )
+        };
+        if success {
+            return None;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+
+        let (breakpoints, deprecated_cheatcodes) =
+            raw_call_result.cheatcodes.as_ref().map_or_else(Default::default, |cheats| {
+                (cheats.breakpoints.clone(), cheats.deprecated.clone())
+            });
+        let reason = if raw_call_result.reverter == Some(CHEATCODE_ADDRESS) {
+            SkipReason::decode(&raw_call_result.result)
+                .map(|reason| reason.to_string())
+                .or_else(|| rd.maybe_decode(&raw_call_result.result, raw_call_result.exit_reason))
+        } else {
+            rd.maybe_decode(&raw_call_result.result, raw_call_result.exit_reason)
+        };
+        let traces = raw_call_result.traces.clone();
+        let debug_bytecodes = raw_call_result.debug_bytecodes.clone();
+        let logs = raw_call_result.logs.clone();
+        let labels = raw_call_result.labels.clone();
+        let line_coverage = raw_call_result.line_coverage.clone();
+        let gas_report_traces = traces.clone().into_iter().map(|trace| trace.arena).collect();
+        let counterexample =
+            BaseCounterExample::from_fuzz_call(calldata, args, raw_call_result.traces);
+
+        Some(FuzzTestResult {
+            success: false,
+            gas_by_case: vec![(raw_call_result.gas_used, raw_call_result.stipend)],
+            reason,
+            counterexample: Some(CounterExample::Single(counterexample)),
+            logs,
+            labels,
+            traces,
+            gas_report_traces,
+            line_coverage,
+            breakpoints: Some(breakpoints),
+            debug_bytecodes,
+            deprecated_cheatcodes,
+            ..Default::default()
+        })
+    }
+
     /// Runs a table test.
     /// The parameters dataset (table) is created from defined parameter fixtures, therefore each
     /// test table parameter should have the same number of fixtures defined.
@@ -4054,6 +4155,15 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
 
         self.try_seed_fuzz_corpus_from_frontiers(func, &fuzz_config);
         self.try_seed_fuzz_corpus_symbolically(func, &fuzz_config);
+        let symbolic_worker_stop = should_run_symbolic_fuzz_worker(&self.config, func)
+            .then(|| Arc::new(AtomicBool::new(false)));
+        let symbolic_worker_executor = symbolic_worker_stop.as_ref().map(|_| self.clone_executor());
+        let symbolic_worker_config = self.config.symbolic.clone();
+        let symbolic_worker_ffi = self.config.ffi;
+        let symbolic_worker_fuzz_config = fuzz_config.clone();
+        let symbolic_worker_address = self.address;
+        let symbolic_worker_sender = self.sender;
+        let revert_decoder = &self.cr.mcr.revert_decoder;
 
         let progress = start_fuzz_progress(
             self.cr.progress,
@@ -4080,7 +4190,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             let result = match fuzzed_executor.replay_persisted_failure(
                 func,
                 self.address,
-                &self.cr.mcr.revert_decoder,
+                revert_decoder,
             ) {
                 Ok(result) => result,
                 Err(e) => {
@@ -4091,22 +4201,59 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             self.result.fuzz_result(result);
             return self.result;
         }
-        let result = match fuzzed_executor.fuzz(
-            func,
-            &self.setup.fuzz_fixtures,
-            state,
-            self.address,
-            &self.cr.mcr.revert_decoder,
-            progress.as_ref(),
-            &self.tcfg.early_exit,
-            &self.cr.tokio_handle,
-        ) {
+        let (result, symbolic_worker_result) = std::thread::scope(|scope| {
+            let symbolic_worker_handle = symbolic_worker_stop
+                .as_ref()
+                .zip(symbolic_worker_executor)
+                .map(|(stop, executor)| {
+                    let stop = Arc::clone(stop);
+                    scope.spawn(move || {
+                        Self::run_symbolic_fuzz_worker(
+                            executor,
+                            symbolic_worker_address,
+                            symbolic_worker_sender,
+                            symbolic_worker_config,
+                            symbolic_worker_ffi,
+                            symbolic_worker_fuzz_config,
+                            func,
+                            revert_decoder,
+                            stop,
+                        )
+                    })
+                });
+            let result = fuzzed_executor.fuzz(
+                func,
+                &self.setup.fuzz_fixtures,
+                state,
+                self.address,
+                revert_decoder,
+                progress.as_ref(),
+                &self.tcfg.early_exit,
+                symbolic_worker_stop.clone(),
+                &self.cr.tokio_handle,
+            );
+            let symbolic_worker_result =
+                symbolic_worker_handle.and_then(|handle| match handle.join() {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(test = %func.signature(), "symbolic fuzz worker panicked");
+                        None
+                    }
+                });
+            (result, symbolic_worker_result)
+        });
+        let mut result = match result {
             Ok(x) => x,
             Err(e) => {
                 self.result.fuzz_setup_fail(e);
                 return self.result;
             }
         };
+        if result.success
+            && let Some(symbolic_worker_result) = symbolic_worker_result
+        {
+            result = symbolic_worker_result;
+        }
 
         // Record counterexample.
         if let Some(CounterExample::Single(counterexample)) = &result.counterexample {

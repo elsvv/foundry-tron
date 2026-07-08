@@ -50,6 +50,7 @@ const DOC_KEYS: &[&str] = &["out", "title", "book", "homepage", "repository", "p
 const SYMBOLIC_KEYS: &[&str] = &[
     "enabled",
     "seed_corpus",
+    "fuzz_worker",
     "use_fuzz_corpus",
     "corpus_seed_limit",
     "use_fuzz_frontiers",

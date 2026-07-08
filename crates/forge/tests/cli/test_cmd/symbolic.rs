@@ -2550,6 +2550,64 @@ Ran 1 test for test/SymbolicFuzzCorpusSeed.t.sol:SymbolicFuzzCorpusSeed
     assert!(stdout.contains(expected_x_decimal), "{stdout}");
 });
 
+forgetest_init!(symbolic_fuzz_worker_reports_counterexample, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_fuzz_worker_reports_counterexample because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicFuzzWorker.t.sol",
+        r#"
+contract SymbolicFuzzWorker {
+    function testFuzz_symbolicWorker(uint256 x) public pure {
+        if (x == 0xdeadbeef) {
+            assert(false);
+        }
+    }
+}
+"#,
+    );
+
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--match-test",
+            "testFuzz_symbolicWorker",
+            "--fuzz-runs",
+            "1",
+            "--fuzz-seed",
+            "0x1",
+            "--threads",
+            "1",
+        ])
+        .assert_success();
+
+    let stdout = cmd
+        .forge_fuse()
+        .args([
+            "test",
+            "--match-test",
+            "testFuzz_symbolicWorker",
+            "--fuzz-runs",
+            "1",
+            "--fuzz-seed",
+            "0x1",
+            "--threads",
+            "1",
+            "--symbolic-fuzz-worker",
+        ])
+        .assert_failure()
+        .get_output()
+        .stdout_lossy();
+
+    assert!(stdout.contains("[FAIL: panic: assertion failed (0x01); counterexample:"), "{stdout}");
+    assert!(stdout.contains("testFuzz_symbolicWorker(uint256) (runs: 1"), "{stdout}");
+    assert!(stdout.contains("3735928559"), "{stdout}");
+});
+
 forgetest_init!(symbolic_seed_corpus_is_best_effort_for_symbolic_incomplete, |prj, cmd| {
     if !z3_available() {
         let _ = sh_eprintln!(
