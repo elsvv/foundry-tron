@@ -6,7 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       versions:
-        description: "Comma-separated list of Foundry versions to benchmark (optional, defaults to 'stable,local'). Use 'local' to bench HEAD of the current branch."
+        description: "Comma-separated Foundry versions (optional, defaults to 'master,local'). Include 'local' to compare the branch HEAD against a source-built 'master' baseline and post a PR comment. Omit 'local' (e.g. 'stable,nightly') to track released versions and commit results."
+        required: false
+        type: string
+      baseline_ref:
+        description: "Baseline git ref to build for the PR comparison (optional; defaults to the merge-base of HEAD and origin/master)."
         required: false
         type: string
       repos:
@@ -15,7 +19,7 @@ on:
         type: string
 
 env:
-  DEFAULT_VERSIONS: "stable,local"
+  DEFAULT_VERSIONS: "master,local"
 
   # Repos to benchmark per step. Each comma-separated entry has the form
   #   org/repo[:rev][ <extra args>]
@@ -56,6 +60,10 @@ jobs:
   run-benchmarks:
     name: Run All Benchmarks
     runs-on: depot-ubuntu-24.04-32
+    # Source-built baseline/candidate use the profiling profile, forge only.
+    env:
+      FOUNDRY_BENCH_LOCAL_BUILD_PROFILE: profiling
+      FOUNDRY_BENCH_LOCAL_BUILD_BINS: forge
     permissions:
       contents: read
     steps:
@@ -63,6 +71,8 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+          # Full history so the baseline merge-base can be resolved.
+          fetch-depth: 0
 
       - name: Install build dependencies
         run: |
@@ -95,10 +105,33 @@ jobs:
           sudo mv hyperfine-v1.19.0-x86_64-unknown-linux-gnu/hyperfine /usr/local/bin/
           rm -rf hyperfine-v1.19.0-x86_64-unknown-linux-gnu
 
+      # PR mode (versions contains "local"): build a "master" baseline from a
+      # worktree at the merge-base (or baseline_ref) and compare vs branch HEAD.
+      # Otherwise pass versions through unchanged (foundryup release tracking).
+      - name: Prepare comparison
+        id: prep
+        env:
+          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
+          BASELINE_REF_INPUT: ${{ github.event.inputs.baseline_ref }}
+        run: |
+          if printf '%s' "$VERSIONS" | grep -q 'local'; then
+            git fetch --no-tags origin master:refs/remotes/origin/master
+            BASE_REF="${BASELINE_REF_INPUT:-}"
+            if [ -z "$BASE_REF" ]; then
+              BASE_REF="$(git merge-base HEAD origin/master)"
+            fi
+            git worktree add --detach ../foundry-baseline "$BASE_REF"
+            echo "effective_versions=master=../foundry-baseline,local" >> "$GITHUB_OUTPUT"
+            echo "baseline_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+            echo "Baseline ref: $BASE_REF"
+          else
+            echo "effective_versions=$VERSIONS" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run forge test benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
+          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
           REPOS: ${{ github.event.inputs.repos || env.TEST_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches --force-install \
@@ -106,12 +139,13 @@ jobs:
             --repos "$REPOS" \
             --benchmarks forge_test,forge_fuzz_test \
             --output-file forge_test_bench.md \
+            --json-output forge_test_bench.json \
             --verbose
 
       - name: Run forge isolate test benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
+          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
           REPOS: ${{ github.event.inputs.repos || env.ISOLATE_TEST_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
@@ -119,6 +153,7 @@ jobs:
             --repos "$REPOS" \
             --benchmarks forge_isolate_test \
             --output-file forge_isolate_test_bench.md \
+            --json-output forge_isolate_test_bench.json \
             --verbose
 
       # Temporarily disabled as long as the previous stable benchmark baseline
@@ -139,7 +174,7 @@ jobs:
       - name: Run forge build benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
+          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
           REPOS: ${{ github.event.inputs.repos || env.BUILD_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
@@ -147,12 +182,13 @@ jobs:
             --repos "$REPOS" \
             --benchmarks forge_build_no_cache,forge_build_with_cache \
             --output-file forge_build_bench.md \
+            --json-output forge_build_bench.json \
             --verbose
 
       - name: Run forge coverage benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
+          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
           REPOS: ${{ github.event.inputs.repos || env.COVERAGE_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
@@ -160,10 +196,29 @@ jobs:
             --repos "$REPOS" \
             --benchmarks forge_coverage \
             --output-file forge_coverage_bench.md \
+            --json-output forge_coverage_bench.json \
             --verbose
 
       - name: Combine benchmark results
         run: ./.github/scripts/combine-benchmarks.sh benches
+
+      # Branch runs: merge the per-version summaries into baseline/candidate
+      # files for the publish job to diff.
+      - name: Merge per-version JSON summaries
+        if: contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')
+        run: |
+          shopt -s nullglob
+          base_parts=( benches/*_bench-master.json )
+          cand_parts=( benches/*_bench-local.json )
+          if [[ ${#base_parts[@]} -gt 0 ]]; then
+            jq -s 'add' "${base_parts[@]}" > benches/base-summary.json
+            echo "Merged ${#base_parts[@]} baseline summary file(s)."
+          fi
+          if [[ ${#cand_parts[@]} -gt 0 ]]; then
+            jq -s 'add' "${cand_parts[@]}" > benches/candidate-summary.json
+            echo "Merged ${#cand_parts[@]} candidate summary file(s)."
+          fi
+          printf '%s\n' "${{ steps.prep.outputs.baseline_ref }}" > benches/baseline-ref.txt
 
       - name: Print benchmark results
         run: cat benches/LATEST.md
@@ -179,6 +234,9 @@ jobs:
             benches/forge_build_bench.md
             benches/forge_coverage_bench.md
             benches/LATEST.md
+            benches/base-summary.json
+            benches/candidate-summary.json
+            benches/baseline-ref.txt
 
   publish-results:
     name: Publish Results
@@ -235,36 +293,51 @@ jobs:
 
             console.log(`Created PR #${pr.number}: ${pr.html_url}`);
 
-      - name: Comment on PR
+      # Resolve the open PR for this branch (owner-qualified) and its author.
+      - name: Resolve PR number
+        id: pr
         if: contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            const { execSync } = require('child_process');
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          OWNER="${GH_REPO%%/*}"
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          PR_JSON="$(gh api --method GET "repos/${GH_REPO}/pulls" \
+            -f state=open -f "head=${OWNER}:${BRANCH}" --jq '.[0]')"
+          PR_NUMBER="$(printf '%s' "$PR_JSON" | jq -r '.number // empty')"
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR found for '${OWNER}:${BRANCH}', skipping comment."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+            echo "author=$(printf '%s' "$PR_JSON" | jq -r '.user.login // empty')" >> "$GITHUB_OUTPUT"
+          fi
 
-            const formatted = execSync('./.github/scripts/format-pr-comment.sh benches/LATEST.md').toString();
-
-            const branch = context.ref.replace('refs/heads/', '');
-            const { data: prs } = await github.rest.pulls.list({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              head: `${context.repo.owner}:${branch}`,
-              state: 'open',
-            });
-
-            if (prs.length === 0) {
-              console.log(`No open PR found for branch '${branch}', skipping comment.`);
-              return;
-            }
-
-            const prNumber = prs[0].number;
-            const body = `## Benchmark Results (stable vs this branch)\n\n${formatted}\n\n---\n\n🤖 This comment was automatically generated by the [Foundry Benchmarks workflow](https://github.com/${{ github.repository }}/actions/workflows/benchmarks.yml).`;
-
-            await github.rest.issues.createComment({
-              issue_number: prNumber,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body,
-            });
-
-            console.log(`Posted benchmark results to PR #${prNumber}`);
+      # Diff the summaries and post the report as a sticky PR comment.
+      - name: Post benchmark summary to PR
+        if: >-
+          contains(github.event.inputs.versions || env.DEFAULT_VERSIONS, 'local')
+          && steps.pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ACTOR: ${{ steps.pr.outputs.author }}
+          VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
+          REPOS: ${{ github.event.inputs.repos || 'per-benchmark defaults' }}
+          BASE_LABEL: master
+          CANDIDATE_LABEL: this PR
+        run: |
+          if [ ! -f benches/base-summary.json ] || [ ! -f benches/candidate-summary.json ]; then
+            echo "::error::Merged benchmark summaries are missing after a successful run; cannot post PR report."
+            exit 1
+          fi
+          BASELINE_REF="$(cat benches/baseline-ref.txt 2>/dev/null || true)"
+          ./.github/scripts/compare-bench.sh \
+            benches/base-summary.json benches/candidate-summary.json \
+            > benches/comparison.md
+          CONFIG="versions=${VERSIONS}; baseline=${BASELINE_REF:-master}; repos=${REPOS}" \
+            ./.github/scripts/post-bench-comment.sh benches/comparison.md benches/LATEST.md
