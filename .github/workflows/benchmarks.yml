@@ -167,6 +167,9 @@ jobs:
     env:
       FOUNDRY_BENCH_LOCAL_BUILD_PROFILE: profiling
       FOUNDRY_BENCH_LOCAL_BUILD_BINS: forge
+      # Untrusted PR code runs here on comment triggers, so it must not touch the
+      # shared Actions cache (cache poisoning). Only cache on trusted dispatch.
+      RUSTC_WRAPPER: ${{ github.event_name != 'issue_comment' && 'sccache' || '' }}
     permissions:
       contents: read
     steps:
@@ -191,7 +194,9 @@ jobs:
 
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
 
-      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      # Skipped on comment triggers: untrusted code must not access the cache.
+      - if: github.event_name != 'issue_comment'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Setup Foundry
         env:
