@@ -197,12 +197,18 @@ inconclusive.
 ### Automated PR comments
 
 The [Foundry Benchmarks workflow](../../.github/workflows/benchmarks.yml) posts
-this comparison directly to a PR. Run it via **`workflow_dispatch`** against the
-PR branch; when `versions` includes `local` (the default is `master,local`) it
-resolves the open PR for the dispatched branch and comments there.
+this comparison directly to a PR. Trigger it either way:
 
-`master` is built from source at the merge-base of the PR head and
-`origin/master`. Each benchmark step writes a per-version JSON summary
+- **Comment `derek bench` on the PR** (write access required). The
+  [dispatch workflow](../../.github/workflows/benchmarks-dispatch.yml) verifies
+  access, then dispatches the benchmark workflow on `master` (a trusted ref)
+  passing the PR number and head SHA. The PR head is built in an isolated,
+  read-only job, so no PR code runs with write scope or the shared build cache.
+- **`workflow_dispatch`** against the PR branch, for manual runs.
+
+When `versions` includes `local` (the default is `master,local`), `master` is
+built from source at the merge-base of the PR head and `origin/master`. Each
+benchmark step writes a per-version JSON summary
 (`<file>-<version>.json`); the workflow merges them into `base-summary.json` and
 `candidate-summary.json`, runs `compare-bench.sh`, and then
 [`post-bench-comment.sh`](../../.github/scripts/post-bench-comment.sh) publishes

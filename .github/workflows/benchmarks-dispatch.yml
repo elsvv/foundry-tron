@@ -14,17 +14,24 @@ concurrency:
 
 jobs:
   publish:
+    # External-service subcommands (invariant/symex). Bare `derek bench` and
+    # `derek bench forge` are handled by the dispatch-forge job below instead.
     # Gate on association here so unauthorized commenters never start a run.
     if: >-
       github.event.issue.pull_request &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
       (
-        github.event.comment.body == 'derek bench' ||
         startsWith(github.event.comment.body, 'derek bench ') ||
-        github.event.comment.body == 'decofe bench' ||
         startsWith(github.event.comment.body, 'decofe bench ') ||
-        github.event.comment.body == '@decofe bench' ||
         startsWith(github.event.comment.body, '@decofe bench ')
+      ) &&
+      !(
+        github.event.comment.body == 'derek bench forge' ||
+        github.event.comment.body == 'decofe bench forge' ||
+        github.event.comment.body == '@decofe bench forge' ||
+        startsWith(github.event.comment.body, 'derek bench forge ') ||
+        startsWith(github.event.comment.body, 'decofe bench forge ') ||
+        startsWith(github.event.comment.body, '@decofe bench forge ')
       )
     runs-on: ubuntu-latest
     # Scopes the EVENTS_* mTLS secrets; shared across all `bench` subcommands.
@@ -38,10 +45,12 @@ jobs:
         with:
           script: |
             const usage = [
-              '**Usage:** `derek bench <subcommand> [args]` (also `decofe bench ...`).\n',
+              '**Usage:** `derek bench <subcommand> [args]` (also `decofe bench ...`).',
+              '',
+              '- `bench` (or `bench forge`) — run the forge test/build/coverage comparison and post the report on this PR',
               '- `bench invariant [compare-ref=REF] [timeout=N] [workers=N] [benchmark-type=property|optimization]`',
               '- `bench symex [compare-ref=REF] [timeout=N]`',
-            ].join('');
+            ].join('\n');
             const actor = context.payload.comment.user.login;
             const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
             const association = context.payload.comment.author_association;
@@ -347,3 +356,104 @@ jobs:
               body,
             });
             if (!success) core.setFailed('Failed to publish bench event');
+
+  # Bare `derek bench` (or `derek bench forge`): run the forge benchmark suite in
+  # GitHub Actions and post the comparison report on the PR. This runs no
+  # external service and no PR code here; it only dispatches benchmarks.yml,
+  # which builds the baseline/candidate and posts the sticky report comment.
+  dispatch-forge:
+    if: >-
+      github.event.issue.pull_request &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+      (
+        github.event.comment.body == 'derek bench' ||
+        github.event.comment.body == 'decofe bench' ||
+        github.event.comment.body == '@decofe bench' ||
+        github.event.comment.body == 'derek bench forge' ||
+        github.event.comment.body == 'decofe bench forge' ||
+        github.event.comment.body == '@decofe bench forge' ||
+        startsWith(github.event.comment.body, 'derek bench forge ') ||
+        startsWith(github.event.comment.body, 'decofe bench forge ') ||
+        startsWith(github.event.comment.body, '@decofe bench forge ')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      pull-requests: write
+    steps:
+      - name: Dispatch benchmark workflow
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          script: |
+            const actor = context.payload.comment.user.login;
+            const failWithComment = async (message) => {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `cc @${actor}\n\n${message}`,
+              });
+              core.setFailed(message);
+            };
+
+            // The association gate is coarse (a MEMBER need not have repo write);
+            // require actual write access before dispatching a run.
+            const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: actor,
+            });
+            if (!['write', 'maintain', 'admin'].includes(perm.permission)) {
+              await failWithComment('You need write access to run benchmarks.');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+            });
+
+            if (pr.state !== 'open') {
+              await failWithComment('bench only runs on open PRs.');
+              return;
+            }
+            // Same-repo branches only; createWorkflowDispatch cannot target forks.
+            const repoFullName = `${context.repo.owner}/${context.repo.repo}`;
+            if (pr.head.repo.full_name !== repoFullName) {
+              await failWithComment(`bench only runs for branches in \`${repoFullName}\`, not external forks.`);
+              return;
+            }
+
+            // Dispatch on the default branch so the benchmark workflow's harness
+            // and publish scripts come from a trusted ref; the PR head is passed
+            // as input and built in an isolated, read-only job.
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'benchmarks.yml',
+              ref: context.payload.repository.default_branch,
+              inputs: {
+                pr_number: String(context.issue.number),
+                head_sha: pr.head.sha,
+              },
+            });
+
+            try {
+              await github.rest.reactions.createForIssueComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: context.payload.comment.id,
+                content: 'eyes',
+              });
+            } catch (error) {
+              core.warning(`Could not add acknowledgement reaction: ${error.message}`);
+            }
+
+            const runsUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/workflows/benchmarks.yml`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `cc @${actor}\n\nBenchmark run queued for \`${pr.head.ref}\`. The report will be posted here when it finishes. [View runs](${runsUrl})`,
+            });

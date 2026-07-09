@@ -2,9 +2,12 @@
 # Post (or update) a benchmark summary as a sticky PR comment. A hidden marker
 # lets repeat runs update the same comment in place.
 #
-# Usage: post-bench-comment.sh <comparison.md> [full-results.md]
+# Usage: post-bench-comment.sh [comparison.md] [full-results.md]
+# With no comparison file, posts a status-only comment (e.g. a failure notice)
+# that updates the same sticky comment in place via the shared marker.
 # Env: PR_NUMBER, GH_REPO, GH_TOKEN (required to post); JOB_URL, DASHBOARD_URL,
-#      ACTOR, CONFIG, COMMENT_KEY (default foundry-bench), DRY_RUN (print only).
+#      ACTOR, CONFIG, STATUS_PREFIX, COMMENT_KEY (default foundry-bench),
+#      DRY_RUN (print only).
 set -euo pipefail
 
 COMPARISON_MD="${1:-}"
