@@ -397,7 +397,7 @@ jobs:
 
             console.log(`Created PR #${pr.number}: ${pr.html_url}`);
 
-      # Diff the summaries and post a sticky comment on the resolved PR.
+      # Diff the summaries and post a comment on the resolved PR.
       - name: Post benchmark summary to PR
         if: >-
           needs.run-benchmarks.result == 'success'
@@ -425,8 +425,8 @@ jobs:
           CONFIG="versions=${VERSIONS}; baseline=${BASELINE_REF:-master}; repos=${REPOS}" \
             ./.github/scripts/post-bench-comment.sh benches/comparison.md benches/LATEST.md
 
-      # If the run failed, update the sticky comment with a failure status so the
-      # requester is not left with only a "queued" acknowledgement.
+      # If the run failed, post a failure status so the requester is not left
+      # with only the dispatcher's "queued" acknowledgement.
       - name: Post failure status to PR
         if: >-
           needs.run-benchmarks.result != 'success'

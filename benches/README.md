@@ -211,11 +211,11 @@ built from source at the merge-base of the PR head and `origin/master`. Each
 benchmark step writes a per-version JSON summary
 (`<file>-<version>.json`); the workflow merges them into `base-summary.json` and
 `candidate-summary.json`, runs `compare-bench.sh`, and then
-[`post-bench-comment.sh`](../../.github/scripts/post-bench-comment.sh) publishes
-a single **sticky** comment (updated in place on re-runs, keyed by a hidden
-marker). The comment leads with the regression/improvement table, links back to
-the workflow run, and keeps the full absolute-time tables in a dropdown. A
-dashboard-run link is included when `DASHBOARD_URL` is provided.
+[`post-bench-comment.sh`](../../.github/scripts/post-bench-comment.sh) posts a
+new comment on the PR (one per run). The comment leads with the
+regression/improvement table, links back to the workflow run, and keeps the full
+absolute-time tables in a dropdown. A dashboard-run link is included when
+`DASHBOARD_URL` is provided.
 
 Omit `local` on a `workflow_dispatch` run (e.g. `versions=stable,nightly`) to
 track released versions and commit results instead of commenting.

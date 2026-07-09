@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# Post (or update) a benchmark summary as a sticky PR comment. A hidden marker
-# lets repeat runs update the same comment in place.
+# Post a benchmark summary as a new PR comment (one per run).
 #
 # Usage: post-bench-comment.sh [comparison.md] [full-results.md]
-# With no comparison file, posts a status-only comment (e.g. a failure notice)
-# that updates the same sticky comment in place via the shared marker.
+# With no comparison file, posts a status-only comment (e.g. a failure notice).
 # Env: PR_NUMBER, GH_REPO, GH_TOKEN (required to post); JOB_URL, DASHBOARD_URL,
 #      ACTOR, CONFIG, STATUS_PREFIX, COMMENT_KEY (default foundry-bench),
 #      DRY_RUN (print only).
@@ -75,20 +73,7 @@ fi
 : "${PR_NUMBER:?PR_NUMBER is required}"
 : "${GH_REPO:?GH_REPO is required}"
 
-# Upsert: edit our own previous marked comment, else create. Restricting to the
-# bot's comments prevents hijacking a comment that merely quotes the marker.
-existing_id="$(
-    gh api --paginate "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
-        --jq ".[] | select(.user.type == \"Bot\") | select(.body | contains(\"${MARKER}\")) | .id" \
-        | head -n1
-)"
-
-if [ -n "$existing_id" ]; then
-    gh api --method PATCH "repos/${GH_REPO}/issues/comments/${existing_id}" \
-        -F body=@"$BODY_FILE" >/dev/null
-    echo "Updated existing benchmark comment (#${existing_id})."
-else
-    gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
-        -F body=@"$BODY_FILE" >/dev/null
-    echo "Created benchmark comment on PR #${PR_NUMBER}."
-fi
+# One comment per run so each report is preserved in the PR timeline.
+gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+    -F body=@"$BODY_FILE" >/dev/null
+echo "Created benchmark comment on PR #${PR_NUMBER}."
