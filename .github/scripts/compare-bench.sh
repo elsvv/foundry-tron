@@ -51,6 +51,10 @@ def mean_of(v):
     return v["mean"] if isinstance(v, dict) else float(v)
 
 
+def has_stddev(v):
+    return isinstance(v, dict) and v.get("stddev") is not None
+
+
 def rel_stddev(v):
     if not isinstance(v, dict):
         return 0.0
@@ -87,6 +91,16 @@ for key in sorted(base.keys() | cand.keys()):
 
     bm, cm = mean_of(b), mean_of(c)
     delta = (cm - bm) / bm * 100.0 if bm else 0.0
+    sign = "+" if delta > 0 else ""
+
+    # Single-run benchmarks (e.g. forge_coverage) have no stddev, so noise is
+    # unknown. Never flag those as significant; a missing band is not zero noise.
+    if not (has_stddev(b) and has_stddev(c)):
+        neutral += 1
+        change = f"{sign}{delta:.1f}% ⚪ (single run, not judged)"
+        rows.append((key, fmt_duration(bm), fmt_duration(cm), change))
+        continue
+
     # Combined relative noise of the two runs.
     band = (rel_stddev(b) ** 2 + rel_stddev(c) ** 2) ** 0.5 * noise_mult
     # reth-style verdict: flag only when the whole band clears the floor. Wall
@@ -103,7 +117,6 @@ for key in sorted(base.keys() | cand.keys()):
         emoji = "⚪"
         neutral += 1
 
-    sign = "+" if delta > 0 else ""
     change = f"{sign}{delta:.1f}% {emoji} (±{band:.1f}%, floor {floor:.1f}%)"
     rows.append((key, fmt_duration(bm), fmt_duration(cm), change))
 
