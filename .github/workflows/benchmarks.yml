@@ -57,21 +57,14 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
-  # Gate and resolve the request for both triggers. For a "derek bench" PR
-  # comment this authorizes the commenter, resolves the PR head to benchmark,
-  # and posts a queued acknowledgement that the results run later updates in
-  # place. No third-party code runs here, so it can hold write scope.
+  # Resolve the dispatched request: pick the versions to benchmark and find the
+  # open PR for the dispatched branch so later jobs can post the summary to it.
   authorize:
     name: Authorize request
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'issue_comment'
-        && github.event.issue.pull_request
-        && startsWith(github.event.comment.body, 'derek bench'))
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
     outputs:
       versions: ${{ steps.req.outputs.versions }}
       repos: ${{ steps.req.outputs.repos }}
@@ -80,60 +73,27 @@ jobs:
       pr_number: ${{ steps.req.outputs.pr_number }}
       actor: ${{ steps.req.outputs.actor }}
     steps:
-      # Base repo default branch only; never the PR head in this write-scoped job.
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Check commenter permissions
-        if: github.event_name == 'issue_comment'
-        env:
-          ASSOC: ${{ github.event.comment.author_association }}
-          ACTOR: ${{ github.event.comment.user.login }}
-        run: |
-          case "$ASSOC" in
-            OWNER | MEMBER | COLLABORATOR)
-              echo "@$ACTOR is authorized ($ASSOC)." ;;
-            *)
-              echo "::error::@$ACTOR ($ASSOC) is not allowed to trigger benchmarks." >&2
-              exit 1 ;;
-          esac
-
       - name: Resolve request
         id: req
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          EVENT: ${{ github.event_name }}
           DEFAULT_VERSIONS: ${{ env.DEFAULT_VERSIONS }}
           IN_VERSIONS: ${{ github.event.inputs.versions }}
           IN_BASELINE: ${{ github.event.inputs.baseline_ref }}
           IN_REPOS: ${{ github.event.inputs.repos }}
           DISPATCH_REF: ${{ github.ref_name }}
           DISPATCH_SHA: ${{ github.sha }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          COMMENT_ACTOR: ${{ github.event.comment.user.login }}
         run: |
-          if [ "$EVENT" = "issue_comment" ]; then
-            # Comment triggers always compare the PR head against master.
-            versions="$DEFAULT_VERSIONS"
-            baseline=""
-            repos=""
-            pr_number="$ISSUE_NUMBER"
-            actor="$COMMENT_ACTOR"
-            checkout_ref="refs/pull/${ISSUE_NUMBER}/head"
-          else
-            versions="${IN_VERSIONS:-$DEFAULT_VERSIONS}"
-            baseline="${IN_BASELINE:-}"
-            repos="${IN_REPOS:-}"
-            checkout_ref="$DISPATCH_SHA"
-            owner="${GH_REPO%%/*}"
-            pr_json="$(gh api --method GET "repos/${GH_REPO}/pulls" \
-              -f state=open -f "head=${owner}:${DISPATCH_REF}" --jq '.[0]')"
-            pr_number="$(printf '%s' "$pr_json" | jq -r '.number // empty')"
-            actor="$(printf '%s' "$pr_json" | jq -r '.user.login // empty')"
-          fi
+          versions="${IN_VERSIONS:-$DEFAULT_VERSIONS}"
+          baseline="${IN_BASELINE:-}"
+          repos="${IN_REPOS:-}"
+          checkout_ref="$DISPATCH_SHA"
+          owner="${GH_REPO%%/*}"
+          pr_json="$(gh api --method GET "repos/${GH_REPO}/pulls" \
+            -f state=open -f "head=${owner}:${DISPATCH_REF}" --jq '.[0]')"
+          pr_number="$(printf '%s' "$pr_json" | jq -r '.number // empty')"
+          actor="$(printf '%s' "$pr_json" | jq -r '.user.login // empty')"
           {
             echo "versions=$versions"
             echo "baseline_ref=$baseline"
@@ -143,18 +103,6 @@ jobs:
             echo "actor=$actor"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Post queued acknowledgement
-        if: github.event_name == 'issue_comment'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ steps.req.outputs.pr_number }}
-          ACTOR: ${{ steps.req.outputs.actor }}
-          JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          STATUS_PREFIX: "⏳ Benchmark queued…"
-          CONFIG: "trigger=comment; versions=${{ steps.req.outputs.versions }}"
-        run: ./.github/scripts/post-bench-comment.sh
-
   run-benchmarks:
     name: Run All Benchmarks
     needs: authorize
@@ -163,16 +111,12 @@ jobs:
     env:
       FOUNDRY_BENCH_LOCAL_BUILD_PROFILE: profiling
       FOUNDRY_BENCH_LOCAL_BUILD_BINS: forge
-      # Untrusted PR code runs here on comment triggers, so it must not touch the
-      # shared Actions cache (cache poisoning). Only cache on trusted dispatch.
-      RUSTC_WRAPPER: ${{ github.event_name != 'issue_comment' && 'sccache' || '' }}
     permissions:
       contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          # The PR head (comment trigger) or dispatched ref, resolved upstream.
           ref: ${{ needs.authorize.outputs.checkout_ref }}
           persist-credentials: false
           # Full history so the baseline merge-base can be resolved.
@@ -190,9 +134,7 @@ jobs:
 
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
 
-      # Skipped on comment triggers: untrusted code must not access the cache.
-      - if: github.event_name != 'issue_comment'
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Setup Foundry
         env:
@@ -401,8 +343,7 @@ jobs:
 
             console.log(`Created PR #${pr.number}: ${pr.html_url}`);
 
-      # Diff the summaries and post (or update the queued ack) as a sticky
-      # comment on the PR resolved by the authorize job.
+      # Diff the summaries and post a sticky comment on the resolved PR.
       - name: Post benchmark summary to PR
         if: >-
           contains(needs.authorize.outputs.versions, 'local')
