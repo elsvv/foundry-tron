@@ -163,62 +163,20 @@ Keep `REPOS`, `BENCHMARKS`, and any per-repo extra arguments identical for
 `master` and `candidate`. Override `CANDIDATE_REF`, `RUN_ID`, or `BENCH_ROOT`
 when needed.
 
-The script writes `master.json` and `candidate.json` (the single-version
-`foundry-bench --json-output` summaries) and then reduces them into
-`results/comparison.md` with
-[`.github/scripts/compare-bench.sh`](../../.github/scripts/compare-bench.sh),
-printing the same table it writes. Each row shows the base time, the candidate
-time, and a noise-aware verdict:
+For PR bodies, reduce the two JSON/Markdown outputs into a concise table:
 
 ```md
-**🔴 1 regression(s)** (1 regression, 1 improvement, 0 neutral)
+### Results
 
-| Benchmark | master | this PR | Change |
-|-----------|------|---------|--------|
-| `forge_test/ithacaxyz-account` | 10.00 s | 10.90 s | +9.0% 🔴 (±0.7%, floor 2.0%) |
-| `forge_build_no_cache/solady`  | 5.00 s  | 4.60 s  | -8.0% 🟢 (±0.6%, floor 2.0%) |
+| Benchmark | master | this PR | delta |
+| --- | ---: | ---: | ---: |
+| `forge_test/ithacaxyz-account` wall time | ... | ... | ... |
 ```
 
-A change is flagged (🔴 regression / 🟢 improvement) only when its magnitude
-exceeds **both** the run-to-run noise band (the combined relative standard
-deviation of the two runs, shown as `±`) **and** a floor (`FLOOR_PCT`, default
-2%). Everything else is reported as ⚪ neutral. Tune `FLOOR_PCT` and `NOISE_MULT`
-when a metric is noisier or quieter than the defaults. `compare-bench.sh` is a
-report generator: it exits 0 after writing the table even when it finds a
-regression (a non-zero exit means the inputs were bad). Set
-`FAIL_ON_REGRESSION=1` to make a regression a non-zero exit for gating a check.
-
-For PR bodies, paste `comparison.md` under a `### Results` heading. Include
-domain counters next to wall time when the benchmark produces them, for example
-symbolic solver queries, reported solver time, invariant throughput, or coverage
-relscore/relcov. If the delta is within noise, describe it as neutral or
-inconclusive.
-
-### Automated PR comments
-
-The [Foundry Benchmarks workflow](../../.github/workflows/benchmarks.yml) posts
-this comparison directly to a PR. Trigger it either way:
-
-- **Comment `derek bench` on the PR** (write access required). The
-  [dispatch workflow](../../.github/workflows/benchmarks-dispatch.yml) verifies
-  access, then dispatches the benchmark workflow on `master` (a trusted ref)
-  passing the PR number and head SHA. The PR head is built in an isolated,
-  read-only job, so no PR code runs with write scope or the shared build cache.
-- **`workflow_dispatch`** against the PR branch, for manual runs.
-
-When `versions` includes `local` (the default is `master,local`), `master` is
-built from source at the merge-base of the PR head and `origin/master`. Each
-benchmark step writes a per-version JSON summary
-(`<file>-<version>.json`); the workflow merges them into `base-summary.json` and
-`candidate-summary.json`, runs `compare-bench.sh`, and then
-[`post-bench-comment.sh`](../../.github/scripts/post-bench-comment.sh) posts a
-new comment on the PR (one per run). The comment leads with the
-regression/improvement table, links back to the workflow run, and keeps the full
-absolute-time tables in a dropdown. A dashboard-run link is included when
-`DASHBOARD_URL` is provided.
-
-Omit `local` on a `workflow_dispatch` run (e.g. `versions=stable,nightly`) to
-track released versions and commit results instead of commenting.
+Include domain counters next to wall time when the benchmark produces them, for
+example symbolic solver queries, reported solver time, invariant throughput, or
+coverage relscore/relcov. If the delta is within noise, describe it as neutral
+or inconclusive.
 
 ## Running scfuzzbench Campaigns
 

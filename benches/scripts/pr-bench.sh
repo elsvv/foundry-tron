@@ -53,14 +53,4 @@ for label in master candidate; do
   )
 done
 
-# Reduce the two summaries into a regression/improvement report.
-COMPARISON_MD="${BENCH_ROOT}/results/comparison.md"
-BASE_LABEL="master" CANDIDATE_LABEL="this PR" \
-  "${REPO_ROOT}/.github/scripts/compare-bench.sh" \
-    "${BENCH_ROOT}/results/master.json" \
-    "${BENCH_ROOT}/results/candidate.json" \
-    > "${COMPARISON_MD}"
-
 printf 'Benchmark results written to %s/results\n' "${BENCH_ROOT}"
-printf '\nComparison (master vs this PR):\n\n'
-cat "${COMPARISON_MD}"

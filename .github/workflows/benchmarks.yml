@@ -6,23 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       versions:
-        description: "Comma-separated Foundry versions (optional, defaults to 'master,local'). Include 'local' to compare the branch HEAD against a source-built 'master' baseline and post a PR comment. Omit 'local' (e.g. 'stable,nightly') to track released versions and commit results."
-        required: false
-        type: string
-      baseline_ref:
-        description: "Baseline git ref to build for the PR comparison (optional; defaults to the merge-base of HEAD and origin/master)."
+        description: "Comma-separated list of Foundry versions to benchmark (optional, defaults to 'master,local'). Include 'local' to compare this branch's HEAD against a source-built 'origin/master' baseline and post the comparison on the PR. Omit 'local' (e.g. 'stable,nightly') to track released versions and commit results."
         required: false
         type: string
       repos:
         description: "Comma-separated repos to benchmark. Each entry: org/repo[:rev] (e.g. aave/aave-v4:af1f0f2ba323ac6fbaaee3abf6be060c78e22d35). Leave empty to use the per-benchmark default repo lists."
-        required: false
-        type: string
-      pr_number:
-        description: "PR to benchmark and comment on. Set by the `derek bench` dispatcher; the candidate is the PR head fetched via refs/pull/<n>/head. Leave empty for manual branch runs."
-        required: false
-        type: string
-      head_sha:
-        description: "Expected PR head SHA at dispatch time (advisory; logged if the head has since advanced)."
         required: false
         type: string
 
@@ -62,103 +50,26 @@ env:
     uniswap/v4-core:46c6834698c48bc4a463a86d8420f4eb1d7f3b75,
     sparkdotfi/spark-psm:v1.0.0 --nmc PSMInvariants_TimeBasedRateSetting_WithTransfers_WithPocketSetting
 
-jobs:
-  # Resolve the dispatched request. Two modes:
-  #   * comment path (pr_number input set): the candidate is the PR head fetched
-  #     via refs/pull/<n>/head; the PR is verified open and in this repo (no
-  #     forks). The dispatcher runs this workflow on master, so the harness and
-  #     publish scripts come from a trusted ref, not the PR.
-  #   * manual path (no pr_number): resolve the open PR for the dispatched branch
-  #     and benchmark that branch HEAD.
-  authorize:
-    name: Authorize request
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      versions: ${{ steps.req.outputs.versions }}
-      repos: ${{ steps.req.outputs.repos }}
-      baseline_ref: ${{ steps.req.outputs.baseline_ref }}
-      checkout_ref: ${{ steps.req.outputs.checkout_ref }}
-      candidate_ref: ${{ steps.req.outputs.candidate_ref }}
-      pr_number: ${{ steps.req.outputs.pr_number }}
-      actor: ${{ steps.req.outputs.actor }}
-    steps:
-      - name: Resolve request
-        id: req
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          DEFAULT_VERSIONS: ${{ env.DEFAULT_VERSIONS }}
-          IN_VERSIONS: ${{ github.event.inputs.versions }}
-          IN_BASELINE: ${{ github.event.inputs.baseline_ref }}
-          IN_REPOS: ${{ github.event.inputs.repos }}
-          IN_PR_NUMBER: ${{ github.event.inputs.pr_number }}
-          IN_HEAD_SHA: ${{ github.event.inputs.head_sha }}
-          DISPATCH_REF: ${{ github.ref_name }}
-          DISPATCH_SHA: ${{ github.sha }}
-        run: |
-          versions="${IN_VERSIONS:-$DEFAULT_VERSIONS}"
-          baseline="${IN_BASELINE:-}"
-          repos="${IN_REPOS:-}"
-          checkout_ref="$DISPATCH_SHA"
-          if [ -n "$IN_PR_NUMBER" ]; then
-            # Comment path: resolve and verify the PR by number.
-            pr_json="$(gh api "repos/${GH_REPO}/pulls/${IN_PR_NUMBER}")"
-            state="$(printf '%s' "$pr_json" | jq -r '.state // empty')"
-            head_repo="$(printf '%s' "$pr_json" | jq -r '.head.repo.full_name // empty')"
-            head_sha="$(printf '%s' "$pr_json" | jq -r '.head.sha // empty')"
-            actor="$(printf '%s' "$pr_json" | jq -r '.user.login // empty')"
-            if [ "$state" != "open" ]; then
-              echo "::error::PR #${IN_PR_NUMBER} is not open." >&2
-              exit 1
-            fi
-            if [ "$head_repo" != "$GH_REPO" ]; then
-              echo "::error::PR #${IN_PR_NUMBER} head is not in ${GH_REPO}; forks are not benchmarked." >&2
-              exit 1
-            fi
-            if [ -n "$IN_HEAD_SHA" ] && [ "$IN_HEAD_SHA" != "$head_sha" ]; then
-              echo "::warning::PR head advanced since dispatch (${IN_HEAD_SHA} -> ${head_sha}); benchmarking current head."
-            fi
-            pr_number="$IN_PR_NUMBER"
-            candidate_ref="refs/pull/${IN_PR_NUMBER}/head"
-          else
-            # Manual path: resolve the open PR for the dispatched branch.
-            owner="${GH_REPO%%/*}"
-            pr_json="$(gh api --method GET "repos/${GH_REPO}/pulls" \
-              -f state=open -f "head=${owner}:${DISPATCH_REF}" --jq '.[0]')"
-            pr_number="$(printf '%s' "$pr_json" | jq -r '.number // empty')"
-            actor="$(printf '%s' "$pr_json" | jq -r '.user.login // empty')"
-            candidate_ref=""
-          fi
-          {
-            echo "versions=$versions"
-            echo "baseline_ref=$baseline"
-            echo "repos=$repos"
-            echo "checkout_ref=$checkout_ref"
-            echo "candidate_ref=$candidate_ref"
-            echo "pr_number=$pr_number"
-            echo "actor=$actor"
-          } >> "$GITHUB_OUTPUT"
+  RUSTC_WRAPPER: "sccache"
 
+jobs:
   run-benchmarks:
     name: Run All Benchmarks
-    needs: authorize
     runs-on: depot-ubuntu-24.04-32
+    permissions:
+      contents: read
+    outputs:
+      is_source_comparison: ${{ steps.prep.outputs.is_source_comparison }}
     # Source-built baseline/candidate use the profiling profile, forge only.
     env:
       FOUNDRY_BENCH_LOCAL_BUILD_PROFILE: profiling
       FOUNDRY_BENCH_LOCAL_BUILD_BINS: forge
-    permissions:
-      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ needs.authorize.outputs.checkout_ref }}
           persist-credentials: false
-          # Full history so the baseline merge-base can be resolved.
+          # Full history so the origin/master baseline can be built from source.
           fetch-depth: 0
 
       - name: Install build dependencies
@@ -173,8 +84,7 @@ jobs:
 
       - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
 
-      # No sccache: this job builds untrusted PR code (the candidate), which must
-      # not write to the shared Actions cache (cache poisoning).
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Setup Foundry
         env:
@@ -193,44 +103,34 @@ jobs:
           sudo mv hyperfine-v1.19.0-x86_64-unknown-linux-gnu/hyperfine /usr/local/bin/
           rm -rf hyperfine-v1.19.0-x86_64-unknown-linux-gnu
 
-      # PR mode (versions contains "local"): build both sides from worktrees so
-      # this job never activates the (trusted) checkout as the candidate.
-      #   * candidate: the PR head (candidate_ref) or, for manual runs, HEAD.
-      #   * baseline: baseline_ref or the merge-base of the candidate and master.
-      # Otherwise pass versions through unchanged (foundryup release tracking).
+      # When 'local' is requested, build origin/master from source in a separate
+      # worktree and benchmark it as the baseline (labelled 'master') against
+      # this branch (labelled 'local'). This compares against master itself, not
+      # the last stable release, so master-only regressions are not hidden.
       - name: Prepare comparison
         id: prep
         env:
-          VERSIONS: ${{ needs.authorize.outputs.versions }}
-          BASELINE_REF_INPUT: ${{ needs.authorize.outputs.baseline_ref }}
-          CANDIDATE_REF: ${{ needs.authorize.outputs.candidate_ref }}
+          REQUESTED_VERSIONS: ${{ github.event.inputs.versions || env.DEFAULT_VERSIONS }}
         run: |
-          if printf '%s' "$VERSIONS" | grep -q 'local'; then
+          compact="${REQUESTED_VERSIONS//[[:space:]]/}"
+          if [[ ",$compact," == *,local,* ]]; then
             git fetch --no-tags origin master:refs/remotes/origin/master
-            if [ -n "$CANDIDATE_REF" ]; then
-              git fetch --no-tags origin "$CANDIDATE_REF"
-              CAND_SHA="$(git rev-parse FETCH_HEAD)"
-            else
-              CAND_SHA="$(git rev-parse HEAD)"
-            fi
-            git worktree add --detach ../foundry-candidate "$CAND_SHA"
-            BASE_REF="${BASELINE_REF_INPUT:-}"
-            if [ -z "$BASE_REF" ]; then
-              BASE_REF="$(git merge-base "$CAND_SHA" origin/master)"
-            fi
-            git worktree add --detach ../foundry-baseline "$BASE_REF"
-            echo "effective_versions=master=../foundry-baseline,local=../foundry-candidate" >> "$GITHUB_OUTPUT"
-            echo "baseline_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
-            echo "Candidate: $CAND_SHA | baseline: $BASE_REF"
+            base_sha="$(git rev-parse origin/master)"
+            git worktree add --detach ../foundry-baseline "$base_sha"
+            echo "versions=master=../foundry-baseline,local" >> "$GITHUB_OUTPUT"
+            echo "is_source_comparison=true" >> "$GITHUB_OUTPUT"
+            printf '%s' "$base_sha" > benches/baseline-ref.txt
+            echo "Comparing origin/master ($base_sha) against this branch."
           else
-            echo "effective_versions=$VERSIONS" >> "$GITHUB_OUTPUT"
+            echo "versions=$REQUESTED_VERSIONS" >> "$GITHUB_OUTPUT"
+            echo "is_source_comparison=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run forge test benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ needs.authorize.outputs.repos || env.TEST_REPOS }}
+          VERSIONS: ${{ steps.prep.outputs.versions }}
+          REPOS: ${{ github.event.inputs.repos || env.TEST_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches --force-install \
             --versions "$VERSIONS" \
@@ -243,8 +143,8 @@ jobs:
       - name: Run forge isolate test benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ needs.authorize.outputs.repos || env.ISOLATE_TEST_REPOS }}
+          VERSIONS: ${{ steps.prep.outputs.versions }}
+          REPOS: ${{ github.event.inputs.repos || env.ISOLATE_TEST_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
             --versions "$VERSIONS" \
@@ -272,8 +172,8 @@ jobs:
       - name: Run forge build benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ needs.authorize.outputs.repos || env.BUILD_REPOS }}
+          VERSIONS: ${{ steps.prep.outputs.versions }}
+          REPOS: ${{ github.event.inputs.repos || env.BUILD_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
             --versions "$VERSIONS" \
@@ -286,8 +186,8 @@ jobs:
       - name: Run forge coverage benchmarks
         env:
           FOUNDRY_DIR: ${{ github.workspace }}/.foundry
-          VERSIONS: ${{ steps.prep.outputs.effective_versions }}
-          REPOS: ${{ needs.authorize.outputs.repos || env.COVERAGE_REPOS }}
+          VERSIONS: ${{ steps.prep.outputs.versions }}
+          REPOS: ${{ github.event.inputs.repos || env.COVERAGE_REPOS }}
         run: |
           ./target/release/foundry-bench --output-dir ./benches \
             --versions "$VERSIONS" \
@@ -300,34 +200,31 @@ jobs:
       - name: Combine benchmark results
         run: ./.github/scripts/combine-benchmarks.sh benches
 
-      # Branch runs: merge the per-version summaries into baseline/candidate
-      # files for the publish job to diff.
-      - name: Merge per-version JSON summaries
-        if: contains(needs.authorize.outputs.versions, 'local')
-        env:
-          BASELINE_REF: ${{ steps.prep.outputs.baseline_ref }}
+      - name: Print benchmark results
+        run: cat benches/LATEST.md
+
+      # For a source comparison the bench binary writes one JSON summary per
+      # version (suffixed `-master` / `-local`). Merge each side's per-benchmark
+      # files into a single baseline/candidate summary for the verdict table.
+      - name: Merge benchmark JSON summaries
+        if: steps.prep.outputs.is_source_comparison == 'true'
         run: |
           shopt -s nullglob
           base_parts=( benches/*_bench-master.json )
           cand_parts=( benches/*_bench-local.json )
-          if [[ ${#base_parts[@]} -gt 0 ]]; then
-            jq -s 'add' "${base_parts[@]}" > benches/base-summary.json
-            echo "Merged ${#base_parts[@]} baseline summary file(s)."
+          if [[ ${#base_parts[@]} -eq 0 || ${#cand_parts[@]} -eq 0 ]]; then
+            echo "::error::Missing per-version benchmark JSON summaries."
+            exit 1
           fi
-          if [[ ${#cand_parts[@]} -gt 0 ]]; then
-            jq -s 'add' "${cand_parts[@]}" > benches/candidate-summary.json
-            echo "Merged ${#cand_parts[@]} candidate summary file(s)."
-          fi
-          printf '%s\n' "$BASELINE_REF" > benches/baseline-ref.txt
-
-      - name: Print benchmark results
-        run: cat benches/LATEST.md
+          jq -s 'add' "${base_parts[@]}" > benches/base-summary.json
+          jq -s 'add' "${cand_parts[@]}" > benches/candidate-summary.json
 
       - name: Upload benchmark results as artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-results
           # The symbolic benchmark artifact is omitted while the symbolic step is disabled.
+          # base/candidate summaries and baseline-ref exist only for source comparisons.
           path: |
             benches/forge_test_bench.md
             benches/forge_isolate_test_bench.md
@@ -340,13 +237,10 @@ jobs:
 
   publish-results:
     name: Publish Results
-    needs: [authorize, run-benchmarks]
+    needs: run-benchmarks
     runs-on: ubuntu-latest
-    # Runs on failure too, so a failed run still reports status to the PR.
-    if: always()
-    # All git writes happen here, on a clean runner that never executed
-    # third-party benchmark code. Scripts come from the dispatched ref; the
-    # comment path dispatches on master, so they are trusted, not PR-controlled.
+    # All git writes happen here, on a clean ubuntu-latest runner that has
+    # never executed third-party benchmark code.
     permissions:
       contents: write
       pull-requests: write
@@ -358,7 +252,6 @@ jobs:
           persist-credentials: true
 
       - name: Download benchmark results
-        if: needs.run-benchmarks.result == 'success'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: benchmark-results
@@ -366,7 +259,7 @@ jobs:
 
       - name: Commit benchmark results
         id: commit_results
-        if: needs.run-benchmarks.result == 'success' && !contains(needs.authorize.outputs.versions, 'local')
+        if: needs.run-benchmarks.outputs.is_source_comparison != 'true'
         env:
           GITHUB_HEAD_REF: ${{ github.head_ref }}
         run: ./.github/scripts/commit-benchmark-results.sh benches "${{ github.event_name }}" "${{ github.repository }}"
@@ -397,46 +290,61 @@ jobs:
 
             console.log(`Created PR #${pr.number}: ${pr.html_url}`);
 
-      # Diff the summaries and post a comment on the resolved PR.
-      - name: Post benchmark summary to PR
-        if: >-
-          needs.run-benchmarks.result == 'success'
-          && contains(needs.authorize.outputs.versions, 'local')
-          && needs.authorize.outputs.pr_number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
-          JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          ACTOR: ${{ needs.authorize.outputs.actor }}
-          VERSIONS: ${{ needs.authorize.outputs.versions }}
-          REPOS: ${{ needs.authorize.outputs.repos || 'per-benchmark defaults' }}
-          BASE_LABEL: master
-          CANDIDATE_LABEL: this PR
-        run: |
-          if [ ! -f benches/base-summary.json ] || [ ! -f benches/candidate-summary.json ]; then
-            echo "::error::Merged benchmark summaries are missing after a successful run; cannot post PR report."
-            exit 1
-          fi
-          BASELINE_REF="$(cat benches/baseline-ref.txt 2>/dev/null || true)"
-          ./.github/scripts/compare-bench.sh \
-            benches/base-summary.json benches/candidate-summary.json \
-            > benches/comparison.md
-          CONFIG="versions=${VERSIONS}; baseline=${BASELINE_REF:-master}; repos=${REPOS}" \
-            ./.github/scripts/post-bench-comment.sh benches/comparison.md benches/LATEST.md
+      - name: Comment on PR
+        if: needs.run-benchmarks.outputs.is_source_comparison == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { execFileSync } = require('child_process');
+            const fs = require('fs');
 
-      # If the run failed, post a failure status so the requester is not left
-      # with only the dispatcher's "queued" acknowledgement.
-      - name: Post failure status to PR
-        if: >-
-          needs.run-benchmarks.result != 'success'
-          && contains(needs.authorize.outputs.versions, 'local')
-          && needs.authorize.outputs.pr_number != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
-          JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          ACTOR: ${{ needs.authorize.outputs.actor }}
-          STATUS_PREFIX: "❌ Benchmark run failed — see the run log."
-        run: ./.github/scripts/post-bench-comment.sh
+            // Regression/improvement verdicts from the base vs candidate summaries.
+            const verdicts = execFileSync(
+              './.github/scripts/compare-nightly.sh',
+              ['benches/base-summary.json', 'benches/candidate-summary.json', '2', '2'],
+              {
+                env: {
+                  ...process.env,
+                  BASE_LABEL: 'master',
+                  CANDIDATE_LABEL: 'this branch',
+                  REPORT_TITLE: '### Verdicts',
+                  FAIL_ON_REGRESSION: '0',
+                },
+              },
+            ).toString();
+
+            // Full comparison tables, collapsed.
+            const formatted = execFileSync(
+              './.github/scripts/format-pr-comment.sh',
+              ['benches/LATEST.md'],
+            ).toString();
+
+            const branch = context.ref.replace('refs/heads/', '');
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              state: 'open',
+            });
+
+            if (prs.length === 0) {
+              console.log(`No open PR found for branch '${branch}', skipping comment.`);
+              return;
+            }
+
+            const prNumber = prs[0].number;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const baseline = fs.existsSync('benches/baseline-ref.txt')
+              ? fs.readFileSync('benches/baseline-ref.txt', 'utf8').trim().slice(0, 12)
+              : 'origin/master';
+
+            const body = `## Benchmark Results (master vs this branch)\n\n[View benchmark run](${runUrl}) · baseline \`${baseline}\`\n\n${verdicts}\n\n${formatted}\n\n---\n\n🤖 This comment was automatically generated by the [Foundry Benchmarks workflow](https://github.com/${{ github.repository }}/actions/workflows/benchmarks.yml).`;
+
+            await github.rest.issues.createComment({
+              issue_number: prNumber,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+            console.log(`Posted benchmark results to PR #${prNumber}`);
