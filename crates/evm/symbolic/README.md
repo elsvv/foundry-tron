@@ -111,6 +111,13 @@ fuzz failure if the worker finds one first:
 forge test --match-test test_hard_branch --symbolic-fuzz-worker
 ```
 
+Use `--symbolic-fuzz-worker` for focused stateless fuzz tests where random
+mutation is unlikely to satisfy a narrow predicate, such as exact equality,
+checksums, modular arithmetic, or branch conditions with a small valid surface.
+It is intentionally opt-in: broad passing fuzz suites can spend significant
+extra CPU exploring symbolic paths that never produce a useful failure, and the
+worker does not currently run for invariant tests.
+
 Symbolic execution can import the same Foundry fuzz corpus as path-priority
 hints for fuzz tests:
 

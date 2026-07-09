@@ -98,6 +98,9 @@ pub(crate) trait SymbolicSolver {
     /// Clears cached expression keys tied to a previous symbolic context.
     fn clear_context_caches(&mut self) {}
 
+    /// Sets an optional cancellation token shared with the current symbolic execution.
+    fn set_cancel(&mut self, _cancel: Option<Arc<AtomicBool>>) {}
+
     /// Returns the number of satisfiable witnesses produced by local hard-arithmetic search.
     fn heuristic_witnesses(&self) -> usize {
         0
@@ -202,6 +205,7 @@ pub(crate) struct SmtLibSubprocessSolver {
     smt_max_query_bytes: u64,
     smt_build_time: Duration,
     smt_max_query_time: Duration,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl SmtLibSubprocessSolver {
@@ -234,6 +238,7 @@ impl SmtLibSubprocessSolver {
             smt_max_query_bytes: 0,
             smt_build_time: Duration::ZERO,
             smt_max_query_time: Duration::ZERO,
+            cancel: None,
         }
     }
 
@@ -294,6 +299,10 @@ impl SymbolicSolver for SmtLibSubprocessSolver {
     fn clear_context_caches(&mut self) {
         self.sat_cache.clear();
         self.model_cache.clear();
+    }
+
+    fn set_cancel(&mut self, cancel: Option<Arc<AtomicBool>>) {
+        self.cancel = cancel;
     }
 
     /// Returns how many validated local hard-arithmetic witnesses this solver used.
@@ -693,6 +702,7 @@ impl SmtLibSubprocessSolver {
             &smt,
             self.timeout,
             model.then_some(model_constraints),
+            self.cancel.as_deref(),
         );
         let query_time = started.elapsed();
         self.solver_time += query_time;
@@ -1172,6 +1182,7 @@ fn run_solver_commands(
     smt: &str,
     timeout: Option<u32>,
     model_constraints: Option<&[SymBoolExpr]>,
+    external_cancel: Option<&AtomicBool>,
 ) -> SolverCommandRun {
     if commands.is_empty() {
         return SolverCommandRun {
@@ -1180,7 +1191,9 @@ fn run_solver_commands(
         };
     }
     if commands.len() == 1 {
-        let output = match run_solver_process(&commands[0], smt, timeout, &AtomicBool::new(false)) {
+        let cancel = AtomicBool::new(false);
+        let output = match run_solver_process(&commands[0], smt, timeout, &cancel, external_cancel)
+        {
             SolverProcessOutcome::Output(output) => Ok(output),
             SolverProcessOutcome::Unknown => Err(SymbolicError::SolverUnknown),
             SolverProcessOutcome::Cancelled => {
@@ -1201,13 +1214,25 @@ fn run_solver_commands(
 
         let mut saw_unknown = false;
         let mut saw_unsat = false;
+        let mut saw_cancelled = false;
         let mut saw_invalid_sat_model = false;
         let mut errors = Vec::new();
         let mut decisive = None;
         let mut summaries = Vec::new();
 
         while running > 0 || !pending.is_empty() {
-            if decisive.is_none() {
+            if solver_cancelled(&cancel, external_cancel) {
+                saw_cancelled = true;
+                cancel.store(true, Ordering::SeqCst);
+                while let Some(solver) = pending.pop_front() {
+                    summaries.push(summary_for_unstarted_solver(solver));
+                }
+                if running == 0 {
+                    break;
+                }
+            }
+
+            if decisive.is_none() && !saw_cancelled {
                 let now = started_at.elapsed();
                 let mut launched = false;
                 while pending
@@ -1222,7 +1247,13 @@ fn run_solver_commands(
                     launched = true;
                     scope.spawn(move || {
                         let start = Instant::now();
-                        let outcome = run_solver_process(&solver.command, smt, timeout, &cancel);
+                        let outcome = run_solver_process(
+                            &solver.command,
+                            smt,
+                            timeout,
+                            &cancel,
+                            external_cancel,
+                        );
                         let _ = tx.send(SolverProcessResult {
                             index: solver.index,
                             display: solver.command.display,
@@ -1328,6 +1359,7 @@ fn run_solver_commands(
                     saw_unknown = true;
                 }
                 SolverProcessOutcome::Cancelled => {
+                    saw_cancelled = true;
                     summaries.push(
                         SolverRunSummary::new(display, elapsed, SolverOutcome::Cancelled)
                             .with_schedule(index, scheduled_after, Some(started_after)),
@@ -1360,6 +1392,8 @@ fn run_solver_commands(
             Ok("unsat\n".to_string())
         } else if saw_unknown {
             Err(SymbolicError::SolverUnknown)
+        } else if saw_cancelled {
+            Err(SymbolicError::Solver("solver query was cancelled".to_string()))
         } else {
             Err(SymbolicError::Solver(errors.join("; ")))
         };
@@ -1479,6 +1513,7 @@ fn run_solver_process(
     smt: &str,
     timeout: Option<u32>,
     cancel: &AtomicBool,
+    external_cancel: Option<&AtomicBool>,
 ) -> SolverProcessOutcome {
     let child = match Command::new(&command.program)
         .args(&command.args)
@@ -1507,7 +1542,7 @@ fn run_solver_process(
     let timeout =
         timeout.filter(|seconds| *seconds > 0).map(|seconds| Duration::from_secs(seconds.into()));
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        if solver_cancelled(cancel, external_cancel) {
             return SolverProcessOutcome::Cancelled;
         }
 
@@ -1543,6 +1578,11 @@ fn run_solver_process(
         ));
     }
     SolverProcessOutcome::Output(stdout)
+}
+
+fn solver_cancelled(cancel: &AtomicBool, external_cancel: Option<&AtomicBool>) -> bool {
+    cancel.load(Ordering::SeqCst)
+        || external_cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst))
 }
 
 fn solver_wait_duration(elapsed: Duration, timeout: Option<Duration>) -> Option<Duration> {

@@ -2562,9 +2562,11 @@ forgetest_init!(symbolic_fuzz_worker_reports_counterexample, |prj, cmd| {
         "SymbolicFuzzWorker.t.sol",
         r#"
 contract SymbolicFuzzWorker {
-    function testFuzz_symbolicWorker(uint256 x) public pure {
-        if (x == 0xdeadbeef) {
-            assert(false);
+    function testFuzz_symbolicWorker(uint256 x, uint256 y) public pure {
+        unchecked {
+            if (x * 7 == 1 && y == 0) {
+                assert(false);
+            }
         }
     }
 }
@@ -2585,8 +2587,7 @@ contract SymbolicFuzzWorker {
         ])
         .assert_success();
 
-    let stdout = cmd
-        .forge_fuse()
+    cmd.forge_fuse()
         .args([
             "test",
             "--match-test",
@@ -2599,13 +2600,78 @@ contract SymbolicFuzzWorker {
             "1",
             "--symbolic-fuzz-worker",
         ])
+        .assert_success();
+
+    let stdout = cmd
+        .forge_fuse()
+        .args([
+            "test",
+            "--match-test",
+            "testFuzz_symbolicWorker",
+            "--fuzz-runs",
+            "100000",
+            "--fuzz-seed",
+            "0x1",
+            "--threads",
+            "1",
+            "--symbolic-fuzz-worker",
+        ])
         .assert_failure()
         .get_output()
         .stdout_lossy();
 
     assert!(stdout.contains("[FAIL: panic: assertion failed (0x01); counterexample:"), "{stdout}");
-    assert!(stdout.contains("testFuzz_symbolicWorker(uint256) (runs: 1"), "{stdout}");
-    assert!(stdout.contains("3735928559"), "{stdout}");
+    assert!(stdout.contains("testFuzz_symbolicWorker(uint256,uint256) (runs:"), "{stdout}");
+});
+
+forgetest_init!(symbolic_fuzz_worker_ignores_skip_replay, |prj, cmd| {
+    if !z3_available() {
+        let _ = sh_eprintln!(
+            "skipping symbolic_fuzz_worker_ignores_skip_replay because z3 is not available"
+        );
+        return;
+    }
+
+    prj.add_test(
+        "SymbolicFuzzWorkerSkip.t.sol",
+        r#"
+interface Vm {
+    function skip(bool) external;
+}
+
+contract SymbolicFuzzWorkerSkip {
+    Vm constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
+
+    function testFuzz_symbolicWorkerSkip(uint256 x) public {
+        unchecked {
+            if (x * 7 == 1) {
+                vm.skip(true);
+            }
+        }
+    }
+}
+"#,
+    );
+
+    let stdout = cmd
+        .forge_fuse()
+        .args([
+            "test",
+            "--match-test",
+            "testFuzz_symbolicWorkerSkip",
+            "--fuzz-runs",
+            "100000",
+            "--fuzz-seed",
+            "0x1",
+            "--threads",
+            "1",
+            "--symbolic-fuzz-worker",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+
+    assert!(stdout.contains("[PASS] testFuzz_symbolicWorkerSkip(uint256)"), "{stdout}");
 });
 
 forgetest_init!(symbolic_seed_corpus_is_best_effort_for_symbolic_incomplete, |prj, cmd| {

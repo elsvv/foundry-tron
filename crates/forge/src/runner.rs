@@ -105,6 +105,24 @@ fn should_symbolically_use_fuzz_frontiers(config: &Config, func: &Function) -> b
     config.symbolic.use_fuzz_frontiers && func.test_function_kind().is_fuzz_test()
 }
 
+fn merge_symbolic_worker_result(result: &mut FuzzTestResult, symbolic: FuzzTestResult) {
+    result.success = false;
+    result.skipped = symbolic.skipped;
+    result.reason = symbolic.reason;
+    result.counterexample = symbolic.counterexample;
+    result.traces = symbolic.traces;
+    result.gas_report_traces.extend(symbolic.gas_report_traces);
+    result.breakpoints = symbolic.breakpoints;
+    result.debug_bytecodes.extend(symbolic.debug_bytecodes);
+    result.deprecated_cheatcodes.extend(symbolic.deprecated_cheatcodes);
+    result.logs.extend(symbolic.logs);
+    result.labels.extend(symbolic.labels);
+    HitMaps::merge_opt(&mut result.line_coverage, symbolic.line_coverage);
+    result.gas_by_case.extend(symbolic.gas_by_case);
+    result.failed_corpus_replays =
+        result.failed_corpus_replays.saturating_add(symbolic.failed_corpus_replays);
+}
+
 const FUZZ_BRANCH_FRONTIER_SCHEMA: &str = "foundry:fuzz.branch-frontiers@v1";
 const FUZZ_BRANCH_FRONTIER_FILE: &str = "branch-frontiers.json";
 
@@ -2218,6 +2236,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             collect_success_input: false,
             corpus_seeds,
             branch_target: None,
+            cancel: None,
         });
         let portfolio_diagnostics = symbolic.portfolio_diagnostics();
         let symbolic_diagnostics = symbolic.take_diagnostics();
@@ -2736,6 +2755,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 collect_success_input: true,
                 corpus_seeds: vec![input],
                 branch_target: Some(target),
+                cancel: None,
             });
 
             let (input, expect_failure) = match result {
@@ -2833,6 +2853,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             collect_success_input: true,
             corpus_seeds: Vec::new(),
             branch_target: None,
+            cancel: None,
         });
 
         let input = match result {
@@ -2943,6 +2964,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             collect_success_input: false,
             corpus_seeds: Vec::new(),
             branch_target: None,
+            cancel: Some(Arc::clone(&stop)),
         });
         let SymbolicRunResult::Counterexample { args, calldata, .. } = result else {
             return None;
@@ -2953,6 +2975,11 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             return None;
         };
         if raw_call_result.result.as_ref() == MAGIC_ASSUME {
+            return None;
+        }
+        if raw_call_result.reverter == Some(CHEATCODE_ADDRESS)
+            && SkipReason::decode(&raw_call_result.result).is_some()
+        {
             return None;
         }
 
@@ -2974,8 +3001,6 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             return None;
         }
 
-        stop.store(true, Ordering::Relaxed);
-
         let (breakpoints, deprecated_cheatcodes) =
             raw_call_result.cheatcodes.as_ref().map_or_else(Default::default, |cheats| {
                 (cheats.breakpoints.clone(), cheats.deprecated.clone())
@@ -2996,7 +3021,7 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         let counterexample =
             BaseCounterExample::from_fuzz_call(calldata, args, raw_call_result.traces);
 
-        Some(FuzzTestResult {
+        let test_result = FuzzTestResult {
             success: false,
             gas_by_case: vec![(raw_call_result.gas_used, raw_call_result.stipend)],
             reason,
@@ -3010,7 +3035,13 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
             debug_bytecodes,
             deprecated_cheatcodes,
             ..Default::default()
-        })
+        };
+
+        if stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+            return None;
+        }
+
+        Some(test_result)
     }
 
     /// Runs a table test.
@@ -4232,6 +4263,9 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 symbolic_worker_stop.clone(),
                 &self.cr.tokio_handle,
             );
+            if let Some(stop) = symbolic_worker_stop.as_ref() {
+                stop.store(true, Ordering::Release);
+            }
             let symbolic_worker_result =
                 symbolic_worker_handle.and_then(|handle| match handle.join() {
                     Ok(result) => result,
@@ -4249,10 +4283,8 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
                 return self.result;
             }
         };
-        if result.success
-            && let Some(symbolic_worker_result) = symbolic_worker_result
-        {
-            result = symbolic_worker_result;
+        if let Some(symbolic_worker_result) = symbolic_worker_result {
+            merge_symbolic_worker_result(&mut result, symbolic_worker_result);
         }
 
         // Record counterexample.

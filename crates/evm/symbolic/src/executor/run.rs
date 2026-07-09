@@ -111,22 +111,49 @@ impl SymbolicExecutor {
         self.deferred_incomplete = None;
         self.solver.clear_context_caches();
         self.cx = SymCx::new();
-        if let Err(err) = self.solver.check_available() {
-            return SymbolicRunResult::Incomplete {
+        let cancel = input.cancel.clone();
+        self.solver.set_cancel(cancel.clone());
+        let result = if symbolically_cancelled(cancel.as_deref()) {
+            SymbolicRunResult::Incomplete {
+                kind: SymbolicStopReason::Timeout,
+                reason: "symbolic execution cancelled".to_string(),
+                stats: self.solver.stats(),
+            }
+        } else if let Err(err) = self.solver.check_available() {
+            SymbolicRunResult::Incomplete {
                 kind: err.stop_reason(),
                 reason: err.to_string(),
                 stats: SymbolicStats::default(),
-            };
-        }
+            }
+        } else {
+            match self.run_inner(input) {
+                Ok(result) => result,
+                Err(err) => SymbolicRunResult::Incomplete {
+                    kind: err.stop_reason(),
+                    reason: err.to_string(),
+                    stats: self.solver.stats(),
+                },
+            }
+        };
+        self.solver.set_cancel(None);
+        result
+    }
 
-        match self.run_inner(input) {
-            Ok(result) => result,
-            Err(err) => SymbolicRunResult::Incomplete {
-                kind: err.stop_reason(),
-                reason: err.to_string(),
-                stats: self.solver.stats(),
-            },
+    fn cancelled_result(&self, completed_paths: usize) -> SymbolicRunResult {
+        SymbolicRunResult::Incomplete {
+            kind: SymbolicStopReason::Timeout,
+            reason: "symbolic execution cancelled".to_string(),
+            stats: self.stats_with_paths(completed_paths),
         }
+    }
+
+    fn check_cancelled<FEN: FoundryEvmNetwork>(
+        &self,
+        input: &SymbolicRunInput<'_, FEN>,
+        completed_paths: usize,
+    ) -> Option<SymbolicRunResult> {
+        symbolically_cancelled(input.cancel.as_deref())
+            .then(|| self.cancelled_result(completed_paths))
     }
 
     /// Returns corpus seed indexes that can be modeled by at least one symbolic calldata variant.
@@ -165,6 +192,7 @@ impl SymbolicExecutor {
         &mut self,
         input: SymbolicInvariantRunInput<'_, FEN>,
     ) -> SymbolicInvariantRunResult {
+        self.solver.set_cancel(None);
         self.deferred_incomplete = None;
         self.solver.clear_context_caches();
         self.cx = SymCx::new();
@@ -231,6 +259,9 @@ impl SymbolicExecutor {
         let depth_limit = self.config.execution_depth() as usize;
 
         while let Some(mut state) = self.pop_next_feasible_path(&mut worklist)? {
+            if let Some(result) = self.check_cancelled(&input, completed_paths) {
+                return Ok(result);
+            }
             if completed_paths >= path_limit {
                 debug!(completed_paths, path_limit, "symbolic path limit reached");
                 return Ok(SymbolicRunResult::Incomplete {
@@ -245,6 +276,9 @@ impl SymbolicExecutor {
             trace!(completed_paths, worklist_size = worklist.len(), "exploring symbolic path");
 
             loop {
+                if let Some(result) = self.check_cancelled(&input, completed_paths) {
+                    return Ok(result);
+                }
                 if state.depth >= depth_limit {
                     debug!(depth = state.depth, depth_limit, "symbolic depth limit reached");
                     return Ok(SymbolicRunResult::Incomplete {
@@ -660,4 +694,8 @@ impl SymbolicExecutor {
     fn hard_arith_heuristic_incomplete_reason() -> String {
         "hard arithmetic heuristic witness used; no replayed counterexample found".to_string()
     }
+}
+
+fn symbolically_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst))
 }

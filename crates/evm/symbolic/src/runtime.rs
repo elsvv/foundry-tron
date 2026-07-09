@@ -83,6 +83,8 @@ pub struct SymbolicRunInput<'a, FEN: FoundryEvmNetwork> {
     pub corpus_seeds: Vec<SymbolicConcreteInput>,
     /// Optional comparison site whose opposite branch should be solved.
     pub branch_target: Option<SymbolicBranchTarget>,
+    /// Optional cancellation token for callers racing symbolic execution against other work.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 /// Error returned by the internal symbolic executor.
