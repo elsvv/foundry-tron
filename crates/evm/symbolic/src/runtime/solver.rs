@@ -1,5 +1,5 @@
 use super::*;
-use std::process::{Child, Output};
+use std::process::{Child, ChildStdin, Output};
 use wait_timeout::ChildExt;
 
 mod hard_arith_fallback;
@@ -1532,15 +1532,14 @@ fn run_solver_process(
     };
     let mut child = SolverChild::new(child);
 
-    if let Some(mut stdin) = child.child_mut().stdin.take()
-        && let Err(err) = stdin.write_all(smt.as_bytes())
-    {
-        return SolverProcessOutcome::Error(format!("failed to write solver query: {err}"));
-    }
-
     let started_at = Instant::now();
     let timeout =
         timeout.filter(|seconds| *seconds > 0).map(|seconds| Duration::from_secs(seconds.into()));
+    if let Err(outcome) =
+        write_solver_input(&mut child, smt, started_at, timeout, cancel, external_cancel)
+    {
+        return outcome;
+    }
     loop {
         if solver_cancelled(cancel, external_cancel) {
             return SolverProcessOutcome::Cancelled;
@@ -1578,6 +1577,57 @@ fn run_solver_process(
         ));
     }
     SolverProcessOutcome::Output(stdout)
+}
+
+fn write_solver_input(
+    child: &mut SolverChild,
+    smt: &str,
+    started_at: Instant,
+    timeout: Option<Duration>,
+    cancel: &AtomicBool,
+    external_cancel: Option<&AtomicBool>,
+) -> Result<(), SolverProcessOutcome> {
+    let Some(stdin) = child.child_mut().stdin.take() else {
+        return Ok(());
+    };
+    let input = start_solver_input_writer(stdin, smt);
+    loop {
+        if solver_cancelled(cancel, external_cancel) {
+            return Err(SolverProcessOutcome::Cancelled);
+        }
+
+        let Some(wait) = solver_wait_duration(started_at.elapsed(), timeout) else {
+            return Err(SolverProcessOutcome::Unknown);
+        };
+
+        match input.recv_timeout(wait) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => {
+                return Err(SolverProcessOutcome::Error(format!(
+                    "failed to write solver query: {err}"
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(SolverProcessOutcome::Error(
+                    "solver input writer stopped before reporting result".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+fn start_solver_input_writer(
+    mut stdin: ChildStdin,
+    smt: &str,
+) -> mpsc::Receiver<std::io::Result<()>> {
+    let (tx, rx) = mpsc::channel();
+    let smt = smt.as_bytes().to_vec();
+    thread::spawn(move || {
+        let result = stdin.write_all(&smt);
+        let _ = tx.send(result);
+    });
+    rx
 }
 
 fn solver_cancelled(cancel: &AtomicBool, external_cancel: Option<&AtomicBool>) -> bool {
@@ -1776,4 +1826,50 @@ fn model_symbols_for_constraints(
         constraint.collect_vars(&mut vars);
     }
     vars.into_iter().map(|symbol| (cx.symbol_name(symbol).to_owned(), symbol)).collect()
+}
+
+#[cfg(test)]
+mod solver_process_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn sleeping_command() -> SolverCommand {
+        SolverCommand::new(vec!["/bin/sleep".to_string(), "5".to_string()], false).unwrap()
+    }
+
+    fn large_solver_query() -> String {
+        "(assert true)\n".repeat(1_000_000)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn solver_input_write_obeys_timeout() {
+        let cancel = AtomicBool::new(false);
+        let started_at = Instant::now();
+
+        let outcome =
+            run_solver_process(&sleeping_command(), &large_solver_query(), Some(1), &cancel, None);
+
+        assert!(matches!(outcome, SolverProcessOutcome::Unknown));
+        assert!(started_at.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn solver_input_write_obeys_external_cancel() {
+        let cancel = AtomicBool::new(false);
+        let external_cancel = AtomicBool::new(true);
+        let started_at = Instant::now();
+
+        let outcome = run_solver_process(
+            &sleeping_command(),
+            &large_solver_query(),
+            Some(5),
+            &cancel,
+            Some(&external_cancel),
+        );
+
+        assert!(matches!(outcome, SolverProcessOutcome::Cancelled));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
 }
