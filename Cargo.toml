@@ -31,6 +31,7 @@ members = [
     "crates/solar/",
     "crates/test-utils/",
     "crates/cli-markdown/",
+    "crates/tron/primitives/",
     "crates/tui/",
 ]
 resolver = "2"
@@ -505,6 +506,12 @@ heck = "0.5"
 uuid = "1.19.0"
 flate2 = "1.1"
 ethereum_ssz = "0.10"
+
+# tron
+bs58 = "0.5"
+prost = "0.13"
+prost-types = "0.13"
+sha2 = "0.10"
 
 # Tempo
 mpp = { git = "https://github.com/tempoxyz/mpp-rs", rev = "6540a5ac3c6f3848684eb619dda7d9720482ae3c", default-features = false, features = [
