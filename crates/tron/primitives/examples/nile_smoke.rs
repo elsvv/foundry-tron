@@ -1,10 +1,18 @@
-//! Manual smoke test against Nile testnet.
+//! Manual smoke test against Nile testnet. Subcommands:
 //!
-//! Usage:
-//!   cargo run --example nile_smoke -- address           # print address for faucet
-//!   cargo run --example nile_smoke -- send <to_T_addr>  # self-transfer 1 TRX
+//!   cargo run --example nile_smoke -- keygen
+//!   cargo run --example nile_smoke -- address
+//!   cargo run --example nile_smoke -- send <to_T_addr>
 //!
-//! Requires TRON_PRIVATE_KEY env var (hex, no 0x).
+//! `keygen` prints a throwaway recipient key + T-address. `address` prints the
+//! funded-key T-address for the faucet. `send` transfers 1 TRX to a DIFFERENT
+//! address (see the note below). `address` and `send` require the
+//! TRON_PRIVATE_KEY env var (hex, no 0x).
+//!
+//! Note: java-tron's TransferActuator rejects a transfer whose recipient equals
+//! the owner ("Cannot transfer TRX to yourself"), so `<to_T_addr>` must differ
+//! from the funded key. Use `keygen` to mint a throwaway recipient; it does not
+//! need to be funded to receive TRX.
 
 use alloy_signer_local::PrivateKeySigner;
 use foundry_tron_primitives::{proto, sign, tapos, to_base58};
@@ -15,14 +23,31 @@ const NILE: &str = "https://nile.trongrid.io";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let signer = PrivateKeySigner::from_str(&std::env::var("TRON_PRIVATE_KEY")?)?;
 
     match args.get(1).map(String::as_str) {
+        Some("keygen") => {
+            // Fresh throwaway key to use as a distinct `send` recipient.
+            let recipient = PrivateKeySigner::random();
+            println!(
+                "private_key: {}",
+                alloy_primitives::hex::encode(recipient.credential().to_bytes())
+            );
+            println!("address:     {}", to_base58(recipient.address()));
+        }
         Some("address") => {
+            let signer = PrivateKeySigner::from_str(&std::env::var("TRON_PRIVATE_KEY")?)?;
             println!("{}", to_base58(signer.address()));
         }
         Some("send") => {
+            let signer = PrivateKeySigner::from_str(&std::env::var("TRON_PRIVATE_KEY")?)?;
             let to = foundry_tron_primitives::parse_address(&args[2])?;
+            // java-tron rejects owner == to ("Cannot transfer TRX to yourself"),
+            // so refuse the self-transfer up front instead of eating a
+            // CONTRACT_VALIDATE_ERROR from the node. Run `keygen` for a
+            // throwaway recipient address.
+            if to == signer.address() {
+                return Err("recipient must differ from the funded key (java-tron rejects self-transfers); run `keygen` for a throwaway address".into());
+            }
             // 1. TAPOS from a fresh block.
             let block: serde_json::Value =
                 ureq::post(&format!("{NILE}/wallet/getnowblock")).call()?.into_json()?;
@@ -71,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into_json()?;
             println!("broadcast response: {resp}");
         }
-        _ => eprintln!("usage: nile_smoke address | send <to>"),
+        _ => eprintln!("usage: nile_smoke keygen | address | send <to>"),
     }
     Ok(())
 }
