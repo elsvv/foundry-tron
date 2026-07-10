@@ -123,6 +123,11 @@ fn merge_symbolic_worker_result(result: &mut FuzzTestResult, symbolic: FuzzTestR
         result.failed_corpus_replays.saturating_add(symbolic.failed_corpus_replays);
 }
 
+fn symbolic_fuzz_worker_replay_rejected(result: &[u8], reverter: Option<Address>) -> bool {
+    result == MAGIC_ASSUME
+        || (reverter == Some(CHEATCODE_ADDRESS) && SkipReason::decode(result).is_some())
+}
+
 const FUZZ_BRANCH_FRONTIER_SCHEMA: &str = "foundry:fuzz.branch-frontiers@v1";
 const FUZZ_BRANCH_FRONTIER_FILE: &str = "branch-frontiers.json";
 
@@ -346,6 +351,21 @@ mod tests {
     use foundry_config::NatSpec;
 
     const CONTRACT_NAME: &str = "src/Test.t.sol:InvariantTest";
+
+    #[test]
+    fn symbolic_worker_replay_rejects_assume_and_skip_payloads() {
+        assert!(symbolic_fuzz_worker_replay_rejected(MAGIC_ASSUME, None));
+
+        let mut skip_with_reason = foundry_evm::constants::MAGIC_SKIP.to_vec();
+        skip_with_reason.extend_from_slice(b"not useful");
+        assert!(symbolic_fuzz_worker_replay_rejected(&skip_with_reason, Some(CHEATCODE_ADDRESS)));
+
+        assert!(!symbolic_fuzz_worker_replay_rejected(
+            &skip_with_reason,
+            Some(Address::with_last_byte(1))
+        ));
+        assert!(!symbolic_fuzz_worker_replay_rejected(b"regular revert", Some(CHEATCODE_ADDRESS)));
+    }
 
     #[test]
     fn symbolic_artifact_file_name_hashes_full_identity() {
@@ -2974,12 +2994,10 @@ impl<'a, FEN: FoundryEvmNetwork> FunctionRunner<'a, FEN> {
         else {
             return None;
         };
-        if raw_call_result.result.as_ref() == MAGIC_ASSUME {
-            return None;
-        }
-        if raw_call_result.reverter == Some(CHEATCODE_ADDRESS)
-            && SkipReason::decode(&raw_call_result.result).is_some()
-        {
+        if symbolic_fuzz_worker_replay_rejected(
+            raw_call_result.result.as_ref(),
+            raw_call_result.reverter,
+        ) {
             return None;
         }
 

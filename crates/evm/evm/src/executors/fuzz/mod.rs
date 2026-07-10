@@ -274,7 +274,11 @@ impl<FEN: FoundryEvmNetwork> FuzzedExecutor<FEN> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(self.aggregate_results(workers, func, &shared_state))
+        let result = self.aggregate_results(workers, func, &shared_state);
+        if let Some(stop) = &shared_state.external_stop {
+            let _ = stop.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        }
+        Ok(result)
     }
 
     /// Replays the persisted single-call counterexample exactly once.
