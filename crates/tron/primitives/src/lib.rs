@@ -5,4 +5,5 @@
 
 pub mod address;
 pub mod keys;
+pub mod proto;
 pub mod units;
