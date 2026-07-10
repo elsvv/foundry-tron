@@ -113,7 +113,7 @@ impl Default for SymbolicConfig {
         Self {
             enabled: false,
             seed_corpus: false,
-            fuzz_worker: true,
+            fuzz_worker: false,
             use_fuzz_corpus: false,
             corpus_seed_limit: 32,
             use_fuzz_frontiers: false,
