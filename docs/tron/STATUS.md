@@ -29,6 +29,7 @@
 3. Chain id Tron mainnet: `728126428`. TVM ≈ Cancun (java-tron 4.8.x): PUSH0, TLOAD/TSTORE, MCOPY есть; BLOBHASH/BLOBBASEFEE — заглушки 0.
 4. Транзакции — protobuf (не RLP), txID = sha256(raw_data), подпись по txID, TAPOS вместо nonce, `eth_sendRawTransaction` отсутствует — запись только через HTTP `/wallet/*` (см. crates/tron/provider).
 5. Sample-проект: `sandbox/tron-counter` (без forge-std; ассерты chainid=728126428 и tstore/tload).
+6. **ISCONTRACT (0xD4) в java-tron проверяет наличие контракт-аккаунта (`ContractCapsule`), а не непустоту кода** (финальное ревью C2 по исходникам @develop). Заглушка этапа 1.5 (`load_account_code` непуст) расходится только в экзотике: self-check внутри конструктора (java-tron уже true, у нас ещё false), контракт с пустым runtime-кодом. Учесть при golden-тестах против Nile в Этапе 2. Там же: трейсы forge пока показывают 0xD0–0xD4 как unknown-мнемоники (косметика, Этап 2/3).
 
 ## Окружение (важно для любой машины)
 
