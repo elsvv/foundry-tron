@@ -204,7 +204,8 @@ impl TronProvider {
         amount_sun: i64,
     ) -> Result<(B256, TxInfo), TronError> {
         let (rb, now_ms) = self.tapos().await?;
-        let raw = build_transfer_raw(signer.address(), to, amount_sun, rb, now_ms, &TxOptions::default());
+        let raw =
+            build_transfer_raw(signer.address(), to, amount_sun, rb, now_ms, &TxOptions::default());
         let signed = sign_raw(raw, signer).map_err(|e| TronError::Decode(e.to_string()))?;
         self.broadcast(&signed).await?;
         let info = self.wait_for_confirmation(signed.txid, 20, Duration::from_secs(3)).await?;
@@ -242,7 +243,8 @@ impl TronProvider {
             now_ms,
             opts,
         );
-        let signed = sign_raw_with(raw, signer).await.map_err(|e| TronError::Decode(e.to_string()))?;
+        let signed =
+            sign_raw_with(raw, signer).await.map_err(|e| TronError::Decode(e.to_string()))?;
         let local_addr = contract_address_from_txid(signed.txid, owner);
         self.broadcast(&signed).await?;
         let info = self.wait_for_confirmation(signed.txid, poll.0, poll.1).await?;
@@ -275,7 +277,8 @@ impl TronProvider {
     ) -> Result<(B256, TxInfo), TronError> {
         let (rb, now_ms) = self.tapos().await?;
         let raw = build_trigger_raw(signer.address(), contract, call_value, data, rb, now_ms, opts);
-        let signed = sign_raw_with(raw, signer).await.map_err(|e| TronError::Decode(e.to_string()))?;
+        let signed =
+            sign_raw_with(raw, signer).await.map_err(|e| TronError::Decode(e.to_string()))?;
         self.broadcast(&signed).await?;
         let info = self.wait_for_confirmation(signed.txid, poll.0, poll.1).await?;
         Ok((signed.txid, info))
@@ -309,10 +312,7 @@ fn wrap_raw(
         fee_limit: opts.fee_limit,
         contract: vec![proto::Contract {
             r#type: ct as i32,
-            parameter: Some(prost_types::Any {
-                type_url: proto::type_url(ct).to_string(),
-                value,
-            }),
+            parameter: Some(prost_types::Any { type_url: proto::type_url(ct).to_string(), value }),
             ..Default::default()
         }],
         ..Default::default()
@@ -705,7 +705,8 @@ mod tests {
         .unwrap();
         let sc = create.new_contract.as_ref().unwrap();
         let rb = RefBlock { bytes: raw.ref_block_bytes.clone(), hash: raw.ref_block_hash.clone() };
-        let opts = TxOptions { fee_limit: raw.fee_limit, expiration_ms: raw.expiration - raw.timestamp };
+        let opts =
+            TxOptions { fee_limit: raw.fee_limit, expiration_ms: raw.expiration - raw.timestamp };
         let rebuilt = build_create_raw(
             owner,
             sc.bytecode.clone(),
@@ -737,9 +738,10 @@ mod tests {
         let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live deploy");
         let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
         let p = TronProvider::new("https://nile.trongrid.io").unwrap();
-        let creation =
-            hex::decode(include_str!("../../../evm/core/testdata/tron_counter_creation.hex").trim())
-                .unwrap();
+        let creation = hex::decode(
+            include_str!("../../../evm/core/testdata/tron_counter_creation.hex").trim(),
+        )
+        .unwrap();
         // 400 TRX cap per the plan's live-test budget.
         let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
         let poll = (30u32, Duration::from_secs(3));
@@ -759,8 +761,7 @@ mod tests {
         // setNumber(7).
         let mut set = hex::decode("3fb5c1cb").unwrap();
         set.extend_from_slice(&alloy_primitives::U256::from(7u64).to_be_bytes::<32>());
-        let (_txid2, info2) =
-            p.trigger_contract(&signer, addr, 0, set, &opts, poll).await.unwrap();
+        let (_txid2, info2) = p.trigger_contract(&signer, addr, 0, set, &opts, poll).await.unwrap();
         assert!(info2.success, "setNumber must succeed");
 
         // number() == 7 via a constant call.
