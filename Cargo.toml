@@ -32,6 +32,7 @@ members = [
     "crates/test-utils/",
     "crates/cli-markdown/",
     "crates/tron/primitives/",
+    "crates/tron/provider/",
     "crates/tui/",
 ]
 resolver = "2"

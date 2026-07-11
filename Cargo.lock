@@ -5986,6 +5986,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "foundry-tron-provider"
+version = "1.7.2"
+dependencies = [
+ "alloy-primitives",
+ "alloy-signer-local",
+ "foundry-tron-primitives",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "foundry-tui"
 version = "1.7.2"
 dependencies = [
