@@ -15,6 +15,9 @@ workspace = true
 [dependencies]
 foundry-tron-primitives = { path = "../primitives" }
 alloy-primitives.workspace = true
+alloy-signer-local.workspace = true
+prost.workspace = true
+prost-types.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -22,5 +25,4 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-alloy-signer-local.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

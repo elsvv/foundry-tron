@@ -3,9 +3,11 @@
 use alloy_primitives::{Address, B256, hex};
 use foundry_tron_primitives::{
     address::to_hex41,
-    sign::SignedTronTx,
+    proto::{self, ContractType},
+    sign::{SignedTronTx, sign_raw},
     tapos::{RefBlock, ref_block},
 };
+use prost::Message;
 use serde::de::DeserializeOwned;
 
 #[derive(Debug, thiserror::Error)]
@@ -152,6 +154,63 @@ impl TronProvider {
             tokio::time::sleep(interval).await;
         }
         Err(TronError::Timeout(format!("tx {txid} not confirmed after {max_attempts} attempts")))
+    }
+
+    /// Sends `amount_sun` SUN from `signer`'s account to `to` and waits for
+    /// confirmation. Runs the full cycle: fetch TAPOS from a fresh block, build
+    /// and sign a `TransferContract` (expiration = block timestamp + 60s),
+    /// broadcast it, then poll for confirmation (20 attempts, 3s apart).
+    pub async fn send_transfer(
+        &self,
+        signer: &alloy_signer_local::PrivateKeySigner,
+        to: Address,
+        amount_sun: i64,
+    ) -> Result<(B256, TxInfo), TronError> {
+        let (rb, now_ms) = self.tapos().await?;
+        let raw = build_transfer_raw(signer.address(), to, amount_sun, rb, now_ms);
+        let signed = sign_raw(raw, signer).map_err(|e| TronError::Decode(e.to_string()))?;
+        self.broadcast(&signed).await?;
+        let info =
+            self.wait_for_confirmation(signed.txid, 20, std::time::Duration::from_secs(3)).await?;
+        Ok((signed.txid, info))
+    }
+}
+
+/// Builds the `TransactionRaw` for a native TRX transfer. Deterministic and
+/// unit-testable offline: addresses are prefixed with the 0x41 Tron byte and
+/// the expiration window is fixed at 60s past `now_ms`.
+pub(crate) fn build_transfer_raw(
+    owner: Address,
+    to: Address,
+    amount_sun: i64,
+    rb: RefBlock,
+    now_ms: i64,
+) -> proto::TransactionRaw {
+    let addr21 = |a: Address| {
+        let mut v = Vec::with_capacity(21);
+        v.push(0x41);
+        v.extend_from_slice(a.as_slice());
+        v
+    };
+    let transfer = proto::TransferContract {
+        owner_address: addr21(owner),
+        to_address: addr21(to),
+        amount: amount_sun,
+    };
+    proto::TransactionRaw {
+        ref_block_bytes: rb.bytes,
+        ref_block_hash: rb.hash,
+        expiration: now_ms + 60_000,
+        timestamp: now_ms,
+        contract: vec![proto::Contract {
+            r#type: ContractType::TransferContract as i32,
+            parameter: Some(prost_types::Any {
+                type_url: proto::type_url(ContractType::TransferContract).to_string(),
+                value: transfer.encode_to_vec(),
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
     }
 }
 
@@ -388,5 +447,55 @@ mod tests {
         let bogus = B256::repeat_byte(0xab);
         let res = p.wait_for_confirmation(bogus, 2, std::time::Duration::from_millis(300)).await;
         assert!(matches!(res, Err(TronError::Timeout(_))));
+    }
+
+    #[test]
+    fn builds_transfer_raw_deterministically() {
+        use foundry_tron_primitives::tapos::RefBlock;
+        let owner =
+            foundry_tron_primitives::address::parse("TX7izXWcmofRYonzdcThrS78jifMtVWCuf").unwrap();
+        let to =
+            foundry_tron_primitives::address::parse("T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb").unwrap();
+        let rb = RefBlock { bytes: vec![0x3c, 0x6f], hash: vec![1, 2, 3, 4, 5, 6, 7, 8] };
+        let raw = build_transfer_raw(owner, to, 1_000_000, rb, 1_783_775_034_896);
+
+        assert_eq!(raw.ref_block_bytes, vec![0x3c, 0x6f]);
+        assert_eq!(raw.expiration, 1_783_775_034_896 + 60_000);
+        assert_eq!(raw.timestamp, 1_783_775_034_896);
+        assert_eq!(raw.contract.len(), 1);
+        let c = &raw.contract[0];
+        assert_eq!(c.r#type, foundry_tron_primitives::proto::ContractType::TransferContract as i32);
+        // `parameter` decodes back to the same `TransferContract` with 21-byte
+        // 0x41 addresses.
+        let tc = <foundry_tron_primitives::proto::TransferContract as prost::Message>::decode(
+            c.parameter.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(tc.owner_address[0], 0x41);
+        assert_eq!(tc.owner_address[1..], owner.as_slice()[..]);
+        assert_eq!(tc.to_address[1..], to.as_slice()[..]);
+        assert_eq!(tc.amount, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn live_e2e_transfer_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live E2E");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        let p = TronProvider::new("https://nile.trongrid.io").unwrap();
+        // Send 0.1 TRX to the burn address (testnet).
+        let to =
+            foundry_tron_primitives::address::parse("T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb").unwrap();
+        let (txid, info) = p.send_transfer(&signer, to, 100_000).await.unwrap();
+        assert!(info.block_number > 69_000_000);
+        assert!(info.success);
+        eprintln!(
+            "live E2E tx: https://nile.tronscan.org/#/transaction/{}",
+            alloy_primitives::hex::encode(txid)
+        );
     }
 }
