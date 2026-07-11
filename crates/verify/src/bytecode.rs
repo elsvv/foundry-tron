@@ -182,6 +182,10 @@ impl VerifyBytecodeArgs {
             NetworkVariant::Tempo => {
                 self.run_with_network_and_config::<TempoEvmNetwork>(config).await
             }
+            NetworkVariant::Tron => {
+                // Naive Tron executes as vanilla EVM.
+                self.run_with_network_and_config::<EthEvmNetwork>(config).await
+            }
         }
     }
 

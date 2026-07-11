@@ -108,6 +108,7 @@ pub enum NetworkVariant {
     #[cfg(feature = "optimism")]
     Optimism,
     Tempo,
+    Tron,
 }
 
 impl std::str::FromStr for NetworkVariant {
@@ -119,6 +120,7 @@ impl std::str::FromStr for NetworkVariant {
             #[cfg(feature = "optimism")]
             "optimism" => Ok(Self::Optimism),
             "tempo" => Ok(Self::Tempo),
+            "tron" => Ok(Self::Tron),
             _ => Err(format!("unknown network variant: {s}")),
         }
     }
@@ -131,6 +133,7 @@ impl NetworkVariant {
             #[cfg(feature = "optimism")]
             Self::Optimism => "optimism",
             Self::Tempo => "tempo",
+            Self::Tron => "tron",
         }
     }
 }
@@ -212,6 +215,16 @@ impl NetworkConfigs {
 
     pub const fn is_tempo(&self) -> bool {
         matches!(self.resolved_network(), Some(NetworkVariant::Tempo))
+    }
+
+    /// Creates configs with the Tron network enabled.
+    pub fn with_tron() -> Self {
+        Self { network: Some(NetworkVariant::Tron), ..Default::default() }
+    }
+
+    /// Returns true when the Tron network is selected.
+    pub const fn is_tron(&self) -> bool {
+        matches!(self.resolved_network(), Some(NetworkVariant::Tron))
     }
 
     pub const fn is_celo(&self) -> bool {
@@ -380,6 +393,7 @@ impl From<NetworkVariant> for NetworkConfigs {
             NetworkVariant::Tempo => {
                 Self { network: Some(network), tempo: true, ..Default::default() }
             }
+            NetworkVariant::Tron => Self { network: Some(network), ..Default::default() },
             #[cfg(feature = "optimism")]
             NetworkVariant::Optimism => {
                 Self { network: Some(network), optimism: true, ..Default::default() }
@@ -548,5 +562,26 @@ mod tests {
             let cfg_optimism: NetworkConfigs = serde_json::from_str(json_optimism).unwrap();
             assert!(cfg_optimism.is_optimism());
         }
+    }
+}
+
+#[cfg(test)]
+mod tron_tests {
+    use super::*;
+
+    #[test]
+    fn tron_variant_parses_and_names() {
+        let v: NetworkVariant = "tron".parse().unwrap();
+        assert_eq!(v, NetworkVariant::Tron);
+        assert_eq!(v.name(), "tron");
+    }
+
+    #[test]
+    fn tron_configs_flag() {
+        let c = NetworkConfigs::with_tron();
+        assert!(c.is_tron());
+        assert!(!c.is_tempo());
+        let via_from: NetworkConfigs = NetworkVariant::Tron.into();
+        assert!(via_from.is_tron());
     }
 }
