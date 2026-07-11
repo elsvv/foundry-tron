@@ -169,6 +169,34 @@ mod tests {
     }
 
     #[test]
+    fn nile_create_tx_roundtrip_and_txid() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/nile_create_tx.json")).unwrap();
+        let bytes = hex::decode(json["raw_data_hex"].as_str().unwrap()).unwrap();
+        let raw = TransactionRaw::decode(bytes.as_slice()).unwrap();
+
+        // Re-encode is byte-identical (the deploy carries an empty abi, so every
+        // field is modelled) and hashes to the node's txID.
+        assert_eq!(raw.encode_to_vec(), bytes, "re-encode must be byte-identical");
+        assert_eq!(hex::encode(txid(&raw)), json["txID"].as_str().unwrap());
+
+        // The single contract decodes to a CreateSmartContract with the fixture
+        // owner, and its inner `Any` parameter round-trips byte-identically.
+        assert_eq!(raw.contract.len(), 1);
+        let c = &raw.contract[0];
+        assert_eq!(c.r#type, ContractType::CreateSmartContract as i32);
+        let param = c.parameter.as_ref().unwrap();
+        assert_eq!(param.type_url, type_url(ContractType::CreateSmartContract));
+        let create = CreateSmartContract::decode(param.value.as_slice()).unwrap();
+        assert_eq!(hex::encode(&create.owner_address), json["owner_address"].as_str().unwrap());
+        assert_eq!(create.owner_address[0], 0x41);
+        assert_eq!(create.encode_to_vec(), param.value, "CreateSmartContract re-encode");
+        let sc = create.new_contract.as_ref().unwrap();
+        assert_eq!(sc.name, "Counter");
+        assert!(!sc.bytecode.is_empty());
+    }
+
+    #[test]
     fn trigger_contract_any_roundtrip() {
         let trig = TriggerSmartContract {
             owner_address: vec![0x41; 21],

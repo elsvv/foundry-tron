@@ -10,7 +10,10 @@ pub mod sign;
 pub mod tapos;
 pub mod units;
 
-pub use address::{parse as parse_address, to_base58, to_hex41};
-pub use proto::{ContractType, Transaction, TransactionRaw, TriggerSmartContract, txid};
-pub use sign::{SignedTronTx, sign_raw};
-pub use tapos::ref_block;
+pub use address::{contract_address_from_txid, parse as parse_address, to_base58, to_hex41};
+pub use proto::{
+    ContractType, CreateSmartContract, SmartContract, Transaction, TransactionRaw,
+    TransferContract, TriggerSmartContract, txid, type_url,
+};
+pub use sign::{SignedTronTx, sign_raw, sign_raw_with};
+pub use tapos::{RefBlock, ref_block};

@@ -5982,6 +5982,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tokio",
  "ureq",
 ]
 
@@ -5990,6 +5991,7 @@ name = "foundry-tron-provider"
 version = "1.7.2"
 dependencies = [
  "alloy-primitives",
+ "alloy-signer",
  "alloy-signer-local",
  "foundry-tron-primitives",
  "prost 0.13.5",
