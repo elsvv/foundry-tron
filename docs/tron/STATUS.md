@@ -1,8 +1,8 @@
 # foundry-tron: статус проекта
 
-Форк Foundry с поддержкой Tron (TVM). Fork: `elsvv/foundry-tron`, upstream: `foundry-rs/foundry` (в апстриме уже есть мультисетевость Ethereum/Optimism/Tempo — Tron добавляется по тем же швам). Рабочая ветка: **`tron-dev`** (дефолтная ветка форка).
+Форк Foundry с поддержкой Tron (TVM). Fork: `elsvv/foundry-tron`, upstream: `foundry-rs/foundry` (в апстриме уже есть мультисетевость Ethereum/Optimism/Tempo — Tron добавляется по тем же швам). Дефолтная ветка форка — **`tron-dev`**. Текущая работа (планы C2 → D) идёт в ветке **`tron-dev-continue`** (ответвлена от `tron-dev`); PR `tron-dev-continue` → `tron-dev` в процессе.
 
-Локальный путь на этой машине: `/Users/vaceslaveliseev/@dev/foundry-tron` — это САМ репозиторий (плоская структура: `crates/`, `docs/tron/`, `sandbox/` прямо в корне). Никакой обёрточной папки/вложенного `foundry/` больше нет — если видите путь вида `.../foundry-tron/foundry/...`, это устаревшее упоминание из старой сессии.
+Локальный путь на этой машине: `/Users/andrey/vibe_projects/foundry-tron` — это САМ репозиторий (плоская структура: `crates/`, `docs/tron/`, `sandbox/` прямо в корне). Никакой обёрточной папки/вложенного `foundry/` больше нет — если видите путь вида `.../foundry-tron/foundry/...`, это устаревшее упоминание из старой сессии.
 
 Обновлено: 2026-07-11.
 
@@ -17,9 +17,9 @@
 |---|---|---|
 | A | `crates/tron/primitives` — адресный кодек base58check/0x41, protobuf-транзакции (txID=sha256(raw_data)), TAPOS, подпись secp256k1 (65 байт, v=27+recid) | ✅ Готов. 18 тестов. Смоук на Nile: tx `3a4d9c5f…` в блоке 69090417 |
 | B | `crates/tron/provider` — async HTTP-клиент `/wallet/*`: блоки/TAPOS, балансы, tx-info, constant-вызовы + energy, broadcast, `send_transfer` | ✅ Готов. 15 тестов (оффлайн fixtures + live `TRON_LIVE=1`), E2E на Nile |
-| C | `NetworkVariant::Tron`, маркер `TronEvmNetwork` (Network=Ethereum, EvmFactory=EthEvmFactory), диспетчеризация forge test, clippy-чистка | ✅ Задачи 1–3 готовы. Задача 4 (E2E-гейт) заблокирована → C2 |
-| C2 | Мини tron-revm: `TronEvmFactory` (EthEvmFactory + insert_instruction для 0xD0–0xD4), закрытие E2E-гейта плана C | 📝 План готов: `docs/tron/plans/2026-07-11-tron-mini-revm.md` (семантика/energy сверены с java-tron). **Workflow НЕ запускать без команды пользователя** |
-| D | cast/forge script: деплой на Nile через tron-provider | ⏳ После C2 |
+| C | `NetworkVariant::Tron`, маркер `TronEvmNetwork` (Network=Ethereum, EvmFactory=`TronEvmFactory`), диспетчеризация forge test, clippy-чистка | ✅ Полностью готов. E2E-гейт (Задача 4) закрыт через C2 |
+| C2 | Мини tron-revm: `TronEvmFactory` (EthEvmFactory + insert_instruction для 0xD0–0xD4), закрытие E2E-гейта плана C | ✅ Готов. Задача 1 (`TronEvmFactory`, unit-тесты на реальном tron-solc-байткоде). Задача 2 — sandbox `forge build`+`forge test` 4/4 на байткоде tron-solc (`testIncrement`, `testTronChainId`, `testTransientStorageCancun`, `testNonPayableGuardWithTvmOpcodes`) |
+| D | cast/forge script: деплой на Nile через tron-provider | ⏳ Следующий (гейт C открыт) |
 | Этап 2 | Полный tron-revm: precompiles (0x09 BatchValidateSign, Ripemd160→0x20003, Blake2F→0x20009), CREATE2-префикс 0x41, energy/bandwidth-репорт, резолвер tron-solc | ⏳ |
 
 ## Ключевые находки (не потерять)
@@ -32,11 +32,12 @@
 
 ## Окружение (важно для любой машины)
 
-- **Тулчейн:** зависимости требуют rustc ≥1.91. Если системный rustc старее (на исходной машине Homebrew 1.88 перекрывал rustup), все cargo-команды запускать так:
+- **Тулчейн:** на текущей машине (`andrey`) — свежий rustup (stable 1.97.0 по умолчанию, nightly с rustfmt). Обычный `cargo` работает; перед командами достаточно `export PATH="$HOME/.cargo/bin:$PATH"`. Форматирование — `cargo +nightly fmt` (repo `rustfmt.toml`).
+  Зависимости требуют rustc ≥1.91. Fallback для машин, где системный/Homebrew rustc старее и перекрывает rustup (как на исходной машине с Homebrew 1.88): все cargo-команды через явный путь к stable-тулчейну:
   ```bash
   TC=$(dirname "$(rustup which --toolchain stable cargo)"); PATH="$TC:$PATH" cargo <...>
   ```
-  Форматирование — nightly rustfmt напрямую (`~/.rustup/toolchains/nightly-*/bin/rustfmt --edition 2024 --config-path rustfmt.toml`).
+- **tron-solc:** нативный бинарник `0.8.27` — `/Users/andrey/.foundry-tron/solc/tron-solc-0.8.27` (universal macOS, sha256 `9e369b44…c7ce17aa`; путь абсолютный, т.к. `SolcReq::Local` не разворачивает `~`). `sandbox/tron-counter/foundry.toml` указывает `solc` именно на него.
 - **Live-тесты:** `TRON_LIVE=1` + `TRON_PRIVATE_KEY` (файл `.env.tron-dev` в корне репо, в git НЕ входит — перенести вручную или сгенерировать новый ключ и пополнить через кран https://nileex.io/join/getJoinPage). Текущий тестовый адрес: `TX7izXWcmofRYonzdcThrS78jifMtVWCuf` (~1997 TRX на Nile).
 - Тесты tron-крейтов: `cargo test -p foundry-tron-primitives -p foundry-tron-provider`. CI-линт: `cargo clippy --all-targets` с `-Dwarnings` — tron-крейты чистые.
 
