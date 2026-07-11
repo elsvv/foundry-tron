@@ -1,6 +1,8 @@
 # foundry-tron: статус проекта
 
-Форк Foundry с поддержкой Tron (TVM). Fork: `elsvv/foundry-tron`, upstream: `foundry-rs/foundry` (в апстриме уже есть мультисетевость Ethereum/Optimism/Tempo — Tron добавляется по тем же швам). Рабочая ветка: **`tron-dev`**.
+Форк Foundry с поддержкой Tron (TVM). Fork: `elsvv/foundry-tron`, upstream: `foundry-rs/foundry` (в апстриме уже есть мультисетевость Ethereum/Optimism/Tempo — Tron добавляется по тем же швам). Рабочая ветка: **`tron-dev`** (дефолтная ветка форка).
+
+Локальный путь на этой машине: `/Users/vaceslaveliseev/@dev/foundry-tron` — это САМ репозиторий (плоская структура: `crates/`, `docs/tron/`, `sandbox/` прямо в корне). Никакой обёрточной папки/вложенного `foundry/` больше нет — если видите путь вида `.../foundry-tron/foundry/...`, это устаревшее упоминание из старой сессии.
 
 Обновлено: 2026-07-11.
 
