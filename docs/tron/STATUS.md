@@ -16,7 +16,7 @@
 | A | `crates/tron/primitives` — адресный кодек base58check/0x41, protobuf-транзакции (txID=sha256(raw_data)), TAPOS, подпись secp256k1 (65 байт, v=27+recid) | ✅ Готов. 18 тестов. Смоук на Nile: tx `3a4d9c5f…` в блоке 69090417 |
 | B | `crates/tron/provider` — async HTTP-клиент `/wallet/*`: блоки/TAPOS, балансы, tx-info, constant-вызовы + energy, broadcast, `send_transfer` | ✅ Готов. 15 тестов (оффлайн fixtures + live `TRON_LIVE=1`), E2E на Nile |
 | C | `NetworkVariant::Tron`, маркер `TronEvmNetwork` (Network=Ethereum, EvmFactory=EthEvmFactory), диспетчеризация forge test, clippy-чистка | ✅ Задачи 1–3 готовы. Задача 4 (E2E-гейт) заблокирована → C2 |
-| C2 | Мини tron-revm: кастомная таблица инструкций для TronEvmNetwork — заглушки опкодов 0xD0–0xD4 | 📝 План пишется (разведка завершается). **Workflow НЕ запускать без команды пользователя** |
+| C2 | Мини tron-revm: `TronEvmFactory` (EthEvmFactory + insert_instruction для 0xD0–0xD4), закрытие E2E-гейта плана C | 📝 План готов: `docs/tron/plans/2026-07-11-tron-mini-revm.md` (семантика/energy сверены с java-tron). **Workflow НЕ запускать без команды пользователя** |
 | D | cast/forge script: деплой на Nile через tron-provider | ⏳ После C2 |
 | Этап 2 | Полный tron-revm: precompiles (0x09 BatchValidateSign, Ripemd160→0x20003, Blake2F→0x20009), CREATE2-префикс 0x41, energy/bandwidth-репорт, резолвер tron-solc | ⏳ |
 
