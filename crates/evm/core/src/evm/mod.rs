@@ -67,6 +67,15 @@ impl FoundryEvmNetwork for EthEvmNetwork {
     type EvmFactory = EthEvmFactory;
 }
 
+/// Tron network marker. Naive stage: executes as vanilla EVM (Cancun); chain id and compiler
+/// come from config. TVM specifics land in tron-revm later.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TronEvmNetwork;
+impl FoundryEvmNetwork for TronEvmNetwork {
+    type Network = Ethereum;
+    type EvmFactory = EthEvmFactory;
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TempoEvmNetwork;
 impl FoundryEvmNetwork for TempoEvmNetwork {

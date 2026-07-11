@@ -39,7 +39,9 @@ use foundry_evm::{
     constants::DEFAULT_CREATE2_DEPLOYER,
     core::{
         FoundryBlock as _, FoundryTransaction as _,
-        evm::{EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor},
+        evm::{
+            EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TronEvmNetwork, TxEnvFor,
+        },
     },
     executors::EvmError,
 };
@@ -184,7 +186,7 @@ impl VerifyBytecodeArgs {
             }
             NetworkVariant::Tron => {
                 // Naive Tron executes as vanilla EVM.
-                self.run_with_network_and_config::<EthEvmNetwork>(config).await
+                self.run_with_network_and_config::<TronEvmNetwork>(config).await
             }
         }
     }

@@ -62,7 +62,8 @@ use foundry_debugger::{Debugger, DebuggerLayout};
 use foundry_evm::core::evm::OpEvmNetwork;
 use foundry_evm::{
     core::evm::{
-        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor,
+        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TronEvmNetwork,
+        TxEnvFor,
     },
     executors::ShowmapDomain,
     fuzz::{BasicTxDetails, CounterExample},
@@ -262,12 +263,17 @@ fn count_fuzz_minimize_targets<FEN: FoundryEvmNetwork>(
 #[derive(Clone, Copy)]
 enum NetworkDispatchKind {
     Tempo,
+    Tron,
     #[cfg(feature = "optimism")]
     Optimism,
     Eth,
 }
 
 const fn network_dispatch_kind(evm_opts: &EvmOpts) -> NetworkDispatchKind {
+    if evm_opts.networks.is_tron() {
+        return NetworkDispatchKind::Tron;
+    }
+
     if evm_opts.networks.is_tempo() {
         return NetworkDispatchKind::Tempo;
     }
@@ -2498,6 +2504,12 @@ impl TestArgs {
                 )
                 .await
             }
+            NetworkDispatchKind::Tron => {
+                self.build_and_run_tests::<TronEvmNetwork>(
+                    config, evm_opts, output, filter, execution,
+                )
+                .await
+            }
             #[cfg(feature = "optimism")]
             NetworkDispatchKind::Optimism => {
                 self.build_and_run_tests::<OpEvmNetwork>(
@@ -2526,6 +2538,10 @@ impl TestArgs {
         match network_dispatch_kind(dispatch_opts) {
             NetworkDispatchKind::Tempo => self
                 .build_fuzz_minimize_runner::<TempoEvmNetwork>(config, evm_opts, output, options)
+                .await
+                .map(|runner| fuzz_minimize_replay(runner, filter)),
+            NetworkDispatchKind::Tron => self
+                .build_fuzz_minimize_runner::<TronEvmNetwork>(config, evm_opts, output, options)
                 .await
                 .map(|runner| fuzz_minimize_replay(runner, filter)),
             #[cfg(feature = "optimism")]
