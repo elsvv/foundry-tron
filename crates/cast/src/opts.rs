@@ -336,6 +336,29 @@ pub enum CastSubcommand {
         unit: String,
     },
 
+    /// Convert a decimal TRX amount into SUN (Tron; 1 TRX = 1e6 SUN).
+    #[command(visible_aliases = &["--to-sun", "2sun"])]
+    ToSun {
+        /// The TRX amount to convert.
+        #[arg(allow_hyphen_values = true)]
+        value: Option<String>,
+    },
+
+    /// Convert a SUN amount into a decimal TRX string (Tron).
+    #[command(visible_aliases = &["--from-sun"])]
+    FromSun {
+        /// The SUN amount to convert.
+        #[arg(allow_hyphen_values = true)]
+        value: Option<String>,
+    },
+
+    /// Convert a Tron address between its base58check (T…), 0x41-hex and 0x forms.
+    #[command(visible_aliases = &["--tron-address"])]
+    TronAddress {
+        /// The address in T…, 41…-hex or 0x… form.
+        address: Option<String>,
+    },
+
     /// RLP encodes hex data, or an array of hex data.
     ///
     /// Accepts a hex-encoded string, or an array of hex-encoded strings.
@@ -845,7 +868,7 @@ pub enum CastSubcommand {
         block: Option<BlockId>,
 
         /// The account to query.
-        #[arg(value_parser = NameOrAddress::from_str)]
+        #[arg(value_parser = crate::tron::parse_name_or_tron_address)]
         who: NameOrAddress,
 
         /// Format the balance in ether.

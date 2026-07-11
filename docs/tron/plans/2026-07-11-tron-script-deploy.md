@@ -113,7 +113,7 @@
   - с calldata → `trigger_contract`; `--create <bytecode> [ctor-args]` → `deploy_contract`;
   - fee_limit/expiration: `config.tron` + `TronOpts` override;
   - вывод: txID, статус, energy_used, fee (TRX), для деплоя — адрес в base58 И hex41. stdout — машинно-читаемый результат (txID или адрес), прочее — stderr (sh_* макросы).
-- [ ] **Step 5: Live-гейт (TRON_LIVE=1, cli-тест или ручной прогон с фиксацией вывода):** `cast send --value 1000000` (1 TRX перевод самому себе) на Nile — txID подтверждён; `cast balance` совпадает с `/wallet/getaccount`; `cast call number()` на контракте из Task 1 live-теста. Зафиксировать команды в sandbox/README.
+- [ ] **Step 5: Live-гейт (TRON_LIVE=1, cli-тест или ручной прогон с фиксацией вывода):** `cast send <получатель> --value 1000000` (1 TRX перевод на ДРУГОЙ адрес, НЕ самому себе — Tron отклоняет self-transfer на валидации контракта: `CONTRACT_VALIDATE_ERROR: Cannot transfer TRX to yourself`) на Nile — txID подтверждён; `cast balance` совпадает с `/wallet/getaccount`; `cast call number()` на контракте из Task 1 live-теста. Зафиксировать команды в sandbox/README.
 - [ ] **Step 6:** `cargo test -p cast@1.7.2`, clippy, fmt, commit — `feat(tron): cast send/call/balance and sun/address utilities`.
 
 ---

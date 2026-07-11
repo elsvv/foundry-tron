@@ -65,6 +65,7 @@ pub mod args;
 pub mod cmd;
 pub mod opts;
 pub mod tempo;
+pub mod tron;
 
 pub mod base;
 pub mod call_spec;
@@ -1632,6 +1633,39 @@ impl SimpleCast {
     pub fn to_wei(value: &str, unit: &str) -> Result<String> {
         let unit = unit.parse().wrap_err("could not parse units")?;
         Ok(ParseUnits::parse_units(value, unit)?.to_string())
+    }
+
+    /// Converts a decimal TRX amount into SUN (Tron; 1 TRX = 1e6 SUN).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cast::SimpleCast as Cast;
+    ///
+    /// assert_eq!(Cast::to_sun("1.5")?, "1500000");
+    /// assert_eq!(Cast::to_sun("1")?, "1000000");
+    /// assert_eq!(Cast::to_sun("0.000001")?, "1");
+    /// # Ok::<_, eyre::Report>(())
+    /// ```
+    pub fn to_sun(value: &str) -> Result<String> {
+        Ok(foundry_tron_primitives::units::parse_trx_to_sun(value)?.to_string())
+    }
+
+    /// Converts a SUN amount into a decimal TRX string with six decimals (Tron).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cast::SimpleCast as Cast;
+    ///
+    /// assert_eq!(Cast::from_sun("1500000")?, "1.500000");
+    /// assert_eq!(Cast::from_sun("1")?, "0.000001");
+    /// # Ok::<_, eyre::Report>(())
+    /// ```
+    pub fn from_sun(value: &str) -> Result<String> {
+        let sun: u64 =
+            value.trim().parse().wrap_err("SUN amount must be a non-negative integer")?;
+        Ok(foundry_tron_primitives::units::format_sun_as_trx(sun))
     }
 
     // Decodes RLP encoded data with validation for canonical integer representation

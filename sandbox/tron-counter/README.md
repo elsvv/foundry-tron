@@ -62,3 +62,45 @@ $FORGE test  -vv          # 3/3 PASS
 The committed `foundry.toml` keeps `solc = <tron-solc>` because compiling with
 real tron-solc is the point of the sandbox; swap to `solc = "0.8.27"` to see the
 3/3 plumbing pass.
+
+## Plan D — `cast` on Tron (offline utilities + Nile deploy/read)
+
+With `network = "tron"` in `foundry.toml`, `cast send`/`call`/`balance` route
+through the protobuf `/wallet/*` path instead of `eth_sendRawTransaction`.
+`CAST=<repo>/target/debug/cast`.
+
+Offline unit converters (no network):
+
+```bash
+$CAST to-sun 1.5                       # -> 1500000  (TRX -> SUN)
+$CAST from-sun 1500000                 # -> 1.500000 (SUN -> TRX)
+$CAST tron-address TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t   # base58 / 41-hex / 0x
+```
+
+Live on Nile (`set -a && source .env.tron-dev && set +a`, then `TRON_LIVE=1`):
+
+```bash
+cd sandbox/tron-counter
+
+# Native TRX transfer (value is SUN): 1 TRX to another account. stdout = txID.
+# The recipient MUST differ from the sender — Tron rejects a self-transfer at
+# contract validation ("Cannot transfer TRX to yourself"). Confirmed on Nile:
+# txID 9dc1b1d6af9071bd3b2b6b5ff24f5fb4226f6e8a3ab1206f4b4848c00093e8e0.
+$CAST send TQuzjxWcqHSh1xDUw4wmMFmCcLjz4wSCBp --value 1000000 \
+  --rpc-url nile --private-key $TRON_PRIVATE_KEY
+
+# Balance (SUN, or TRX with --ether).
+$CAST balance TX7izXWcmofRYonzdcThrS78jifMtVWCuf --rpc-url nile --ether
+
+# Deploy the Counter creation bytecode; stdout = base58 contract address.
+ADDR=$($CAST send --create $(cat ../../crates/evm/core/testdata/tron_counter_creation.hex) \
+  --tron.fee-limit 400000000 --rpc-url nile --private-key $TRON_PRIVATE_KEY)
+
+# Contract call: setNumber(7) then read number() (constant call).
+$CAST send $ADDR "setNumber(uint256)" 7 --rpc-url nile --private-key $TRON_PRIVATE_KEY
+$CAST call $ADDR "number()(uint256)" --rpc-url nile          # -> 7
+```
+
+Addresses are accepted in `T…` (base58check), `41…`-hex and `0x…` forms on every
+Tron path. `--tron.fee-limit` (SUN) and `--tron.expiration` (seconds) override the
+`[tron]` config section.

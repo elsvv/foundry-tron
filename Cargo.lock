@@ -2899,6 +2899,8 @@ dependencies = [
  "foundry-evm-networks",
  "foundry-primitives",
  "foundry-test-utils",
+ "foundry-tron-primitives",
+ "foundry-tron-provider",
  "foundry-wallets",
  "futures",
  "itertools 0.15.0",
