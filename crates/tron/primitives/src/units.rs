@@ -2,7 +2,7 @@
 
 pub const SUN_PER_TRX: u64 = 1_000_000;
 
-pub fn trx_to_sun(trx: u64) -> u64 {
+pub const fn trx_to_sun(trx: u64) -> u64 {
     trx * SUN_PER_TRX
 }
 

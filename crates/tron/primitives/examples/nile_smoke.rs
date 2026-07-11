@@ -14,6 +14,11 @@
 //! from the funded key. Use `keygen` to mint a throwaway recipient; it does not
 //! need to be funded to receive TRX.
 
+// Standalone manual smoke-test binary: plain stdout/stderr is the intended
+// output here, so the workspace `sh_*`-macro rule (for CLI crates) does not
+// apply. Same rationale as the sibling `foundry-tron-provider` test gate.
+#![allow(clippy::disallowed_macros)]
+
 use alloy_signer_local::PrivateKeySigner;
 use foundry_tron_primitives::{proto, sign, tapos, to_base58};
 use prost::Message;

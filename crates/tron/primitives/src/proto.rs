@@ -55,7 +55,7 @@ pub struct Transaction {
 }
 
 /// `TriggerSmartContract` from `core/contract/smart_contract.proto`.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct TriggerSmartContract {
     #[prost(bytes = "vec", tag = "1")]
     pub owner_address: Vec<u8>,
@@ -72,7 +72,7 @@ pub struct TriggerSmartContract {
 }
 
 /// `TransferContract` from `core/contract/balance_contract.proto`.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct TransferContract {
     #[prost(bytes = "vec", tag = "1")]
     pub owner_address: Vec<u8>,
@@ -83,7 +83,7 @@ pub struct TransferContract {
 }
 
 /// `CreateSmartContract` from `core/contract/smart_contract.proto`.
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct CreateSmartContract {
     #[prost(bytes = "vec", tag = "1")]
     pub owner_address: Vec<u8>,
@@ -98,7 +98,7 @@ pub struct CreateSmartContract {
 /// `SmartContract` from `core/contract/smart_contract.proto`. The `abi`
 /// field (tag 3) is intentionally omitted: contracts are deployed without
 /// an on-chain ABI (matching tronweb's `abi: []`).
-#[derive(Clone, PartialEq, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, ::prost::Message)]
 pub struct SmartContract {
     #[prost(bytes = "vec", tag = "1")]
     pub origin_address: Vec<u8>,
@@ -127,7 +127,7 @@ pub enum ContractType {
 
 /// Returns the `type.googleapis.com` type URL used inside the `Any`
 /// parameter wrapper for the given contract type.
-pub fn type_url(ct: ContractType) -> &'static str {
+pub const fn type_url(ct: ContractType) -> &'static str {
     match ct {
         ContractType::TransferContract => "type.googleapis.com/protocol.TransferContract",
         ContractType::CreateSmartContract => "type.googleapis.com/protocol.CreateSmartContract",

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 pub const TRON_ADDRESS_PREFIX: u8 = 0x41;
 
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AddressError {
     #[error("invalid base58: {0}")]
     InvalidBase58(String),
@@ -120,7 +120,7 @@ mod tests {
         ));
         assert!(matches!(
             parse("0x1234"),
-            Err(AddressError::InvalidHex(_)) | Err(AddressError::InvalidLength(_))
+            Err(AddressError::InvalidHex(_) | AddressError::InvalidLength(_))
         ));
     }
 }
