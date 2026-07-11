@@ -3,6 +3,7 @@
 use alloy_primitives::{Address, B256, hex};
 use foundry_tron_primitives::{
     address::to_hex41,
+    sign::SignedTronTx,
     tapos::{RefBlock, ref_block},
 };
 use serde::de::DeserializeOwned;
@@ -125,6 +126,33 @@ impl TronProvider {
         let v: serde_json::Value = self.post_json("/wallet/triggerconstantcontract", body).await?;
         parse_constant_result(&v)
     }
+
+    /// Broadcasts a signed transaction via `/wallet/broadcasthex`. On rejection
+    /// the node reports `result != true`; the returned `TronError::Api` carries
+    /// its `code` and the hex-decoded `message`.
+    pub async fn broadcast(&self, tx: &SignedTronTx) -> Result<(), TronError> {
+        let body = serde_json::json!({ "transaction": tx.broadcast_hex() });
+        let v: serde_json::Value = self.post_json("/wallet/broadcasthex", body).await?;
+        parse_broadcast_result(&v)
+    }
+
+    /// Polls `get_transaction_info` until the transaction lands in a block, up to
+    /// `max_attempts` times spaced by `interval`. The bound is mandatory: an
+    /// unbounded poll (the TronBox lesson) can hang forever on a dropped tx.
+    pub async fn wait_for_confirmation(
+        &self,
+        txid: B256,
+        max_attempts: u32,
+        interval: std::time::Duration,
+    ) -> Result<TxInfo, TronError> {
+        for _ in 0..max_attempts {
+            if let Some(info) = self.get_transaction_info(txid).await? {
+                return Ok(info);
+            }
+            tokio::time::sleep(interval).await;
+        }
+        Err(TronError::Timeout(format!("tx {txid} not confirmed after {max_attempts} attempts")))
+    }
 }
 
 /// Parses a raw `/wallet/getnowblock` JSON response.
@@ -190,6 +218,22 @@ pub(crate) fn parse_constant_result(v: &serde_json::Value) -> Result<ConstantRes
         energy_used: v.get("energy_used").and_then(|e| e.as_u64()).unwrap_or(0),
         success,
     })
+}
+
+/// Parses a `/wallet/broadcasthex` response. `result == true` is success;
+/// otherwise the node returns a `code` and a hex-encoded `message` which is
+/// decoded back to its UTF-8 form (falling back to the raw string).
+pub(crate) fn parse_broadcast_result(v: &serde_json::Value) -> Result<(), TronError> {
+    if v.get("result").and_then(|r| r.as_bool()) == Some(true) {
+        return Ok(());
+    }
+    let code = v.get("code").and_then(|c| c.as_str()).unwrap_or("UNKNOWN").to_string();
+    let raw_msg = v.get("message").and_then(|m| m.as_str()).unwrap_or_default();
+    let message = hex::decode(raw_msg)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| raw_msg.to_string());
+    Err(TronError::Api { code, message })
 }
 
 // `eprintln!` is used to document why live tests self-skip; it is disallowed
@@ -309,5 +353,40 @@ mod tests {
         assert!(cr.success);
         assert_eq!(cr.result.len(), 32);
         assert!(alloy_primitives::U256::from_be_slice(&cr.result) > alloy_primitives::U256::ZERO);
+    }
+
+    #[test]
+    fn broadcast_success_parses() {
+        let v = serde_json::json!({"code": "SUCCESS", "result": true, "txid": "aa"});
+        assert!(parse_broadcast_result(&v).is_ok());
+    }
+
+    #[test]
+    fn broadcast_error_decodes_hex_message() {
+        // The node's real error format: `message` in hex ("SIGERROR" -> hex ascii).
+        let v = serde_json::json!({
+            "code": "SIGERROR",
+            "message": hex::encode("validate signature error"),
+        });
+        let err = parse_broadcast_result(&v).unwrap_err();
+        match err {
+            TronError::Api { code, message } => {
+                assert_eq!(code, "SIGERROR");
+                assert_eq!(message, "validate signature error");
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_confirmation_times_out_on_unknown_tx() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        let p = TronProvider::new("https://nile.trongrid.io").unwrap();
+        let bogus = B256::repeat_byte(0xab);
+        let res = p.wait_for_confirmation(bogus, 2, std::time::Duration::from_millis(300)).await;
+        assert!(matches!(res, Err(TronError::Timeout(_))));
     }
 }
