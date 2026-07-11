@@ -530,6 +530,10 @@ pub fn builtin_rpc_url(alias: &str) -> Option<&'static str> {
     match alias {
         "tempo" => Some("https://rpc.mpp.tempo.xyz"),
         "moderato" => Some("https://rpc.mpp.moderato.tempo.xyz"),
+        // Tron networks resolve to their TronGrid HTTP hosts (`/wallet/*` + `/jsonrpc`).
+        "tron" => Some("https://api.trongrid.io"),
+        "nile" => Some("https://nile.trongrid.io"),
+        "shasta" => Some("https://api.shasta.trongrid.io"),
         _ => None,
     }
 }
@@ -537,6 +541,14 @@ pub fn builtin_rpc_url(alias: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_tron_rpc_aliases() {
+        assert_eq!(builtin_rpc_url("tron"), Some("https://api.trongrid.io"));
+        assert_eq!(builtin_rpc_url("nile"), Some("https://nile.trongrid.io"));
+        assert_eq!(builtin_rpc_url("shasta"), Some("https://api.shasta.trongrid.io"));
+        assert_eq!(builtin_rpc_url("unknown"), None);
+    }
 
     #[test]
     fn serde_rpc_config() {

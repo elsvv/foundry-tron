@@ -7,6 +7,7 @@ mod rpc;
 mod rpc_common;
 mod tempo;
 mod transaction;
+mod tron;
 
 pub use build::*;
 pub use chain::*;
@@ -17,3 +18,4 @@ pub use rpc::*;
 pub use rpc_common::*;
 pub use tempo::*;
 pub use transaction::*;
+pub use tron::*;
