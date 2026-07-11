@@ -35,6 +35,13 @@ pub struct TxInfo {
     pub contract_address: Option<Address>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantResult {
+    pub result: Vec<u8>,
+    pub energy_used: u64,
+    pub success: bool,
+}
+
 pub struct TronProvider {
     base_url: String,
     api_key: Option<String>,
@@ -99,6 +106,25 @@ impl TronProvider {
         let v: serde_json::Value = self.post_json("/wallet/gettransactioninfobyid", body).await?;
         parse_tx_info(&v)
     }
+
+    /// Executes a read-only (constant) contract call and returns its ABI-encoded
+    /// output together with the energy estimate. The `data` payload must already
+    /// be ABI-encoded (selector + arguments); ABI encoding is the caller's job.
+    pub async fn trigger_constant(
+        &self,
+        owner: Address,
+        contract: Address,
+        data: &[u8],
+    ) -> Result<ConstantResult, TronError> {
+        let body = serde_json::json!({
+            "owner_address": to_hex41(owner),
+            "contract_address": to_hex41(contract),
+            "data": hex::encode(data),
+            "visible": false,
+        });
+        let v: serde_json::Value = self.post_json("/wallet/triggerconstantcontract", body).await?;
+        parse_constant_result(&v)
+    }
 }
 
 /// Parses a raw `/wallet/getnowblock` JSON response.
@@ -149,6 +175,21 @@ pub(crate) fn parse_tx_info(v: &serde_json::Value) -> Result<Option<TxInfo>, Tro
         success,
         contract_address,
     }))
+}
+
+/// Parses a `/wallet/triggerconstantcontract` response. `result` is the raw
+/// bytes of `constant_result[0]`, `success` mirrors `result.result`.
+pub(crate) fn parse_constant_result(v: &serde_json::Value) -> Result<ConstantResult, TronError> {
+    let success = v["result"].get("result").and_then(|r| r.as_bool()).unwrap_or(false);
+    let result = match v["constant_result"].get(0).and_then(|r| r.as_str()) {
+        Some(h) => hex::decode(h).map_err(|e| TronError::Decode(e.to_string()))?,
+        None => Vec::new(),
+    };
+    Ok(ConstantResult {
+        result,
+        energy_used: v.get("energy_used").and_then(|e| e.as_u64()).unwrap_or(0),
+        success,
+    })
 }
 
 // `eprintln!` is used to document why live tests self-skip; it is disallowed
@@ -238,5 +279,35 @@ mod tests {
             "3a4d9c5f35b165b1a28f44a57b53cf39b3c2707153e50cdb52d7c0d979750aeb".parse().unwrap();
         let info = p.get_transaction_info(txid).await.unwrap().unwrap();
         assert_eq!(info.block_number, 69_090_417);
+    }
+
+    #[test]
+    fn parses_constant_result_fixture() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/nile_triggerconstant.json")).unwrap();
+        let cr = parse_constant_result(&v).unwrap();
+        assert!(cr.success);
+        assert_eq!(cr.result.len(), 32, "totalSupply returns uint256");
+        assert!(cr.energy_used > 0);
+        assert_eq!(hex::encode(&cr.result), v["constant_result"][0].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn live_trigger_constant_total_supply() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        let p = TronProvider::new("https://nile.trongrid.io").unwrap();
+        let owner =
+            foundry_tron_primitives::address::parse("TX7izXWcmofRYonzdcThrS78jifMtVWCuf").unwrap();
+        // Nile USDT (TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj).
+        let usdt =
+            foundry_tron_primitives::address::parse("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj").unwrap();
+        // totalSupply() selector.
+        let cr = p.trigger_constant(owner, usdt, &hex::decode("18160ddd").unwrap()).await.unwrap();
+        assert!(cr.success);
+        assert_eq!(cr.result.len(), 32);
+        assert!(alloy_primitives::U256::from_be_slice(&cr.result) > alloy_primitives::U256::ZERO);
     }
 }

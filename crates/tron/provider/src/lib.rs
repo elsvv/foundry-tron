@@ -4,4 +4,4 @@
 
 mod client;
 
-pub use client::{NowBlock, TronError, TronProvider, TxInfo};
+pub use client::{ConstantResult, NowBlock, TronError, TronProvider, TxInfo};
