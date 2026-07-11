@@ -1,7 +1,10 @@
 //! Typed async client for the Tron wallet HTTP API.
 
-use alloy_primitives::hex;
-use foundry_tron_primitives::tapos::{RefBlock, ref_block};
+use alloy_primitives::{Address, B256, hex};
+use foundry_tron_primitives::{
+    address::to_hex41,
+    tapos::{RefBlock, ref_block},
+};
 use serde::de::DeserializeOwned;
 
 #[derive(Debug, thiserror::Error)]
@@ -21,6 +24,15 @@ pub struct NowBlock {
     pub block_id: [u8; 32],
     pub number: i64,
     pub timestamp_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxInfo {
+    pub block_number: i64,
+    pub fee_sun: u64,
+    pub energy_used: u64,
+    pub success: bool,
+    pub contract_address: Option<Address>,
 }
 
 pub struct TronProvider {
@@ -71,6 +83,22 @@ impl TronProvider {
         let nb = self.get_now_block().await?;
         Ok((ref_block(nb.number, &nb.block_id), nb.timestamp_ms))
     }
+
+    /// Returns the account balance in SUN. A non-existent account (the node
+    /// replies with an empty `{}` body) reads as a zero balance.
+    pub async fn get_balance(&self, addr: Address) -> Result<u64, TronError> {
+        let body = serde_json::json!({ "address": to_hex41(addr), "visible": false });
+        let v: serde_json::Value = self.post_json("/wallet/getaccount", body).await?;
+        parse_account_balance(&v)
+    }
+
+    /// Returns transaction info once the transaction is in a block, or `None`
+    /// while it is still pending (the node replies with an empty `{}` body).
+    pub async fn get_transaction_info(&self, txid: B256) -> Result<Option<TxInfo>, TronError> {
+        let body = serde_json::json!({ "value": hex::encode(txid) });
+        let v: serde_json::Value = self.post_json("/wallet/gettransactioninfobyid", body).await?;
+        parse_tx_info(&v)
+    }
 }
 
 /// Parses a raw `/wallet/getnowblock` JSON response.
@@ -87,6 +115,40 @@ pub(crate) fn parse_now_block(v: &serde_json::Value) -> Result<NowBlock, TronErr
         number: raw["number"].as_i64().ok_or_else(|| missing("number"))?,
         timestamp_ms: raw["timestamp"].as_i64().ok_or_else(|| missing("timestamp"))?,
     })
+}
+
+/// Parses the balance (in SUN) from a `/wallet/getaccount` response. An empty
+/// object (unknown account) yields a zero balance.
+pub(crate) fn parse_account_balance(v: &serde_json::Value) -> Result<u64, TronError> {
+    Ok(v.get("balance").and_then(|b| b.as_u64()).unwrap_or(0))
+}
+
+/// Parses a `/wallet/gettransactioninfobyid` response. Returns `None` while the
+/// transaction is still pending (empty `{}` body).
+pub(crate) fn parse_tx_info(v: &serde_json::Value) -> Result<Option<TxInfo>, TronError> {
+    let Some(block_number) = v.get("blockNumber").and_then(|b| b.as_i64()) else {
+        return Ok(None);
+    };
+    let receipt = &v["receipt"];
+    let success = match receipt.get("result").and_then(|r| r.as_str()) {
+        // `TransferContract` and similar non-VM contracts omit `receipt.result`.
+        None => true,
+        Some(r) => r == "SUCCESS",
+    };
+    let contract_address = match v.get("contract_address").and_then(|c| c.as_str()) {
+        Some(h41) => Some(
+            foundry_tron_primitives::address::parse(h41)
+                .map_err(|e| TronError::Decode(e.to_string()))?,
+        ),
+        None => None,
+    };
+    Ok(Some(TxInfo {
+        block_number,
+        fee_sun: v.get("fee").and_then(|f| f.as_u64()).unwrap_or(0),
+        energy_used: receipt.get("energy_usage_total").and_then(|e| e.as_u64()).unwrap_or(0),
+        success,
+        contract_address,
+    }))
 }
 
 // `eprintln!` is used to document why live tests self-skip; it is disallowed
@@ -130,5 +192,51 @@ mod tests {
         let nb = p.get_now_block().await.unwrap();
         assert!(nb.number > 69_000_000);
         assert_ne!(nb.block_id, [0u8; 32]);
+    }
+
+    #[test]
+    fn parses_account_balance_fixture() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/nile_getaccount.json")).unwrap();
+        let balance = parse_account_balance(&v).unwrap();
+        assert_eq!(balance, v["balance"].as_u64().unwrap());
+        assert!(balance > 0);
+    }
+
+    #[test]
+    fn empty_account_is_zero_balance() {
+        assert_eq!(parse_account_balance(&serde_json::json!({})).unwrap(), 0);
+    }
+
+    #[test]
+    fn parses_tx_info_fixture() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/nile_txinfo.json")).unwrap();
+        let info = parse_tx_info(&v).unwrap().expect("smoke tx is in a block");
+        assert_eq!(info.block_number, 69_090_417);
+        assert_eq!(info.fee_sun, 1_100_000);
+        assert!(info.success);
+        assert_eq!(info.contract_address, None);
+    }
+
+    #[test]
+    fn pending_tx_info_is_none() {
+        assert_eq!(parse_tx_info(&serde_json::json!({})).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn live_balance_and_txinfo() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        let p = TronProvider::new("https://nile.trongrid.io").unwrap();
+        let addr =
+            foundry_tron_primitives::address::parse("TX7izXWcmofRYonzdcThrS78jifMtVWCuf").unwrap();
+        assert!(p.get_balance(addr).await.unwrap() > 0);
+        let txid: B256 =
+            "3a4d9c5f35b165b1a28f44a57b53cf39b3c2707153e50cdb52d7c0d979750aeb".parse().unwrap();
+        let info = p.get_transaction_info(txid).await.unwrap().unwrap();
+        assert_eq!(info.block_number, 69_090_417);
     }
 }
