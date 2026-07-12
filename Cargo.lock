@@ -4991,6 +4991,8 @@ dependencies = [
  "foundry-evm-symbolic",
  "foundry-linking",
  "foundry-test-utils",
+ "foundry-tron-primitives",
+ "foundry-tron-provider",
  "foundry-wallets",
  "globset",
  "indicatif",

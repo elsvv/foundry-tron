@@ -23,7 +23,14 @@ revm / Cancun, chain id 728126428).
    - `testTransientStorageCancun` → TSTORE/TLOAD (Cancun spec active)
    - `testIncrement`    → deploy + call
 
-## Blocker: tron-solc bytecode does NOT run on the naive revm
+## Blocker (RESOLVED in C2): tron-solc bytecode on the naive revm
+
+> **Update (Plan C2):** the blocker below was closed by the mini `tron-revm`
+> (`TronEvmFactory` with instruction stubs for `0xD0–0xD4`). `forge test` now
+> runs the **real tron-solc bytecode** and passes **4/4**
+> (`testIncrement`, `testTronChainId`, `testTransientStorageCancun`,
+> `testNonPayableGuardWithTvmOpcodes`). The original analysis is kept below for
+> the record.
 
 `forge test` with the **tron-solc-compiled** bytecode fails with
 `EvmError: OpcodeNotFound`. Root cause: tron-solc injects TVM-only opcodes into
@@ -107,3 +114,60 @@ $CAST call $ADDR "number()(uint256)" --rpc-url nile          # -> 7
 Addresses are accepted in `T…` (base58check), `41…`-hex and `0x…` forms on every
 Tron path. `--tron.fee-limit` (SUN) and `--tron.expiration` (seconds) override the
 `[tron]` config section.
+
+## Plan D — `forge create` and `forge script --broadcast` (full Stage-1 cycle)
+
+Both deploy through the protobuf `CreateSmartContract` / `TriggerSmartContract`
+path (not `eth_sendTransaction`); the contract address is derived locally from
+the txID via the java-tron `WalletUtil` formula and cross-checked against the
+address the node reports once mined (mismatch = hard error).
+`FORGE=<repo>/target/debug/forge`.
+
+```bash
+cd sandbox/tron-counter
+set -a && source ../../.env.tron-dev && set +a   # loads TRON_PRIVATE_KEY
+
+# forge build (real tron-solc) and forge test (4/4 on tron-solc bytecode).
+$FORGE build
+$FORGE test
+
+# forge create: compiles src/Counter.sol, appends ABI-encoded ctor args (none
+# here), deploys. stdout carries deployer/address/txID; --broadcast is required
+# to touch the network (omit it for a dry run that prints the creation bytecode).
+$FORGE create src/Counter.sol:Counter --rpc-url nile \
+  --private-key "$TRON_PRIVATE_KEY" --tron.fee-limit 400000000 --broadcast
+
+# forge script: runs Deploy.s.sol (new Counter() + counter.setNumber(42) under a
+# broadcast) and replays the collected CreateSmartContract + TriggerSmartContract
+# to Nile. The on-chain (fork) simulation phase is skipped — forking a Tron node
+# needs eth_ JSON-RPC (Stage 2). Artifacts land under
+# broadcast/Deploy.s.sol/3448148188/ (Nile chain id).
+$FORGE script script/Deploy.s.sol --rpc-url nile --broadcast \
+  --private-key "$TRON_PRIVATE_KEY" --tron.fee-limit 400000000
+```
+
+The broadcast artifact `broadcast/Deploy.s.sol/3448148188/run-latest.json` keeps
+the standard Foundry shape; `hash` carries the Tron txID, and each transaction
+gains an optional `tron` block:
+
+```json
+{ "txid": "0x2507a88a…", "ownerBase58": "TX7izXWcmof…",
+  "contractAddressBase58": "THhVv6vwHsy…",
+  "feeLimit": 400000000, "energyUsed": 101188, "feeSun": 10962800 }
+```
+
+`--verify`, `--unlocked` and `--browser` on `forge create` are rejected up front
+("not supported on tron yet"); `--fork-url` on `forge script` is a Stage-2 error.
+
+### Live-run evidence (Nile, chain id 3448148188, 2026-07-12)
+
+| Step | txID | Result |
+|---|---|---|
+| `forge create Counter` | `6a1b82bcb399afafb5084cec1cae2f244b6f2baa33a878649837589126b51fbb` | → `TEsgXDHsYDMvdpoAswPuPDeghuUiAucivJ` (`4135cd1b0867d8a1d16be5a93718b63ae0392ef14d`), 10.96 TRX, 101188 energy |
+| `cast send setNumber(7)` | `d73d8c9315557d24954157858052ec7f627966148b42c72934fd8f39f3491fb6` | block 69109676; `number()` → 7 |
+| `cast send` transfer 1 TRX | `059bedb74d019ae58a1de528f53938e1faf6a88a2af59ab565cda7b2b4870d26` | block 69109682, 0.274 TRX |
+| `forge script` CREATE | `2507a88a8120adeb43f1eea47e53452656dbe57149e1a0e9c8e8c449753292b1` | → `THhVv6vwHsyaKm42hPUHVc8szHy4xNPagt` (`4154c8786eb31e9d5d76aafc1d46742acdda711084`), 10.96 TRX |
+| `forge script` CALL setNumber(42) | `cdc904f3cc87f622fb5ec67a3606b5a52d288e59a276462dfda589e25ad0d12f` | `number()` → 42 |
+
+The public Nile endpoint (`nile.trongrid.io`, no API key) WAF-throttles a burst
+of `/wallet/*` POSTs with HTTP 405; set `TRON_PRO_API_KEY` to avoid it.

@@ -12,7 +12,7 @@ use clap::{Parser, ValueHint};
 use eyre::{Context, ContextCompat, Result};
 use forge_verify::{RetryArgs, VerifierArgs, VerifyArgs, parse_etherscan_license_type};
 use foundry_cli::{
-    opts::{BuildOpts, EthereumOpts, EtherscanOpts, TransactionOpts},
+    opts::{BuildOpts, EthereumOpts, EtherscanOpts, TransactionOpts, TronOpts},
     utils::{
         LoadConfig, ResolvedLane, find_contract_artifacts, maybe_print_resolved_lane,
         read_constructor_args_file, resolve_lane,
@@ -33,19 +33,27 @@ use foundry_compilers::{
     ArtifactId, artifacts::BytecodeObject, info::ContractInfo, utils::canonicalize,
 };
 use foundry_config::{
-    Config, Eip1559FeeEstimatePreset,
+    Config, Eip1559FeeEstimatePreset, TronConfig,
     figment::{
         self, Metadata, Profile,
         value::{Dict, Map},
     },
     merge_impl_figment_convert,
 };
+use foundry_tron_primitives::{to_base58, to_hex41, units::format_sun_as_trx};
+use foundry_tron_provider::{TronProvider, TxOptions};
 use foundry_wallets::{
     BrowserWalletOpts, TempoAccessKeyConfig, WalletSigner, wallet_browser::signer::BrowserSigner,
 };
 use serde_json::json;
 use std::{borrow::Borrow, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
 use tempo_alloy::TempoNetwork;
+
+/// Environment variable carrying the TronGrid API key (forwarded as `TRON-PRO-API-KEY`).
+const TRON_API_KEY_ENV: &str = "TRON_PRO_API_KEY";
+
+/// Poll interval, in seconds, while waiting for a Tron deploy to confirm.
+const TRON_POLL_INTERVAL_SECS: u64 = 3;
 
 merge_impl_figment_convert!(CreateArgs, build, eth);
 
@@ -128,11 +136,25 @@ pub struct CreateArgs {
     /// Browser wallet options
     #[command(flatten)]
     browser: BrowserWalletOpts,
+
+    /// Tron transaction options (`--tron.fee-limit`, `--tron.expiration`).
+    #[command(flatten)]
+    tron: TronOpts,
 }
 
 impl CreateArgs {
     /// Executes the command to create a contract
     pub async fn run(mut self) -> Result<()> {
+        // Tron is config-file driven (`network = "tron"`); it diverges before any signer,
+        // access-key, alloy provider or `get_chain_id` handling because it deploys a protobuf
+        // `CreateSmartContract` through the `/wallet/*` API, not `eth_sendTransaction`. The Tron
+        // endpoint speaks a partial `eth_*` surface, so resolving the chain via an alloy provider
+        // here would fail before we ever reach the protobuf path.
+        let config = self.load_config()?;
+        if config.networks.is_tron() {
+            return self.run_tron(config).await;
+        }
+
         let (signer, tempo_access_key) = self.eth.wallet.maybe_signer().await?;
 
         // Resolve chain early so we can dispatch to the correct network type.
@@ -151,6 +173,132 @@ impl CreateArgs {
         } else {
             self.run_generic::<Ethereum>(signer, None).await
         }
+    }
+
+    /// Deploys a contract on Tron. Config-file driven (`network = "tron"`): the creation bytecode
+    /// and ABI-encoded constructor arguments are assembled locally and broadcast as a
+    /// `CreateSmartContract` protobuf through the `/wallet/*` API, signed over `sha256(raw_data)`
+    /// with the resolved [`WalletSigner`] (async `sign_hash`, so every wallet backend works). The
+    /// deploy address is derived from the txID via the java-tron `WalletUtil` formula and
+    /// cross-checked against the address the node reports once mined.
+    ///
+    /// Compilation and linking mirror [`run_generic`](Self::run_generic) up to the point a
+    /// transaction would be assembled. Options with no Tron equivalent yet (`--verify`,
+    /// `--unlocked`, `--browser`) are rejected up front rather than silently ignored.
+    async fn run_tron(mut self, mut config: Config) -> Result<()> {
+        if self.verify {
+            eyre::bail!("--verify is not supported on tron yet");
+        }
+        if self.unlocked {
+            eyre::bail!("--unlocked is not supported on tron yet");
+        }
+        if self.browser.browser {
+            eyre::bail!("--browser is not supported on tron yet");
+        }
+
+        // Install missing dependencies (mirrors `run_generic`).
+        if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
+        {
+            config = self.load_config()?;
+        }
+
+        // Find project & compile.
+        let project = config.project()?;
+        let target_path = if let Some(ref mut path) = self.contract.path {
+            canonicalize(project.root().join(path))?
+        } else {
+            project.find_contract_path(&self.contract.name)?
+        };
+        let output = compile::compile_target(&target_path, &project, shell::is_json())?;
+        let (abi, bin, _id) = find_contract_artifacts(output, &target_path, &self.contract.name)?;
+
+        let bin = match bin.object {
+            BytecodeObject::Bytecode(_) => bin.object,
+            _ => {
+                let link_refs = bin
+                    .link_references
+                    .iter()
+                    .flat_map(|(path, names)| {
+                        names.keys().map(move |name| format!("\t{name}: {path}"))
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n");
+                eyre::bail!(
+                    "Dynamic linking not supported in `create` command - deploy the following library contracts first, then provide the address to link at compile time\n{}",
+                    link_refs
+                )
+            }
+        };
+        let bin = bin.into_bytes().unwrap_or_default();
+        if bin.is_empty() {
+            eyre::bail!("no bytecode found in bin object for {}", self.contract.name);
+        }
+
+        // Parse constructor args and append their ABI encoding to the creation bytecode.
+        let params = if let Some(constructor) = &abi.constructor {
+            let constructor_args =
+                self.constructor_args_path.clone().map(read_constructor_args_file).transpose()?;
+            self.parse_constructor_args(
+                constructor,
+                constructor_args.as_deref().unwrap_or(&self.constructor_args),
+            )?
+        } else {
+            if !self.constructor_args.is_empty() || self.constructor_args_path.is_some() {
+                sh_warn!(
+                    "`{}` has no constructor; ignoring provided constructor arguments",
+                    self.contract.name
+                )?;
+            }
+            vec![]
+        };
+        let mut bytecode = bin.to_vec();
+        if let Some(constructor) = abi.constructor()
+            && !params.is_empty()
+        {
+            bytecode.extend_from_slice(&constructor.abi_encode_input(&params)?);
+        }
+
+        // Tron `fee_limit`/`expiration` come from the `[tron]` config, overridden by `--tron.*`.
+        // `origin_energy_limit`/`user_fee_percentage` use the provider defaults (identical to the
+        // `[tron]` defaults); non-default overrides of those two are honored on the `cast`/`forge
+        // script` paths but not here (stage-1 simplification).
+        let tron_cfg = self.tron.apply(&config.tron);
+        let opts = tron_tx_options(&tron_cfg);
+
+        // Without `--broadcast`, mirror `forge create`'s dry run: report what would be deployed and
+        // stop before touching the network.
+        if !self.broadcast {
+            return tron_dry_run(&self.contract.name, &bytecode, &abi);
+        }
+
+        let signer = self.eth.wallet.signer().await?;
+        let deployer = signer.address();
+        let provider = tron_provider(&config)?;
+        let poll = tron_poll_params(&tron_cfg);
+
+        sh_status!("Deploying {} to Tron...", self.contract.name)?;
+        let (txid, addr, info) =
+            provider.deploy_contract(&signer, bytecode, "", &opts, poll).await?;
+
+        if shell::is_json() {
+            let output = json!({
+                "deployer": to_base58(deployer),
+                "deployedTo": to_base58(addr),
+                "deployedToHex": to_hex41(addr),
+                "transactionHash": hex::encode(txid),
+            });
+            sh_println!("{}", serde_json::to_string_pretty(&output)?)?;
+        } else {
+            sh_status!("status:      {}", if info.success { "success" } else { "failed" })?;
+            if info.energy_used > 0 {
+                sh_status!("energy used: {}", info.energy_used)?;
+            }
+            sh_status!("fee:         {} TRX", format_sun_as_trx(info.fee_sun))?;
+            sh_println!("Deployer: {}", to_base58(deployer))?;
+            sh_println!("Deployed to: {} ({})", to_base58(addr), to_hex41(addr))?;
+            sh_println!("Transaction hash: {}", hex::encode(txid))?;
+        }
+        Ok(())
     }
 
     async fn run_generic<N: Network>(
@@ -777,6 +925,65 @@ impl CreateArgs {
         let params = params.iter().map(|(ty, arg)| (ty, arg.as_str()));
         parse_tokens(params).map_err(Into::into)
     }
+}
+
+/// Builds a [`TronProvider`] from the RPC endpoint resolved in `config` (from `--rpc-url`, which
+/// resolves the builtin `tron`/`nile`/`shasta` aliases, or `eth_rpc_url` in `foundry.toml`). A
+/// `TRON_PRO_API_KEY` environment variable, when present, is attached as the `TRON-PRO-API-KEY`
+/// header (spec §4.7).
+fn tron_provider(config: &Config) -> Result<TronProvider> {
+    let url = config
+        .get_rpc_url()
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "a Tron RPC endpoint is required; pass --rpc-url (e.g. nile) or set one in foundry.toml"
+            )
+        })?
+        .wrap_err("failed to resolve the Tron RPC endpoint")?
+        .into_owned();
+    let mut provider = TronProvider::new(&url)?;
+    if let Ok(key) = std::env::var(TRON_API_KEY_ENV)
+        && !key.is_empty()
+    {
+        provider = provider.with_api_key(key);
+    }
+    Ok(provider)
+}
+
+/// Converts a [`TronConfig`] into transaction [`TxOptions`]: `fee_limit` stays in SUN, and
+/// `expiration` seconds are converted to milliseconds.
+const fn tron_tx_options(cfg: &TronConfig) -> TxOptions {
+    TxOptions { fee_limit: cfg.fee_limit, expiration_ms: (cfg.expiration as i64) * 1000 }
+}
+
+/// Derives `(attempts, interval)` polling parameters covering the transaction's expiration window
+/// plus a 30s margin at a fixed interval, so confirmation polling never gives up before a
+/// still-valid deploy can be mined.
+fn tron_poll_params(cfg: &TronConfig) -> (u32, Duration) {
+    let attempts = (cfg.expiration + 30).div_ceil(TRON_POLL_INTERVAL_SECS).max(1) as u32;
+    (attempts, Duration::from_secs(TRON_POLL_INTERVAL_SECS))
+}
+
+/// Prints what a Tron deploy would broadcast without touching the network (the `forge create` dry
+/// run, when `--broadcast` is absent).
+fn tron_dry_run(name: &str, bytecode: &[u8], abi: &JsonAbi) -> Result<()> {
+    if shell::is_json() {
+        let output = json!({
+            "contract": name,
+            "bytecode": hex::encode_prefixed(bytecode),
+            "abi": abi,
+        });
+        sh_println!("{}", serde_json::to_string_pretty(&output)?)?;
+    } else {
+        sh_warn!("Dry run enabled, not broadcasting transaction\n")?;
+        sh_println!("Contract: {name}")?;
+        sh_println!("Creation bytecode: {}", hex::encode_prefixed(bytecode))?;
+        sh_println!("ABI: {}\n", serde_json::to_string_pretty(abi)?)?;
+        sh_warn!(
+            "To broadcast this deploy, add --broadcast to the previous command. See forge create --help for more."
+        )?;
+    }
+    Ok(())
 }
 
 impl figment::Provider for CreateArgs {
