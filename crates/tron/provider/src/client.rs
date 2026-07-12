@@ -905,4 +905,84 @@ mod tests {
         );
         eprintln!("live 0x01 ecrecover = {}", hex::encode(&cr01.result));
     }
+
+    /// Live golden for the Tron CREATE2 scheme on Nile. Deploys the sandbox
+    /// `Create2Factory`, then has the node compute both `childCodeHash()` (the
+    /// exact embedded `Counter` init-code hash) and `deploy(salt)` (the CREATE2
+    /// child address java-tron's `generateContractAddress2` produces, via a
+    /// constant call that runs 0xF5 in simulation), and asserts the Rust
+    /// [`foundry_tron_primitives::address::create2_address`] formula reproduces
+    /// the node's address byte-for-byte. A final real `deploy(salt)` transaction
+    /// confirms the child actually deploys on-chain at that address.
+    #[tokio::test]
+    async fn live_create2_golden_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live create2");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+
+        // The sandbox `Create2Factory` (deploy(bytes32) + childCodeHash()),
+        // compiled with tron-solc 0.8.27.
+        let creation =
+            hex::decode(include_str!("../testdata/tron_create2_factory_creation.hex").trim())
+                .unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+
+        let (txid, factory, info) =
+            p.deploy_contract(&signer, creation, "Create2Factory", &opts, poll).await.unwrap();
+        assert!(info.success, "factory deploy must succeed");
+        eprintln!(
+            "live create2 factory tx {} -> {}",
+            hex::encode(txid),
+            foundry_tron_primitives::to_base58(factory),
+        );
+
+        let owner = signer.address();
+        let salt = B256::from(alloy_primitives::U256::from(0xC0FFEEu64));
+
+        // childCodeHash(): the exact `Counter` init-code hash the node hashes.
+        let cr_hash =
+            p.trigger_constant(owner, factory, &hex::decode("ef803be1").unwrap()).await.unwrap();
+        assert!(
+            cr_hash.success && cr_hash.result.len() == 32,
+            "childCodeHash() must return bytes32"
+        );
+        let init_code_hash = B256::from_slice(&cr_hash.result);
+
+        // deploy(salt) as a constant call: the node runs CREATE2 and returns the
+        // child address it computes (java-tron generateContractAddress2), without
+        // persisting state.
+        let mut deploy_data = hex::decode("2b85ba38").unwrap();
+        deploy_data.extend_from_slice(salt.as_slice());
+        let cr_addr = p.trigger_constant(owner, factory, &deploy_data).await.unwrap();
+        assert!(cr_addr.success && cr_addr.result.len() == 32, "deploy() must return an address");
+        let node_child = Address::from_slice(&cr_addr.result[12..]);
+
+        // THE GOLDEN: the Rust formula must reproduce the node's CREATE2 address.
+        let local_child =
+            foundry_tron_primitives::address::create2_address(factory, salt, init_code_hash);
+        assert_eq!(
+            node_child,
+            local_child,
+            "Tron CREATE2 address mismatch: node {} != local {}",
+            to_hex41(node_child),
+            to_hex41(local_child),
+        );
+        eprintln!("live create2 child (node == local) = {}", to_hex41(node_child));
+
+        // Confirm the child truly deploys on-chain at that address (real tx).
+        let (deploy_txid, deploy_info) =
+            p.trigger_contract(&signer, factory, 0, deploy_data, &opts, poll).await.unwrap();
+        assert!(deploy_info.success, "on-chain CREATE2 deploy must succeed");
+        eprintln!(
+            "live create2 on-chain deploy tx https://nile.tronscan.org/#/transaction/{}",
+            hex::encode(deploy_txid),
+        );
+    }
 }

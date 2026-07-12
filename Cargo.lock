@@ -5715,6 +5715,7 @@ dependencies = [
  "foundry-evm-networks",
  "foundry-fork-db",
  "foundry-test-utils",
+ "foundry-tron-primitives",
  "futures",
  "itertools 0.15.0",
  "op-alloy-consensus",

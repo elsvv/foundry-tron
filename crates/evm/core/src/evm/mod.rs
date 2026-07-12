@@ -46,6 +46,12 @@ pub use tron::*;
 
 /// Foundry's supertrait associating [Network] with [FoundryEvmFactory]
 pub trait FoundryEvmNetwork: Copy + Debug + Default + 'static {
+    /// Whether this network runs the Tron EVM (TVM opcodes, TVM energy model,
+    /// and the Tron CREATE2 address scheme). Lets network-agnostic code such as
+    /// the `computeCreate2Address` cheatcode pick the Tron-specific behavior at
+    /// compile time without threading a runtime network handle.
+    const IS_TRON: bool = false;
+
     type Network: Network<
             TxEnvelope: Decodable
                             + SignerRecoverable
@@ -74,6 +80,8 @@ impl FoundryEvmNetwork for EthEvmNetwork {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TronEvmNetwork;
 impl FoundryEvmNetwork for TronEvmNetwork {
+    const IS_TRON: bool = true;
+
     type Network = Ethereum;
     type EvmFactory = TronEvmFactory;
 }
