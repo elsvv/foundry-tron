@@ -505,6 +505,15 @@ pub(crate) fn parse_broadcast_result(v: &serde_json::Value) -> Result<(), TronEr
 #[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
+    use alloy_evm::{Evm, EvmEnv, EvmFactory};
+    use alloy_primitives::{Bytes, TxKind, U256};
+    use foundry_evm_core::evm::TronEvmFactory;
+    use revm::{
+        context::{CfgEnv, TxEnv},
+        database::{CacheDB, EmptyDB},
+        primitives::hardfork::SpecId,
+        state::{AccountInfo, Bytecode},
+    };
 
     fn fixture() -> serde_json::Value {
         serde_json::from_str(include_str!("../testdata/nile_getnowblock.json")).unwrap()
@@ -829,6 +838,295 @@ mod tests {
         eprintln!(
             "live E2E tx: https://nile.tronscan.org/#/transaction/{}",
             alloy_primitives::hex::encode(txid)
+        );
+    }
+
+    /// Live confirmation of the two highest-risk Tron precompile divergences on
+    /// Nile: `0x01` ECRecover's 21-byte (`0x41`-prefixed) address word and
+    /// `0x03`'s `sha256(sha256(x)[..20])` (not ripemd160). Precompile addresses
+    /// are not directly callable via `triggerconstantcontract` ("Smart contract
+    /// is not exist"), so this deploys a tiny generic STATICCALL proxy whose
+    /// calldata is `target_word(32) ‖ input`, then probes it. Cross-checks the
+    /// on-chain output against `foundry-evm-core`'s local precompile semantics.
+    #[tokio::test]
+    async fn live_precompile_probe_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live probe");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+
+        // Generic STATICCALL proxy: runtime reads calldata word 0 as the target
+        // address and forwards calldata[32..] to it, returning the raw output.
+        let creation =
+            hex::decode("601b8060095f395ff36020360360205f375f5f602036035f5f355afa503d5f5f3e3d5ff3")
+                .unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+        let (txid, proxy, info) =
+            p.deploy_contract(&signer, creation, "PrecompileProxy", &opts, poll).await.unwrap();
+        assert!(info.success, "proxy deploy must succeed");
+        eprintln!(
+            "live precompile proxy deploy tx {} -> {}",
+            hex::encode(txid),
+            foundry_tron_primitives::to_base58(proxy),
+        );
+
+        let target = |low: u8| {
+            let mut w = [0u8; 32];
+            w[31] = low;
+            w
+        };
+        let owner = signer.address();
+
+        // 0x03: sha256(sha256("abc")[..20]), not ripemd160("abc").
+        let mut data03 = target(0x03).to_vec();
+        data03.extend_from_slice(b"abc");
+        let cr03 = p.trigger_constant(owner, proxy, &data03).await.unwrap();
+        assert!(cr03.success, "0x03 staticcall must succeed");
+        assert_eq!(
+            hex::encode(&cr03.result),
+            "6b6ea134869d649e6f52658be1a5691e37db83c6b8b72b0f1b36d4f849929c9e",
+            "0x03 on Nile must be double-sha256, not ripemd160",
+        );
+        eprintln!("live 0x03(abc) = {}", hex::encode(&cr03.result));
+
+        // 0x01: canonical ecrecover vector -> Tron 21-byte address form (byte 11 = 0x41).
+        let ecrecover_input = hex::decode(
+            "456e9aea5e197a1f1af7a3e85a3212fa4049a3ba34c2289b4c860fc0b0c64ef3\
+             000000000000000000000000000000000000000000000000000000000000001c\
+             9242685bf161793cc25603c231bc2f568eb630ea16aa137d2664ac8038825608\
+             4f8ae3bd7535248d0bd448298cc2e2071e56992d0774dc340c368ae950852ada",
+        )
+        .unwrap();
+        let mut data01 = target(0x01).to_vec();
+        data01.extend_from_slice(&ecrecover_input);
+        let cr01 = p.trigger_constant(owner, proxy, &data01).await.unwrap();
+        assert!(cr01.success, "0x01 staticcall must succeed");
+        assert_eq!(
+            hex::encode(&cr01.result),
+            "0000000000000000000000417156526fbd7a3c72969b54f64e42c10fbb768c8a",
+            "0x01 on Nile must return the 21-byte (0x41-prefixed) address word",
+        );
+        eprintln!("live 0x01 ecrecover = {}", hex::encode(&cr01.result));
+    }
+
+    /// Live golden for the Tron CREATE2 scheme on Nile. Deploys the sandbox
+    /// `Create2Factory`, then has the node compute both `childCodeHash()` (the
+    /// exact embedded `Counter` init-code hash) and `deploy(salt)` (the CREATE2
+    /// child address java-tron's `generateContractAddress2` produces, via a
+    /// constant call that runs 0xF5 in simulation), and asserts the Rust
+    /// [`foundry_tron_primitives::address::create2_address`] formula reproduces
+    /// the node's address byte-for-byte. A final real `deploy(salt)` transaction
+    /// confirms the child actually deploys on-chain at that address.
+    #[tokio::test]
+    async fn live_create2_golden_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live create2");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+
+        // The sandbox `Create2Factory` (deploy(bytes32) + childCodeHash()),
+        // compiled with tron-solc 0.8.27.
+        let creation =
+            hex::decode(include_str!("../testdata/tron_create2_factory_creation.hex").trim())
+                .unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+
+        let (txid, factory, info) =
+            p.deploy_contract(&signer, creation, "Create2Factory", &opts, poll).await.unwrap();
+        assert!(info.success, "factory deploy must succeed");
+        eprintln!(
+            "live create2 factory tx {} -> {}",
+            hex::encode(txid),
+            foundry_tron_primitives::to_base58(factory),
+        );
+
+        let owner = signer.address();
+        let salt = B256::from(alloy_primitives::U256::from(0xC0FFEEu64));
+
+        // childCodeHash(): the exact `Counter` init-code hash the node hashes.
+        let cr_hash =
+            p.trigger_constant(owner, factory, &hex::decode("ef803be1").unwrap()).await.unwrap();
+        assert!(
+            cr_hash.success && cr_hash.result.len() == 32,
+            "childCodeHash() must return bytes32"
+        );
+        let init_code_hash = B256::from_slice(&cr_hash.result);
+
+        // deploy(salt) as a constant call: the node runs CREATE2 and returns the
+        // child address it computes (java-tron generateContractAddress2), without
+        // persisting state.
+        let mut deploy_data = hex::decode("2b85ba38").unwrap();
+        deploy_data.extend_from_slice(salt.as_slice());
+        let cr_addr = p.trigger_constant(owner, factory, &deploy_data).await.unwrap();
+        assert!(cr_addr.success && cr_addr.result.len() == 32, "deploy() must return an address");
+        let node_child = Address::from_slice(&cr_addr.result[12..]);
+
+        // THE GOLDEN: the Rust formula must reproduce the node's CREATE2 address.
+        let local_child =
+            foundry_tron_primitives::address::create2_address(factory, salt, init_code_hash);
+        assert_eq!(
+            node_child,
+            local_child,
+            "Tron CREATE2 address mismatch: node {} != local {}",
+            to_hex41(node_child),
+            to_hex41(local_child),
+        );
+        eprintln!("live create2 child (node == local) = {}", to_hex41(node_child));
+
+        // Confirm the child truly deploys on-chain at that address (real tx).
+        let (deploy_txid, deploy_info) =
+            p.trigger_contract(&signer, factory, 0, deploy_data, &opts, poll).await.unwrap();
+        assert!(deploy_info.success, "on-chain CREATE2 deploy must succeed");
+        eprintln!(
+            "live create2 on-chain deploy tx https://nile.tronscan.org/#/transaction/{}",
+            hex::encode(deploy_txid),
+        );
+    }
+
+    // ---- golden energy parity harness (local tron-revm vs Nile node) ----
+
+    /// A CANCUN environment mirroring the tron sandbox (`evm_version = "cancun"`),
+    /// identical to the one the `foundry-evm-core` energy-model unit tests use, so
+    /// local energy is metered under the same conditions the node runs under.
+    fn tron_cancun_env() -> EvmEnv {
+        let mut env: EvmEnv<SpecId> =
+            EvmEnv { cfg_env: CfgEnv::new_with_spec(SpecId::CANCUN), ..Default::default() };
+        env.block_env.gas_limit = 30_000_000;
+        env.block_env.prevrandao = Some(B256::with_last_byte(0x11));
+        env
+    }
+
+    /// Deploys the sandbox `Counter` creation bytecode through the local
+    /// [`TronEvmFactory`] and returns the runtime code the constructor RETURNs --
+    /// the exact bytes java-tron stores and later executes on a call.
+    fn counter_runtime() -> Bytes {
+        let creation = hex::decode(
+            include_str!("../../../evm/core/testdata/tron_counter_creation.hex").trim(),
+        )
+        .unwrap();
+        let mut evm = TronEvmFactory.create_evm(CacheDB::<EmptyDB>::default(), tron_cancun_env());
+        let out = evm
+            .transact_raw(TxEnv {
+                kind: TxKind::Create,
+                data: creation.into(),
+                gas_limit: 10_000_000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.result.is_success(), "counter must deploy locally: {:?}", out.result);
+        out.result.output().unwrap().clone()
+    }
+
+    /// Runs `calldata` against a fresh account holding `runtime` on the local
+    /// [`TronEvmFactory`] and returns the metered energy (`tx_gas_used`). The
+    /// account starts with empty storage (slot 0 = 0), matching a freshly
+    /// deployed Counter before its first `setNumber`. Intrinsic tx gas is zero
+    /// under the Tron energy model (it is bandwidth, not energy), so this is pure
+    /// execution energy -- the quantity the node reports as `energy_used`
+    /// (constant call) / `energy_usage_total` (mined tx).
+    fn local_call_energy(runtime: &Bytes, calldata: Vec<u8>) -> u64 {
+        let contract = Address::from([0x42u8; 20]);
+        let mut db = CacheDB::<EmptyDB>::default();
+        db.insert_account_info(
+            contract,
+            AccountInfo::from_bytecode(Bytecode::new_raw(runtime.clone())),
+        );
+        let mut evm = TronEvmFactory.create_evm(db, tron_cancun_env());
+        let out = evm
+            .transact_raw(TxEnv {
+                kind: TxKind::Call(contract),
+                data: calldata.into(),
+                gas_limit: 10_000_000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.result.is_success(), "local call must succeed: {:?}", out.result);
+        out.result.tx_gas_used()
+    }
+
+    /// GOLDEN energy parity against Nile: the local tron-revm energy model must
+    /// reproduce the node's energy **exactly** for both a read and a write on a
+    /// freshly deployed `Counter` (so the dynamic-energy factor is 1 and does not
+    /// inflate the node's number). This is the end-to-end proof that the
+    /// FRONTIER-table + TVM-delta energy model (plan E, Task 1) is faithful, not
+    /// merely internally self-consistent: the local number is computed from the
+    /// same runtime bytecode the node executes, and both are asserted equal with
+    /// no tolerance. Energy (not `fee_sun`) is compared: staked resources zero the
+    /// fee while energy is still metered.
+    #[tokio::test]
+    async fn live_golden_energy_parity_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live golden");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+        let owner = signer.address();
+
+        // Fresh Counter deploy (dynamic-energy factor = 1).
+        let creation = hex::decode(
+            include_str!("../../../evm/core/testdata/tron_counter_creation.hex").trim(),
+        )
+        .unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+        let (deploy_txid, addr, info) =
+            p.deploy_contract(&signer, creation, "Counter", &opts, poll).await.unwrap();
+        assert!(info.success, "counter deploy must succeed");
+        eprintln!(
+            "golden fresh counter tx {} -> {}",
+            hex::encode(deploy_txid),
+            foundry_tron_primitives::to_base58(addr),
+        );
+
+        // The runtime the node stored == the constructor's local output.
+        let runtime = counter_runtime();
+
+        // ---- READ path: number() via triggerconstantcontract ----
+        // Called before setNumber, so slot 0 is 0 both on-chain and locally.
+        let number_sel = hex::decode("8381f58a").unwrap();
+        let node_view = p.trigger_constant(owner, addr, &number_sel).await.unwrap();
+        assert!(node_view.success, "number() constant call must succeed");
+        let local_view = local_call_energy(&runtime, number_sel.clone());
+        assert_eq!(
+            local_view, node_view.energy_used,
+            "READ energy parity failed: local tron-revm {local_view} != Nile {}",
+            node_view.energy_used,
+        );
+        eprintln!("golden READ number(): local == node == {local_view} energy");
+
+        // ---- WRITE path: setNumber(7) mined, TxInfo.energy_usage_total ----
+        // First write on the fresh contract: slot 0 goes 0->7 = SSTORE SET (20000)
+        // both on-chain and locally.
+        let mut set = hex::decode("3fb5c1cb").unwrap();
+        set.extend_from_slice(&U256::from(7u64).to_be_bytes::<32>());
+        let (set_txid, set_info) =
+            p.trigger_contract(&signer, addr, 0, set.clone(), &opts, poll).await.unwrap();
+        assert!(set_info.success, "setNumber(7) must succeed");
+        let local_write = local_call_energy(&runtime, set);
+        assert_eq!(
+            local_write, set_info.energy_used,
+            "WRITE energy parity failed: local tron-revm {local_write} != Nile {}",
+            set_info.energy_used,
+        );
+        eprintln!(
+            "golden WRITE setNumber(7): local == node == {local_write} energy (tx {})",
+            hex::encode(set_txid),
         );
     }
 }

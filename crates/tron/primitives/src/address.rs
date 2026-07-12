@@ -55,6 +55,28 @@ pub fn contract_address_from_txid(txid: B256, owner: Address) -> Address {
     Address::from_slice(&keccak256(combined)[12..])
 }
 
+/// Derives the address java-tron assigns to a contract created by the `CREATE2`
+/// (0xF5) opcode: `keccak256(0x41 ‖ sender ‖ salt ‖ init_code_hash)[12..]`.
+///
+/// Mirrors java-tron `WalletUtil.generateContractAddress2` (chainbase), which
+/// merges `senderAddress(21) ‖ salt(32) ‖ sha3(code)(32)` and takes
+/// `sha3omit12`. `sender` is the 20-byte executing-contract address, hashed with
+/// its 0x41 prefix as the 21-byte Tron address (`Program.createContract2` reads
+/// it from `getContextAddress()` under `allowTvmIstanbul`). `init_code_hash` is
+/// `keccak256(init_code)`.
+///
+/// Unlike Ethereum's EIP-1014 (`Address::create2`) there is **no** `0xff` domain-
+/// separator byte and the sender is the 21-byte 0x41-prefixed address, so the
+/// resulting address differs from the EVM CREATE2 scheme.
+pub fn create2_address(sender: Address, salt: B256, init_code_hash: B256) -> Address {
+    let mut combined = Vec::with_capacity(21 + 32 + 32);
+    combined.push(TRON_ADDRESS_PREFIX);
+    combined.extend_from_slice(sender.as_slice());
+    combined.extend_from_slice(salt.as_slice());
+    combined.extend_from_slice(init_code_hash.as_slice());
+    Address::from_slice(&keccak256(combined)[12..])
+}
+
 pub fn parse(s: &str) -> Result<Address, AddressError> {
     if let Some(h) = s.strip_prefix("0x") {
         let bytes = hex::decode(h).map_err(|e| AddressError::InvalidHex(e.to_string()))?;
@@ -89,7 +111,7 @@ pub fn parse(s: &str) -> Result<Address, AddressError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::{U256, address};
 
     const USDT_HEX20: Address = address!("a614f803b6fd780986a42c78ec9c7f77e6ded13c");
     const USDT_BASE58: &str = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
@@ -145,6 +167,33 @@ mod tests {
         let wtrx_owner = address!("4f778d7cbfa90278c8225403a1485ec09945d418");
         let wtrx_contract = address!("fb3b3134f13ccd2c81f4012e53024e8135d58fee");
         assert_eq!(contract_address_from_txid(wtrx_txid, wtrx_owner), wtrx_contract);
+    }
+
+    #[test]
+    fn create2_address_matches_tron_scheme() {
+        // Golden vector computed out-of-band via `cast keccak` on a hand-built
+        // preimage `0x41 ‖ sender ‖ salt ‖ init_code_hash` (independent of the
+        // Rust construction below), so this is not tautological:
+        //   init_code_hash = keccak256(0x6001600155)
+        //                  = 0xf8b07b08…24a64ef3
+        //   keccak256(0x41 a614…d13c 000…002a f8b0…4ef3)[12..]
+        //                  = 0x524199a5…eaabb171
+        let sender = USDT_HEX20;
+        let salt = B256::from(U256::from(0x2au64));
+        let init_code_hash: B256 =
+            "f8b07b083341d3a7667e38718918d301f47d62f82d8186f4ccd7ed7424a64ef3".parse().unwrap();
+        assert_eq!(
+            create2_address(sender, salt, init_code_hash),
+            address!("524199a527c61ba3920f9921b61b6a1deaabb171"),
+        );
+
+        // The Tron scheme must differ from Ethereum's EIP-1014 (0xff prefix,
+        // 20-byte sender): a shared result would mean the override is a no-op.
+        assert_ne!(
+            create2_address(sender, salt, init_code_hash),
+            sender.create2(salt, init_code_hash),
+            "Tron CREATE2 must diverge from the EVM 0xff scheme"
+        );
     }
 
     #[test]

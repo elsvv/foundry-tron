@@ -6,7 +6,7 @@ libs = []
 network = "tron"
 chain_id = 728126428
 evm_version = "cancun"
-# Native tron-solc 0.8.27 (github.com/tronprotocol/solidity, tag tv_0.8.27,
-# universal macOS binary, sha256 9e369b44...c7ce17aa). Absolute path because
-# SolcReq::Local does not expand `~`.
-solc = "/Users/andrey/.foundry-tron/solc/tron-solc-0.8.27"
+# No `solc` key: on `network = "tron"` forge auto-resolves the native tron-solc
+# (github.com/tronprotocol/solidity, tag tv_0.8.27, sha256-pinned) into
+# ~/.foundry-tron/solc/tron-solc-0.8.27, downloading it once if absent. An
+# explicit `solc = "/abs/path"` still overrides this for a locally built binary.

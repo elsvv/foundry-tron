@@ -1450,6 +1450,26 @@ impl Config {
     ///
     /// If `solc` is [`SolcReq::Local`] then this will ensure that the path exists.
     fn ensure_solc(&self) -> Result<Option<Solc>, SolcError> {
+        // Tron networks use the native `tron-solc` compiler, which `svm` cannot
+        // install (its release host and checksum list are hardcoded to
+        // soliditylang and never match the `tronprotocol/solidity` builds).
+        // Resolve and pin-verify it through `foundry-tron-solc` instead, honoring
+        // `self.offline`. `SolcReq::Local` remains an explicit path override and
+        // falls through to the shared handling below; only `None` (default
+        // version) and `SolcReq::Version` route to the tron resolver.
+        if self.networks.is_tron() && !matches!(self.solc, Some(SolcReq::Local(_))) {
+            let version = match &self.solc {
+                Some(SolcReq::Version(version)) => version.clone(),
+                _ => foundry_tron_solc::default_version(),
+            };
+            let path = foundry_tron_solc::resolve_tron_solc(&version, self.offline)
+                .map_err(|err| SolcError::msg(err.to_string()))?;
+            // `new_with_version` skips the `solc --version` exec and never runs
+            // the soliditylang `verify_checksum` (which would mismatch tron-solc);
+            // the binary is already sha256-verified against the embedded pin.
+            return Ok(Some(Solc::new_with_version(path, version)));
+        }
+
         if let Some(solc) = &self.solc {
             let solc = match solc {
                 SolcReq::Version(version) => {
@@ -5450,6 +5470,92 @@ mod tests {
 
             Ok(())
         });
+    }
+
+    // Tron + no explicit `solc` must auto-resolve the pinned default tron-solc
+    // (0.8.27) via `foundry-tron-solc`, not svm/AutoDetect. Driven with
+    // `offline = true` so it can only succeed off the machine cache — never the
+    // network — and it skips cleanly when the cached binary is absent (e.g. CI
+    // without tron-solc installed). `eprintln!` documents the skip.
+    #[test]
+    #[allow(clippy::disallowed_macros)]
+    fn tron_ensure_solc_auto_resolves_default_from_cache() {
+        let version = Version::new(0, 8, 27);
+        let Ok(cached) = foundry_tron_solc::binary_path(&version) else {
+            eprintln!("skipping tron auto-resolve test: no home directory");
+            return;
+        };
+        if !cached.is_file() {
+            eprintln!(
+                "skipping tron auto-resolve test: no cached tron-solc at {} \
+                 (install tron-solc 0.8.27 to exercise this path)",
+                cached.display()
+            );
+            return;
+        }
+        let config =
+            Config { networks: NetworkConfigs::with_tron(), offline: true, ..Default::default() };
+        let solc = config
+            .ensure_solc()
+            .expect("tron resolve must succeed off the cache")
+            .expect("tron must resolve a concrete solc, not AutoDetect");
+        assert_eq!(solc.solc, cached);
+        assert_eq!(solc.version, version);
+        // The resolver path must feed a `Specific` compiler, not AutoDetect.
+        assert!(matches!(config.solc_compiler().unwrap(), SolcCompiler::Specific(_)));
+    }
+
+    // An explicit `solc = "/abs/path"` on tron is an override: it must be used
+    // verbatim through the shared `Local` handling, bypassing the resolver. The
+    // real cached binary doubles as the absolute path so the version-detecting
+    // `Solc::new` exec succeeds; skips when the binary is absent.
+    #[test]
+    #[allow(clippy::disallowed_macros)]
+    fn tron_ensure_solc_honors_explicit_local_path() {
+        let Ok(cached) = foundry_tron_solc::binary_path(&Version::new(0, 8, 27)) else {
+            eprintln!("skipping tron local-path test: no home directory");
+            return;
+        };
+        if !cached.is_file() {
+            eprintln!("skipping tron local-path test: no cached tron-solc at {}", cached.display());
+            return;
+        }
+        let config = Config {
+            networks: NetworkConfigs::with_tron(),
+            solc: Some(SolcReq::Local(cached.clone())),
+            offline: true,
+            ..Default::default()
+        };
+        let solc = config.ensure_solc().unwrap().expect("local path must resolve a solc");
+        assert_eq!(solc.solc, cached, "explicit local path must be used verbatim");
+    }
+
+    // The `SolcReq::Version` arm on tron routes to the tron resolver. An unknown
+    // version has no pin, so the resolver rejects it deterministically before any
+    // cache or network access — proving the routing without depending on a binary.
+    #[test]
+    fn tron_ensure_solc_version_arm_routes_to_resolver() {
+        let config = Config {
+            networks: NetworkConfigs::with_tron(),
+            solc: Some(SolcReq::Version(Version::new(0, 8, 99))),
+            offline: true,
+            ..Default::default()
+        };
+        let err = config.ensure_solc().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no pinned tron-solc checksum") && msg.contains("0.8.99"),
+            "expected a NoPin tron-solc error, got: {msg}"
+        );
+    }
+
+    // Regression guard: on a non-tron network the tron gate must not fire, so a
+    // config with no `solc` still resolves to `None` (AutoDetect downstream).
+    #[test]
+    fn non_tron_ensure_solc_is_unchanged() {
+        let config = Config::default();
+        assert!(!config.networks.is_tron());
+        assert!(config.ensure_solc().unwrap().is_none());
     }
 
     #[test]

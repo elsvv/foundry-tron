@@ -127,6 +127,9 @@ impl EvmOpts {
             .maybe_initial_backoff(self.fork_retry_backoff)
             .maybe_headers(self.fork_headers.clone())
             .compute_units_per_second(self.get_compute_units_per_second())
+            // On Tron, `eth_getTransactionCount` is a permanent `-32601` stub; install the nonce
+            // shim so the fork backend's account loads succeed. No-op for every other network.
+            .tron_shim(self.networks.is_tron())
             .build()
     }
 
@@ -224,6 +227,17 @@ impl EvmOpts {
                 && let Some(host) = url.host()
             {
                 write!(msg, " with provider {host}").unwrap();
+            }
+            // A Tron fork must target the node's `/jsonrpc` endpoint, which serves the `eth_*`
+            // methods the fork backend needs. Pointing at a `/wallet/*` host (the broadcast API)
+            // fails here on `eth_chainId`; surface an actionable hint instead of a bare RPC error.
+            if self.networks.is_tron() {
+                write!(
+                    msg,
+                    "\ntron fork requires the /jsonrpc endpoint \
+                     (e.g. https://api.trongrid.io/jsonrpc)"
+                )
+                .unwrap();
             }
             msg
         })?;

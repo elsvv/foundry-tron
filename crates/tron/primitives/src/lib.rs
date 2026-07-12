@@ -10,7 +10,9 @@ pub mod sign;
 pub mod tapos;
 pub mod units;
 
-pub use address::{contract_address_from_txid, parse as parse_address, to_base58, to_hex41};
+pub use address::{
+    contract_address_from_txid, create2_address, parse as parse_address, to_base58, to_hex41,
+};
 pub use proto::{
     ContractType, CreateSmartContract, SmartContract, Transaction, TransactionRaw,
     TransferContract, TriggerSmartContract, txid, type_url,

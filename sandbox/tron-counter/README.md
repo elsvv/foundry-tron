@@ -6,12 +6,16 @@ revm / Cancun, chain id 728126428).
 
 ## What is PROVEN working
 
-1. **Native tron-solc 0.8.27** downloaded to
-   `~/.foundry-tron/solc/tron-solc-0.8.27`
+1. **Native tron-solc 0.8.27, auto-resolved.** `foundry.toml` carries no `solc`
+   key; on `network = "tron"` forge resolves the compiler through
+   `foundry-tron-solc` into `~/.foundry-tron/solc/tron-solc-0.8.27`
    (github.com/tronprotocol/solidity, tag `tv_0.8.27`, universal macOS binary,
-   sha256 `9e369b442b3a835320cf1450a21ce5e8acf0d319a50d10a10a2001aac7ce17aa`).
-   Runs **natively** on Apple Silicon (universal x86_64+arm64 binary — no
-   Rosetta, no fallback). `--version` → `solc.tron ... 0.8.27+commit.19164bed`.
+   sha256 `9e369b442b3a835320cf1450a21ce5e8acf0d319a50d10a10a2001aac7ce17aa`),
+   downloading and pin-verifying it once if the cache is empty (skipped under
+   `offline`). Runs **natively** on Apple Silicon (universal x86_64+arm64 binary
+   — no Rosetta, no fallback). `--version` → `solc.tron ... 0.8.27+commit.19164bed`.
+   An explicit `solc = "/abs/path"` still overrides the resolver for a locally
+   built binary.
 
 2. **`forge build` with real tron-solc succeeds.** Both contracts compile;
    trace confirms forge invokes the exact tron-solc binary via `--standard-json`
@@ -66,9 +70,9 @@ $FORGE test  -vv          # FAIL: EvmError: OpcodeNotFound (0xD3 CALLTOKENID)
 $FORGE test  -vv          # 3/3 PASS
 ```
 
-The committed `foundry.toml` keeps `solc = <tron-solc>` because compiling with
-real tron-solc is the point of the sandbox; swap to `solc = "0.8.27"` to see the
-3/3 plumbing pass.
+The committed `foundry.toml` has no `solc` key: forge auto-resolves the real
+tron-solc (compiling with it is the point of the sandbox). To see the 3/3
+vanilla-solc plumbing pass instead, add `solc = "0.8.27"` back.
 
 ## Plan D — `cast` on Tron (offline utilities + Nile deploy/read)
 
@@ -171,3 +175,53 @@ gains an optional `tron` block:
 
 The public Nile endpoint (`nile.trongrid.io`, no API key) WAF-throttles a burst
 of `/wallet/*` POSTs with HTTP 405; set `TRON_PRO_API_KEY` to avoid it.
+
+## Plan G — read-only fork over `/jsonrpc`
+
+`forge test --fork-url <host>/jsonrpc` with `network = "tron"` forks real Tron
+state into tron-revm (Plan E energy model + precompiles). It is **read-only** —
+no transaction is broadcast, no TRX is spent — and **mainnet-only**: the live
+`/jsonrpc` servlet is mounted on `api.trongrid.io` but **not** on `api.nileex.io`
+(nginx 404), and it is inherently **tip-only** (java-tron serves account/storage
+state only at the `latest` tag; a pinned block number returns `-32602`).
+
+Two shims on the foundry side make it work (java-tron's `/jsonrpc` intentionally
+answers `eth_getTransactionCount` with a permanent `-32601`, and rejects
+block-number state queries): a nonce shim (`eth_getTransactionCount → 0x0`) and a
+tip-only unpin of the fork state block. Both `--fork-url` (global fork) and
+`vm.createSelectFork` route through them.
+
+```bash
+cd sandbox/tron-counter
+FORGE=<repo>/target/debug/forge
+
+# Read the real mainnet USDT contract on a fork (drop this test into test/):
+cat > test/UsdtFork.t.sol <<'SOL'
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+interface Vm { function createSelectFork(string calldata) external returns (uint256); }
+interface IERC20 { function name() external view returns (string memory);
+                   function decimals() external view returns (uint8);
+                   function totalSupply() external view returns (uint256); }
+contract UsdtForkTest {
+    Vm constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
+    IERC20 constant USDT = IERC20(0xa614f803B6FD780986A42c78Ec9c7f77e6DeD13C);
+    function test_fork_usdt() public {
+        vm.createSelectFork("https://api.trongrid.io/jsonrpc");
+        require(keccak256(bytes(USDT.name())) == keccak256("Tether USD"), "name");
+        require(USDT.decimals() == 6, "decimals");
+        require(USDT.totalSupply() > 0, "supply");
+    }
+}
+SOL
+TRON_LIVE=1 $FORGE test --mt test_fork_usdt -vvv
+
+# Or a global fork from the command line:
+TRON_LIVE=1 $FORGE test --fork-url https://api.trongrid.io/jsonrpc -vvv
+```
+
+Canonical, gated coverage lives in `crates/forge/tests/cli/tron.rs`
+(`tron_mainnet_fork_reads_usdt`, `TRON_LIVE=1`): it also cross-checks a raw
+balances storage slot (`keccak256(abi.encode(holder, 0))`) against `balanceOf`
+and confirms `extcodesize > 0`. Forking a Tron node under `forge script`
+(broadcast) is still rejected with an actionable error.
