@@ -48,6 +48,24 @@ const TRON_SELFDESTRUCT_NEW_ACCOUNT_ENERGY: u64 = 25_000;
 /// the FRONTIER base table, re-asserted here for clarity/robustness.
 const TRON_TRANSIENT_ENERGY: u16 = 100;
 
+/// Tron MLOAD/MSTORE/MSTORE8 static energy: `SPECIAL_TIER` (1), not the
+/// `VERY_LOW` (3) revm's FRONTIER base charges. java-tron
+/// `OperationRegistry.adjustMemOperations` re-registers these three memory
+/// opcodes to `getMloadCost2` / `getMStoreCost2` / `getMStore8Cost2`, each of
+/// which returns `SPECIAL_TIER + calcMemEnergy(...)` (`EnergyCost.java:170-200`),
+/// whenever `allowHigherLimitForMaxCpuTimeOfOneTx` is active. That flag is on for
+/// both mainnet and Nile (`getAllowHigherLimitForMaxCpuTimeOfOneTx = 1`, chain
+/// param probed 2026-07-12). revm charges the base 3 purely via the static gas
+/// table and the memory expansion dynamically inside the instruction
+/// (`revm-interpreter` `memory.rs` `mload`/`mstore`), so lowering the static tier
+/// to 1 reproduces java-tron's `1 + memory` exactly. MCOPY is left at `VERY_LOW`:
+/// `EnergyCost.getMCopyCost` keeps `VERY_LOW_TIER + calcMemEnergy`, matching
+/// revm. Verified live against Nile: a fresh Counter `number()` read is 414
+/// energy on-chain and 414 locally only with this delta (the read executes 2
+/// MSTORE + 2 MLOAD, i.e. 8 energy of overcharge removed), and `setNumber(7)` is
+/// 20438 on-chain and 20438 locally (1 MSTORE, 2 removed).
+const TRON_MEMORY_OP_ENERGY: u16 = 1;
+
 /// Applies the faithful TVM energy model to a freshly built revm EVM: swaps the
 /// static gas table to the FRONTIER baseline, re-asserts the TVM static deltas,
 /// installs FRONTIER `GasParams`, and overrides the Tron-specific dynamic
@@ -114,6 +132,13 @@ pub(super) fn apply_tron_energy<DB: Database, I>(
     instructions.insert_gas(opcode::TLOAD, TRON_TRANSIENT_ENERGY);
     instructions.insert_gas(opcode::TSTORE, TRON_TRANSIENT_ENERGY);
     instructions.insert_gas(opcode::SELFDESTRUCT, TRON_SELFDESTRUCT_ENERGY);
+    // MLOAD/MSTORE/MSTORE8 are SPECIAL_TIER (1) + memory on Tron, not VERY_LOW
+    // (3) + memory (see [`TRON_MEMORY_OP_ENERGY`]). The memory expansion is still
+    // charged dynamically inside the revm instruction, so only the static tier
+    // moves from 3 to 1.
+    instructions.insert_gas(opcode::MLOAD, TRON_MEMORY_OP_ENERGY);
+    instructions.insert_gas(opcode::MSTORE, TRON_MEMORY_OP_ENERGY);
+    instructions.insert_gas(opcode::MSTORE8, TRON_MEMORY_OP_ENERGY);
 
     // 2. Dynamic gas: FRONTIER GasParams + the Tron-specific overrides.
     inner.ctx.cfg.set_gas_params(tron_gas_params());
@@ -338,13 +363,46 @@ mod tests {
     }
 
     #[test]
+    fn mstore_is_special_tier_1_plus_memory_not_verylow_3() {
+        // 60 01 PUSH1 1 value(3) | 5f PUSH0 offset(2) | 52 MSTORE = 1 SPECIAL +
+        // memory-expand-to-1-word(3) | 5f 5f f3 (2+2+0). java-tron's
+        // adjustMemOperations makes MSTORE SPECIAL_TIER(1), not VERY_LOW(3).
+        let code = hex::decode("60015f52 5f5ff3".replace(' ', "")).unwrap();
+        assert_eq!(
+            tron_energy(&code),
+            3 + 2 + (1 + 3) + 2 + 2,
+            "MSTORE is SPECIAL_TIER(1) + memory on Tron, not VERY_LOW(3) + memory"
+        );
+        assert!(
+            eth_energy(&code) != tron_energy(&code),
+            "Ethereum charges VERY_LOW(3) + memory + intrinsic"
+        );
+    }
+
+    #[test]
+    fn mload_is_special_tier_1_plus_memory() {
+        // 5f PUSH0 offset(2) | 51 MLOAD = 1 SPECIAL + memory-expand-to-1-word(3) |
+        // 50 POP(2) | 5f 5f f3 (2+2+0).
+        let code = hex::decode("5f5150 5f5ff3".replace(' ', "")).unwrap();
+        assert_eq!(
+            tron_energy(&code),
+            2 + (1 + 3) + 2 + 2 + 2,
+            "MLOAD is SPECIAL_TIER(1) + memory on Tron"
+        );
+        assert!(
+            eth_energy(&code) != tron_energy(&code),
+            "Ethereum must differ (VERY_LOW + intrinsic)"
+        );
+    }
+
+    #[test]
     fn deploy_price_is_execution_plus_200_per_runtime_byte() {
         // Constructor writes one byte and RETURNs it as the 1-byte runtime.
-        // 60 01(3) 60 00(3) 53 MSTORE8 = 3 + mem-expand-1-word(3) | 60 01(3)
-        // 60 00(3) f3 RETURN(0) -> execution 18; code deposit 200*1 (CREATE_DATA),
+        // 60 01(3) 60 00(3) 53 MSTORE8 = 1 SPECIAL + mem-expand-1-word(3) | 60 01(3)
+        // 60 00(3) f3 RETURN(0) -> execution 16; code deposit 200*1 (CREATE_DATA),
         // and NO EIP-3860 initcode metering and NO 21000/32000 intrinsic.
         let code = hex::decode("600160005360016000f3").unwrap();
-        assert_eq!(tron_energy(&code), 18 + 200, "deploy energy = execution + 200/runtime-byte");
+        assert_eq!(tron_energy(&code), 16 + 200, "deploy energy = execution + 200/runtime-byte");
         // Ethereum adds 21000 + 32000 intrinsic + initcode metering.
         assert!(eth_energy(&code) > 50_000, "Ethereum deploy carries the create intrinsic");
     }
@@ -426,10 +484,11 @@ mod tests {
     /// **no** per-word EIP-3860 term. The snippet stores a 32-byte child initcode
     /// (`5f 5f f3` = return empty, then padding), CREATEs it, POPs the address and
     /// returns empty. Hand-computed against `EnergyCost.getCreateCost`: setup is
-    /// `PUSH32 3, PUSH0 2, MSTORE 3+mem 3, PUSH1 3, PUSH0 2, PUSH0 2` = 18; then
-    /// `CREATE 32000`, the child `PUSH0 2, PUSH0 2, RETURN 0` = 4, and the tail
-    /// `POP 2, PUSH0 2, PUSH0 2, RETURN 0` = 6, totalling 32028. With EIP-3860
-    /// metering left on it would be 32030 (2/word extra).
+    /// `PUSH32 3, PUSH0 2, MSTORE 1+mem 3, PUSH1 3, PUSH0 2, PUSH0 2` = 16 (MSTORE
+    /// is SPECIAL_TIER 1 on Tron); then `CREATE 32000`, the child `PUSH0 2, PUSH0
+    /// 2, RETURN 0` = 4, and the tail `POP 2, PUSH0 2, PUSH0 2, RETURN 0` = 6,
+    /// totalling 32026. With EIP-3860 metering left on it would be 32028 (2/word
+    /// extra).
     #[test]
     fn inner_create_has_no_eip3860_metering() {
         let mut child = vec![0x5f, 0x5f, 0xf3];
@@ -442,8 +501,8 @@ mod tests {
 
         assert_eq!(
             tron_energy(&code),
-            32_028,
-            "inner CREATE of a 32-byte initcode is 32028 (no 2/word EIP-3860 term)"
+            32_026,
+            "inner CREATE of a 32-byte initcode is 32026 (no 2/word EIP-3860 term)"
         );
         assert_ne!(
             eth_energy(&code),
@@ -455,11 +514,11 @@ mod tests {
     /// An inner CREATE forwards the full remaining gas to the child (no 63/64
     /// retention). The child initcode reads `GAS` and REVERTs with it, so the
     /// parent surfaces the child's forwarded budget via RETURNDATACOPY.
-    /// Hand-computed: parent spends `PUSH32 3, PUSH0 2, MSTORE 3+mem 3, PUSH1 3,
-    /// PUSH0 2, PUSH0 2` = 18 before CREATE, then CREATE deducts 32000, so the
-    /// child budget is `10_000_000 - 18 - 32000 = 9_967_982`; the child `GAS` op
-    /// charges 2 and reports 9_967_980. With the 63/64 rule left on it would
-    /// report 9_812_229.
+    /// Hand-computed: parent spends `PUSH32 3, PUSH0 2, MSTORE 1+mem 3, PUSH1 3,
+    /// PUSH0 2, PUSH0 2` = 16 before CREATE (MSTORE is SPECIAL_TIER 1 on Tron),
+    /// then CREATE deducts 32000, so the child budget is
+    /// `10_000_000 - 16 - 32000 = 9_967_984`; the child `GAS` op charges 2 and
+    /// reports 9_967_982. With the 63/64 rule left on it would report 9_812_231.
     #[test]
     fn inner_create_forwards_all_gas() {
         // child = GAS, PUSH0, MSTORE, PUSH1 32, PUSH0, REVERT (reverts with gasleft).
@@ -477,7 +536,7 @@ mod tests {
 
         assert_eq!(
             tron_returned_word(&code),
-            U256::from(9_967_980u64),
+            U256::from(9_967_982u64),
             "child sees the full forwarded gas (no 63/64 retention)"
         );
         // Ethereum retains 1/64 and carries a different create intrinsic, so the
