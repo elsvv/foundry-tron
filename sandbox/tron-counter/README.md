@@ -6,12 +6,16 @@ revm / Cancun, chain id 728126428).
 
 ## What is PROVEN working
 
-1. **Native tron-solc 0.8.27** downloaded to
-   `~/.foundry-tron/solc/tron-solc-0.8.27`
+1. **Native tron-solc 0.8.27, auto-resolved.** `foundry.toml` carries no `solc`
+   key; on `network = "tron"` forge resolves the compiler through
+   `foundry-tron-solc` into `~/.foundry-tron/solc/tron-solc-0.8.27`
    (github.com/tronprotocol/solidity, tag `tv_0.8.27`, universal macOS binary,
-   sha256 `9e369b442b3a835320cf1450a21ce5e8acf0d319a50d10a10a2001aac7ce17aa`).
-   Runs **natively** on Apple Silicon (universal x86_64+arm64 binary — no
-   Rosetta, no fallback). `--version` → `solc.tron ... 0.8.27+commit.19164bed`.
+   sha256 `9e369b442b3a835320cf1450a21ce5e8acf0d319a50d10a10a2001aac7ce17aa`),
+   downloading and pin-verifying it once if the cache is empty (skipped under
+   `offline`). Runs **natively** on Apple Silicon (universal x86_64+arm64 binary
+   — no Rosetta, no fallback). `--version` → `solc.tron ... 0.8.27+commit.19164bed`.
+   An explicit `solc = "/abs/path"` still overrides the resolver for a locally
+   built binary.
 
 2. **`forge build` with real tron-solc succeeds.** Both contracts compile;
    trace confirms forge invokes the exact tron-solc binary via `--standard-json`
@@ -66,9 +70,9 @@ $FORGE test  -vv          # FAIL: EvmError: OpcodeNotFound (0xD3 CALLTOKENID)
 $FORGE test  -vv          # 3/3 PASS
 ```
 
-The committed `foundry.toml` keeps `solc = <tron-solc>` because compiling with
-real tron-solc is the point of the sandbox; swap to `solc = "0.8.27"` to see the
-3/3 plumbing pass.
+The committed `foundry.toml` has no `solc` key: forge auto-resolves the real
+tron-solc (compiling with it is the point of the sandbox). To see the 3/3
+vanilla-solc plumbing pass instead, add `solc = "0.8.27"` back.
 
 ## Plan D — `cast` on Tron (offline utilities + Nile deploy/read)
 

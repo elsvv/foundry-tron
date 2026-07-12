@@ -21,7 +21,7 @@
 | C2 | Мини tron-revm: `TronEvmFactory` (EthEvmFactory + insert_instruction для 0xD0–0xD4), закрытие E2E-гейта плана C | ✅ Готов. Задача 1 (`TronEvmFactory`, unit-тесты на реальном tron-solc-байткоде). Задача 2 — sandbox `forge build`+`forge test` 4/4 на байткоде tron-solc (`testIncrement`, `testTronChainId`, `testTransientStorageCancun`, `testNonPayableGuardWithTvmOpcodes`) |
 | D | cast/forge script/forge create: деплой и вызовы на Nile через tron-provider | ✅ Готов. Полный сквозной цикл Этапа 1 воспроизведён на Nile (см. ниже) |
 | E | Ядро tron-revm (ветка `tron-stage2`): faithful energy-модель (FRONTIER-таблицы + TVM-дельты), полный набор precompiles java-tron, CREATE2 по формуле Tron + cheatcode | ✅ Готов. Golden energy exact-match на Nile (view+write), CREATE2/precompile golden подтверждены (см. «План E» ниже) |
-| F | Резолвер tron-solc (крейт `foundry-tron-solc`, GitHub-релизы + чексуммы, шов `Config::ensure_solc`) | ⏳ Следующий |
+| F | Резолвер tron-solc (крейт `foundry-tron-solc`, GitHub-релизы + чексуммы, шов `Config::ensure_solc`) | ✅ Готов. Крейт с pinned sha256 (0.8.25/26/27 × linux/macos/windows), автовыбор в `ensure_solc` при `network=tron`, sandbox без абсолютного пути. Оффлайн-тесты зелёные, download-гейт `TRON_SOLC_DOWNLOAD=1` |
 | G | Fork-режим (`forge/cast --fork-url` через `/jsonrpc`) с постоянным shim `eth_getTransactionCount → 0x0` (java-tron отдаёт `-32601`) | ⏳ После F |
 
 ## План D — что работает (сквозной цикл Этапа 1 на Nile)
@@ -56,6 +56,18 @@
 
 Тесты: `cargo test -p foundry-evm-core tron` = 38 зелёных; golden в `crates/tron/provider/src/client.rs` (`live_golden_energy_parity_on_nile`, гейт `TRON_LIVE`).
 
+## План F — авторезолв tron-solc (крейт `foundry-tron-solc` + шов `Config::ensure_solc`)
+
+svm непригоден (`SOLC_RELEASES_URL` захардкожен на `binaries.soliditylang.org`, `verify_checksum` сверяет с soliditylang-листом → гарантированный mismatch для tron-бинарников). Решение — отдельный крейт `crates/tron/solc` (не в config: там нет reqwest/sha2/tokio), качающий нативные бинарники из GitHub-релизов `tronprotocol/solidity` и сверяющий sha256 по встроенной pinned-таблице.
+
+1. **Крейт `foundry-tron-solc` (F1).** `resolve_tron_solc(version, offline) -> PathBuf`: кэш-проверка (`~/.foundry-tron/solc/tron-solc-{ver}` + sha256) → скачивание (reqwest, redirect-friendly, таймауты, ретраи ×3, `RuntimeOrHandle`-паттерн для блокирующего HTTP) → sha256-верификация → атомарная запись (tmp+rename, chmod 755). Pinned sha256 в `pins.rs` (`const`, источник `tronprotocol.github.io/solc-bin/{platform}/list.json`, дата 2026-07-12): 0.8.25/0.8.26/0.8.27 × {linux-amd64, macosx-amd64, windows-amd64}. НИКОГДА не качает при `offline` или кэш-хите; mismatch = hard error (не тихий фолбэк). Оффлайн-юниты + download-гейт `TRON_SOLC_DOWNLOAD=1` (качает самый малый ассет — windows ~10 МБ — и сверяет пин). **Конвенция `~/.foundry-tron/solc/tron-solc-{ver}` кодифицирована здесь** (`binary_path`).
+2. **Интеграция в config (F2).** `Config::ensure_solc` при `self.networks.is_tron()` и `solc` = `None`/`Version(v)`: выбор версии (None → `default_version()`=0.8.27; Version(v) → v) → `resolve_tron_solc(&v, self.offline)` → `Solc::new_with_version(path, v)` (без exec `--version`, без `verify_checksum`). `SolcReq::Local` — как раньше (явный оверрайд, падает в общую ветку, резолвер не трогается). Non-tron путь не изменён. Диспетч не ломается: `ensure_solc` теперь отдаёт `Some(Solc)` → `SolcCompiler::Specific` (не AutoDetect).
+3. **Sandbox без абсолютного пути.** `sandbox/tron-counter/foundry.toml` больше НЕ несёт `solc = "/Users/…"` — резолвится авто в машинный кэш. `forge build` + `forge test` = 5/5 через авторезолв (кэш-хит).
+
+**Известный gap:** нативного Linux-ARM бинарника tron-solc нет (`linux-arm64`/`macosx-aarch64` в solc-bin отдают 404) — `Platform::LinuxAarch64` → понятная ошибка `UnsupportedPlatform` (build-from-source). macOS ARM покрыт universal `solc-macos` под ключом `macosx-amd64`.
+
+Тесты: `cargo test -p foundry-tron-solc` (оффлайн + гейт); `cargo test -p foundry-config tron` = 8 зелёных (4 новых config-теста: авторезолв-дефолт из кэша, honors explicit Local, Version-арм → резолвер (unknown-версия → NoPin, детерминированно без сети), non-tron не изменился).
+
 ## Ключевые находки (не потерять)
 
 00. **Golden поймал реальную дельту: MLOAD/MSTORE/MSTORE8 = SPECIAL_TIER (1), а не VERY_LOW (3).** Первый прогон golden дал расхождение view `number()` local 422 vs node 414 (Δ8) и write local 20440 vs node 20438 (Δ2). Корень — java-tron `OperationRegistry.adjustMemOperations` перерегистрирует MLOAD/MSTORE/MSTORE8 на `getMloadCost2`/`getMStoreCost2`/`getMStore8Cost2` = `SPECIAL_TIER(1) + calcMemEnergy`, когда активен `allowHigherLimitForMaxCpuTimeOfOneTx` (chain param `getAllowHigherLimitForMaxCpuTimeOfOneTx=1` на Nile, проба 2026-07-12). revm-FRONTIER несёт для них 3 в статической таблице (память — динамически внутри инструкции), поэтому фикс = `insert_gas(MLOAD/MSTORE/MSTORE8, 1)`. Δ8 = 2 MSTORE + 2 MLOAD × 2; Δ2 = 1 MSTORE × 2 — оба обнулились до exact-match. MCOPY НЕ трогается (`getMCopyCost` держит VERY_LOW=3, совпадает с revm). Зафиксировано в `energy.rs` (`TRON_MEMORY_OP_ENERGY`) + два юнит-теста. **Это доказывает ценность golden с exact-match без допусков — «почти совпадает» скрыло бы дельту.**
@@ -74,9 +86,9 @@
 11. **Канал доступа к исходникам java-tron: jsdelivr.** `raw.githubusercontent.com` с этой машины блокируется; `https://cdn.jsdelivr.net/gh/tronprotocol/java-tron@develop/<path>` работает (`curl -4`). Все доменные факты плана E сверялись через него (`EnergyCost.java`, `OperationRegistry.java`, `PrecompiledContracts.java`, `Program.java`, `ProgramResult.java`).
 12. **Live-нода: `https://api.nileex.io`, НЕ `nile.trongrid.io`.** С этой машины `nile.trongrid.io` недоступен (DNS/сеть); `api.nileex.io` работает для `/wallet/*`. ВАЖНО: на nileex `/jsonrpc` НЕ смонтирован (только `/wallet/*`) — поэтому `get_chain_id`/fork-режим (план G) должны учитывать, что eth_* JSON-RPC живёт на другом хосте/пути. Часть старых live-тестов провайдера всё ещё указывает на `nile.trongrid.io` (могут флапать TLS-хэндшейком) — новые (precompile/create2/golden) уже на `api.nileex.io`.
 
-## Следующие планы Этапа 2 (F, G)
+## Следующие планы Этапа 2 (G)
 
-- **План F — резолвер tron-solc** (крейт `foundry-tron-solc`). svm непригоден: `svm::install` жёстко захардкодил `binaries.soliditylang.org` (`svm-rs-0.5.26/releases.rs:17`, без хука кастомного URL), а `verify_checksum` сверяет с soliditylang-релиз-листом → для tron-бинарников mismatch. Решение: качать нативные бинарники из GitHub-релизов `tronprotocol/solidity` (ассет `solc-macos` универсальный, версии до 0.8.27_Democritus) со своими sha256 в `~/.foundry-tron/solc/`, автовыбор по pragma; шов — `Config::ensure_solc` (`crates/config/src/lib.rs:1452-1481`) / `SolcReq`. Сейчас путь ручной (`solc = "/abs/path"` в foundry.toml — этап 1, работает).
+- **План F — резолвер tron-solc** — ✅ ГОТОВ (см. секцию «План F» выше).
 - **План G — fork-режим** (`forge/cast --fork-url <host>/jsonrpc`). Разведка: почти всё уже работает по generic-N-пути (env, block-хэши = Tron block id, storage, code, balance), forge test даже не имеет tron-fork-гейта — `--fork-url` уже создаёт реальный `AnyNetwork` fork. **Единственный блокер — постоянный `eth_getTransactionCount → -32601`** (java-tron `TronJsonRpc.java:251-256` — это hard-stub, аннотация `@JsonRpcError(-32601)` как ЕДИНСТВЕННОЕ поведение, не временно): роняет `try_join3` в `foundry-fork-db` `get_account_req` на первом же account-fetch. Решение — tower-layer на RPC-клиенте (`crates/common/src/provider/mod.rs:395/410`, рядом с `retry_layer`, гейт `network=tron`): перехватывать метод `eth_getTransactionCount` и возвращать `0x0` без обращения к сети (не трогая git-pinned `foundry-fork-db`). ВНИМАНИЕ: `/jsonrpc` НЕ смонтирован на `api.nileex.io` (nginx 404) — golden/fork-пробы плана G потребуют trongrid-mainnet или self-hosted java-tron.
 
 ## Окружение (важно для любой машины)
@@ -86,7 +98,7 @@
   ```bash
   TC=$(dirname "$(rustup which --toolchain stable cargo)"); PATH="$TC:$PATH" cargo <...>
   ```
-- **tron-solc:** нативный бинарник `0.8.27` — `/Users/andrey/.foundry-tron/solc/tron-solc-0.8.27` (universal macOS, sha256 `9e369b44…c7ce17aa`; путь абсолютный, т.к. `SolcReq::Local` не разворачивает `~`). `sandbox/tron-counter/foundry.toml` указывает `solc` именно на него.
+- **tron-solc:** нативный бинарник `0.8.27` — `/Users/andrey/.foundry-tron/solc/tron-solc-0.8.27` (universal macOS, sha256 `9e369b44…c7ce17aa`). После плана F резолвится **авто** через `foundry-tron-solc` при `network=tron` (кэш-хит без сети; при пустом кэше — скачивание с пин-верификацией, отключается `offline=true`); `sandbox/tron-counter/foundry.toml` `solc` НЕ задаёт. Явный `solc = "/abs/path"` по-прежнему оверрайдит резолвер (`SolcReq::Local` не разворачивает `~`, поэтому путь абсолютный).
 - **Live-тесты:** `TRON_LIVE=1` + `TRON_PRIVATE_KEY` (файл `.env.tron-dev` в корне репо, в git НЕ входит — перенести вручную или сгенерировать новый ключ и пополнить через кран https://nileex.io/join/getJoinPage). Текущий тестовый адрес: `TX7izXWcmofRYonzdcThrS78jifMtVWCuf` (~1997 TRX на Nile).
 - Тесты tron-крейтов: `cargo test -p foundry-tron-primitives -p foundry-tron-provider`. CI-линт: `cargo clippy --all-targets` с `-Dwarnings` — tron-крейты чистые.
 

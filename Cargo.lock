@@ -5582,6 +5582,7 @@ dependencies = [
  "foundry-compilers",
  "foundry-evm-hardforks",
  "foundry-evm-networks",
+ "foundry-tron-solc",
  "glob",
  "globset",
  "heck",
