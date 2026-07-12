@@ -72,6 +72,22 @@ const TRON_TRANSIENT_ENERGY: u16 = 100;
 /// below: `sstore_clearing_slot_refund`, `sstore_set_refund`,
 /// `sstore_reset_refund`, and `selfdestruct_refund`.
 ///
+/// # Gas forwarding: no 63/64 retention (verified fact #5)
+///
+/// Ethereum's EIP-150 retains 1/64 of the caller's gas on every inner CALL and
+/// CREATE. Tron does **not**: `Program.getCallEnergy` / `getCreateEnergy`
+/// (`Program.java:1834-1848`) apply the 1/64 cut only under
+/// `allowTvmCompatibleEvm && contractVersion == 1`, a flag that is off on both
+/// mainnet and Nile (probed 2026-07-12); the default path forwards
+/// `min(requested, all-available)`. revm applies the cut unconditionally in the
+/// call/create instructions (`call_helpers.rs:92-96`, `contract.rs:101-110`),
+/// reading the reduction divisor from `GasId::call_stipend_reduction` (64 in the
+/// FRONTIER `GasParams`, gated on the CANCUN runtime spec). Setting that divisor
+/// to `u64::MAX` makes `gas_limit - gas_limit / divisor == gas_limit` for every
+/// realistic gas limit, i.e. the full remaining gas is forwarded — matching
+/// Tron. Without this an inner frame would see 63/64 of the parent's gas, so
+/// `gasleft()` and nested out-of-gas boundaries would diverge from on-chain.
+///
 /// # Known limitation: call depth
 ///
 /// Tron caps call depth at 64 (`Program.java` `MAX_DEPTH=64`) versus revm's
@@ -100,6 +116,23 @@ pub(super) fn apply_tron_energy<DB: Database, I>(
     instructions.insert_gas(opcode::SELFDESTRUCT, TRON_SELFDESTRUCT_ENERGY);
 
     // 2. Dynamic gas: FRONTIER GasParams + the Tron-specific overrides.
+    inner.ctx.cfg.set_gas_params(tron_gas_params());
+
+    // 3. Limits Tron does not have: no EIP-170 (24KB code cap) and no EIP-3860
+    // size cap. `Program.java:927-943` has no size check. The per-word initcode
+    // metering EIP-3860 also adds (`EnergyCost:414-419` `getCreateCost` has no
+    // per-word term) is disabled in `tron_gas_params` via `initcode_per_word`,
+    // because `limit_contract_initcode_size` only lifts the size cap, not the
+    // metering.
+    inner.ctx.cfg.limit_contract_code_size = Some(usize::MAX);
+    inner.ctx.cfg.limit_contract_initcode_size = Some(usize::MAX);
+}
+
+/// Builds the Tron energy [`GasParams`]: the FRONTIER baseline plus the
+/// Tron-specific dynamic overrides. Extracted from [`apply_tron_energy`] so the
+/// exact override values can be unit-tested directly, independent of the full
+/// EVM wiring.
+pub(super) fn tron_gas_params() -> GasParams {
     let mut gas_params = GasParams::new_spec(SpecId::FRONTIER);
     gas_params.override_gas([
         // EXP byte energy = 10 (Tron `EXP_BYTE_ENERGY`). Already 10 at
@@ -126,24 +159,32 @@ pub(super) fn apply_tron_energy<DB: Database, I>(
         // protobuf tx envelope).
         (GasId::tx_base_stipend(), 0),
         (GasId::tx_token_cost(), 0),
+        // No EIP-3860 per-word initcode metering. `initcode_per_word` is 2 for
+        // *every* spec in the base table (FRONTIER included) and is charged by
+        // the inner CREATE / stock CREATE2 instructions
+        // (`contract.rs:44-58`, gated on the CANCUN runtime spec), so lifting
+        // `limit_contract_initcode_size` alone leaves the 2/word charge. Tron
+        // `EnergyCost.getCreateCost` (:414-419) has no per-word term, so zero
+        // it: an inner CREATE of an N-word initcode otherwise overcharges 2N.
+        (GasId::initcode_per_word(), 0),
+        // No EIP-150 63/64 gas retention on inner CALL/CREATE (see doc comment,
+        // verified fact #5). `call_stipend_reduction(gas_limit)` computes
+        // `gas_limit - gas_limit / divisor`; with divisor `u64::MAX` the second
+        // term is 0 for every realistic gas limit, so the full gas is forwarded.
+        (GasId::call_stipend_reduction(), u64::MAX),
     ]);
-    inner.ctx.cfg.set_gas_params(gas_params);
-
-    // 3. Limits Tron does not have: no EIP-170 (24KB code cap) and no EIP-3860
-    // (initcode metering / size cap). `Program.java:927-943` has no size check
-    // and `EnergyCost:415` `getCreateCost` has no per-word initcode metering.
-    inner.ctx.cfg.limit_contract_code_size = Some(usize::MAX);
-    inner.ctx.cfg.limit_contract_initcode_size = Some(usize::MAX);
+    gas_params
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TRON_ENERGY_FEE_SUN;
+    use super::{TRON_ENERGY_FEE_SUN, tron_gas_params};
     use crate::evm::tron::TronEvmFactory;
     use alloy_evm::{EthEvmFactory, Evm, EvmEnv, EvmFactory};
     use alloy_primitives::{B256, TxKind, U256, hex};
     use revm::{
         context::{CfgEnv, TxEnv},
+        context_interface::cfg::GasParams,
         database::{CacheDB, EmptyDB},
         primitives::hardfork::SpecId,
     };
@@ -345,6 +386,106 @@ mod tests {
             eth_returned_word(&basefee),
             U256::ZERO,
             "Ethereum BASEFEE returns the block base fee"
+        );
+    }
+
+    // ---- inner CREATE/CREATE2 gas: no EIP-3860 metering, no 63/64 retention ----
+
+    /// The Tron `GasParams` charge no per-word EIP-3860 initcode metering,
+    /// unlike the FRONTIER base table (which carries 2/word for every spec).
+    #[test]
+    fn tron_gas_params_disable_initcode_metering() {
+        let tron = tron_gas_params();
+        // 64 bytes = 2 words; FRONTIER would charge 2 * 2 = 4, Tron charges 0.
+        assert_eq!(tron.initcode_cost(64), 0, "Tron has no per-word initcode metering");
+        assert_eq!(
+            GasParams::new_spec(SpecId::FRONTIER).initcode_cost(64),
+            4,
+            "FRONTIER base meters 2/word (the value Tron must override away)"
+        );
+    }
+
+    /// The Tron `GasParams` forward the full gas to inner CALL/CREATE frames,
+    /// unlike FRONTIER which retains 1/64 (EIP-150).
+    #[test]
+    fn tron_gas_params_forward_all_gas_no_63_64() {
+        let tron = tron_gas_params();
+        assert_eq!(
+            tron.call_stipend_reduction(9_967_982),
+            9_967_982,
+            "Tron forwards all gas (no 1/64 retention)"
+        );
+        assert_eq!(
+            GasParams::new_spec(SpecId::FRONTIER).call_stipend_reduction(9_967_982),
+            9_967_982 - 9_967_982 / 64,
+            "FRONTIER retains 1/64 (the behaviour Tron must override away)"
+        );
+    }
+
+    /// An inner CREATE of a 32-byte initcode costs execution + CREATE(32000) with
+    /// **no** per-word EIP-3860 term. The snippet stores a 32-byte child initcode
+    /// (`5f 5f f3` = return empty, then padding), CREATEs it, POPs the address and
+    /// returns empty. Hand-computed against `EnergyCost.getCreateCost`: setup is
+    /// `PUSH32 3, PUSH0 2, MSTORE 3+mem 3, PUSH1 3, PUSH0 2, PUSH0 2` = 18; then
+    /// `CREATE 32000`, the child `PUSH0 2, PUSH0 2, RETURN 0` = 4, and the tail
+    /// `POP 2, PUSH0 2, PUSH0 2, RETURN 0` = 6, totalling 32028. With EIP-3860
+    /// metering left on it would be 32030 (2/word extra).
+    #[test]
+    fn inner_create_has_no_eip3860_metering() {
+        let mut child = vec![0x5f, 0x5f, 0xf3];
+        child.resize(32, 0x00);
+        let mut code = vec![0x7f]; // PUSH32 child-initcode word.
+        code.extend_from_slice(&child);
+        code.extend_from_slice(&[0x5f, 0x52]); // PUSH0 offset, MSTORE.
+        code.extend_from_slice(&[0x60, 0x20, 0x5f, 0x5f, 0xf0]); // PUSH1 32, PUSH0, PUSH0, CREATE.
+        code.extend_from_slice(&[0x50, 0x5f, 0x5f, 0xf3]); // POP, PUSH0, PUSH0, RETURN.
+
+        assert_eq!(
+            tron_energy(&code),
+            32_028,
+            "inner CREATE of a 32-byte initcode is 32028 (no 2/word EIP-3860 term)"
+        );
+        assert_ne!(
+            eth_energy(&code),
+            tron_energy(&code),
+            "Ethereum must differ (intrinsic + EIP-3860 metering)"
+        );
+    }
+
+    /// An inner CREATE forwards the full remaining gas to the child (no 63/64
+    /// retention). The child initcode reads `GAS` and REVERTs with it, so the
+    /// parent surfaces the child's forwarded budget via RETURNDATACOPY.
+    /// Hand-computed: parent spends `PUSH32 3, PUSH0 2, MSTORE 3+mem 3, PUSH1 3,
+    /// PUSH0 2, PUSH0 2` = 18 before CREATE, then CREATE deducts 32000, so the
+    /// child budget is `10_000_000 - 18 - 32000 = 9_967_982`; the child `GAS` op
+    /// charges 2 and reports 9_967_980. With the 63/64 rule left on it would
+    /// report 9_812_229.
+    #[test]
+    fn inner_create_forwards_all_gas() {
+        // child = GAS, PUSH0, MSTORE, PUSH1 32, PUSH0, REVERT (reverts with gasleft).
+        let child = [0x5a, 0x5f, 0x52, 0x60, 0x20, 0x5f, 0xfd];
+        let mut word = [0u8; 32];
+        word[..child.len()].copy_from_slice(&child);
+        let mut code = vec![0x7f]; // PUSH32 child-initcode word (child in the top 7 bytes).
+        code.extend_from_slice(&word);
+        code.extend_from_slice(&[0x5f, 0x52]); // PUSH0 offset, MSTORE.
+        code.extend_from_slice(&[0x60, 0x07, 0x5f, 0x5f, 0xf0]); // PUSH1 7, PUSH0, PUSH0, CREATE.
+        code.push(0x50); // POP the (zero) create result.
+        // RETURNDATACOPY(dest=0, off=0, size=32); RETURN(0, 32).
+        code.extend_from_slice(&[0x60, 0x20, 0x5f, 0x5f, 0x3e]); // PUSH1 32, PUSH0, PUSH0, RETURNDATACOPY.
+        code.extend_from_slice(&[0x60, 0x20, 0x5f, 0xf3]); // PUSH1 32, PUSH0, RETURN.
+
+        assert_eq!(
+            tron_returned_word(&code),
+            U256::from(9_967_980u64),
+            "child sees the full forwarded gas (no 63/64 retention)"
+        );
+        // Ethereum retains 1/64 and carries a different create intrinsic, so the
+        // child observes a strictly smaller, different budget.
+        assert_ne!(
+            eth_returned_word(&code),
+            tron_returned_word(&code),
+            "Ethereum must differ (63/64 retention + create intrinsic)"
         );
     }
 

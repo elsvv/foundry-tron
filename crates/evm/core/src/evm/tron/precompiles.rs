@@ -15,7 +15,9 @@
 //! - **`0x05` ModExp** uses EIP-198 pricing (GQUAD divisor 20, no 200 floor), which is exactly
 //!   revm's `modexp::byzantium_run` (`gas_calc::<0, 8, 20, _>` plus the Byzantium mult-complexity
 //!   curve). Confirmed identical to `ModExp.getMultComplexity` / `getAdjustedExponentLength` /
-//!   `GQUAD_DIVISOR`.
+//!   `GQUAD_DIVISOR`. The one output-shape difference: for a zero modulus java-tron's
+//!   `ModExp.execute` returns `EMPTY_BYTE_ARRAY` (0 bytes) where revm left-pads to `mod_len` zero
+//!   bytes, so we wrap it (see [`tron_modexp_run`]).
 //! - **`0x09`/`0x0a`** are BatchValidateSign (TIP-43) and ValidateMultiSign (TIP-60), which collide
 //!   with Ethereum's blake2f (`0x09`) and KZG point-eval (`0x0a`). We deliberately override both.
 //!
@@ -29,7 +31,7 @@
 use std::borrow::Cow;
 
 use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
-use alloy_primitives::{Address, Bytes};
+use alloy_primitives::{Address, Bytes, U256};
 use foundry_evm_networks::tron::{
     AVAILABLE_UNFREEZE_V2_SIZE, BATCH_VALIDATE_SIGN, BLAKE2F, BN128_ADD, BN128_MUL, BN128_PAIRING,
     CHECK_UN_DELEGATE_RESOURCE, DELEGATABLE_RESOURCE, ECRECOVER, ETH_RIPEMD160,
@@ -73,7 +75,7 @@ pub fn tron_precompiles() -> Vec<(Address, DynPrecompile)> {
         (SHA256, pure(PrecompileId::Sha256, hash::sha256_run)),
         (RIPEMD160_BROKEN, pure(custom("tron ripemd(sha256d)"), tron_double_sha256_run)),
         (IDENTITY, pure(PrecompileId::Identity, identity::identity_run)),
-        (MODEXP, pure(PrecompileId::ModExp, modexp::byzantium_run)),
+        (MODEXP, pure(PrecompileId::ModExp, tron_modexp_run)),
         (BN128_ADD, pure(PrecompileId::Bn254Add, bn128_add_run)),
         (BN128_MUL, pure(PrecompileId::Bn254Mul, bn128_mul_run)),
         (BN128_PAIRING, pure(PrecompileId::Bn254Pairing, bn128_pairing_run)),
@@ -215,6 +217,57 @@ pub fn tron_double_sha256_run(input: &[u8], gas_limit: u64) -> EthPrecompileResu
     Ok(EthPrecompileOutput::new(cost, out.to_vec().into()))
 }
 
+/// `0x05` ModExp in java-tron form: EIP-198 pricing and math via revm's
+/// `byzantium_run`, but returning an **empty** output when the modulus is zero.
+///
+/// java-tron `ModExp.execute` returns `EMPTY_BYTE_ARRAY` (0 bytes) for
+/// `isZero(mod)`, whereas revm left-pads the result to `mod_len` zero bytes, so
+/// `RETURNDATASIZE` would be `mod_len` instead of 0. The gas cost is unchanged
+/// (the modexp price does not depend on the modulus *value*), and the zero-value
+/// result of a *non-zero* modulus (e.g. `0^2 mod 5 = 0`) is left untouched — only
+/// a zero *modulus* collapses to empty, exactly as java-tron does.
+pub fn tron_modexp_run(input: &[u8], gas_limit: u64) -> EthPrecompileResult {
+    let out = modexp::byzantium_run(input, gas_limit)?;
+    if modexp_modulus_is_zero(input) {
+        return Ok(EthPrecompileOutput::new(out.gas_used, Bytes::new()));
+    }
+    Ok(out)
+}
+
+/// Whether the ModExp modulus is zero, matching java-tron's `isZero(mod)` where
+/// `mod = parseArg(data, 96 + baseLen + expLen, modLen)`. The input layout is
+/// `baseLen | expLen | modLen` (three 32-byte big-endian words) followed by the
+/// base, exponent and modulus bytes; missing trailing bytes are implicitly zero
+/// (right-padding), matching revm's parsing.
+fn modexp_modulus_is_zero(input: &[u8]) -> bool {
+    // Reads the 32-byte big-endian word at word index `i`, right-padding with
+    // zeroes when `input` is short (as revm's `right_pad_with_offset` does).
+    let read_word = |i: usize| -> U256 {
+        let start = i * 32;
+        let mut buf = [0u8; 32];
+        if start < input.len() {
+            let end = (start + 32).min(input.len());
+            buf[..end - start].copy_from_slice(&input[start..end]);
+        }
+        U256::from_be_bytes(buf)
+    };
+    let base_len = read_word(0);
+    let exp_len = read_word(1);
+    let mod_len = read_word(2);
+    if mod_len.is_zero() {
+        return true;
+    }
+    // Byte offset where the modulus starts: 96 + baseLen + expLen.
+    let start = U256::from(96u64).saturating_add(base_len).saturating_add(exp_len);
+    let Ok(start) = usize::try_from(start) else {
+        // Offset past addressable memory: every modulus byte is implicitly zero.
+        return true;
+    };
+    let mod_len = usize::try_from(mod_len).unwrap_or(usize::MAX);
+    // Bytes present in `input`; anything past the end is an implicit zero.
+    input.get(start..).unwrap_or_default().iter().take(mod_len).all(|&b| b == 0)
+}
+
 /// `0x09` BatchValidateSign (TIP-43): `res[i] = 1` iff the `i`-th recovered
 /// address matches `addresses[i]` (compared on the low 20 bytes), else 0.
 ///
@@ -309,23 +362,26 @@ fn batch_validate_sign_inner(data: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Recovers the 20-byte Ethereum address a `0x09`/`0x0a` signature signed for
-/// `hash`, replicating java-tron's `recoverAddrBySign` v-normalisation
-/// (`Rsv.fromSignature` then `ECKey.signatureToKeyBytes`): the trailing byte is
-/// the recovery id, offset by 27 (and, for chain-tagged 31..34, by a further 4).
-/// Returns `None` on any invalid component. The comparison is on the low 20
-/// bytes, matching `DataWord.equalAddressByteArray`.
+/// `hash`, replicating java-tron's `recoverAddrBySign` (`PrecompiledContracts`
+/// `:371-386`). `Rsv.fromSignature` bumps a bare recovery id below 27 by 27,
+/// then `ECDSASignature.validateComponents` (`ECKey.java:923-940`) rejects any
+/// `v` outside `{27, 28}` before recovery — so only raw `v ∈ {0, 1, 27, 28}` is
+/// accepted (recovery id 0 or 1). The chain-tagged `header >= 31 → -4` branch in
+/// `signatureToKeyBytes` is unreachable here because `validateComponents` has
+/// already rejected every `v != 27/28`. Returns `None` on any invalid component.
+/// The comparison is on the low 20 bytes, matching `DataWord.equalAddressByteArray`.
 fn recover_eth_address(sig: &[u8; SIG_LENGTH], hash: &[u8; 32]) -> Option<[u8; 20]> {
     let mut v = sig[64];
+    // Rsv.fromSignature: a bare recovery id (< 27) is lifted to the 27/28 form.
     if v < 27 {
         v = v.wrapping_add(27);
     }
-    if v >= 31 {
-        v -= 4;
-    }
-    let recid = v.checked_sub(27)?;
-    if recid > 3 {
+    // validateComponents: only v ∈ {27, 28} passes; everything else (raw recid
+    // > 1, or chain-tagged 31..34) is rejected before any recovery is attempted.
+    if v != 27 && v != 28 {
         return None;
     }
+    let recid = v - 27;
     let mut sig64 = [0u8; 64];
     sig64.copy_from_slice(&sig[..64]);
     let word = crypto().secp256k1_ecrecover(&sig64, recid, hash).ok()?;
@@ -451,6 +507,37 @@ mod tests {
         assert_ne!(tron.gas_used, berlin.gas_used, "Tron modexp must reprice vs Berlin");
     }
 
+    #[test]
+    fn modexp_zero_modulus_returns_empty_output() {
+        // base_len=exp_len=mod_len=1, base=03, exp=02, mod=00. java-tron's
+        // ModExp.execute returns EMPTY_BYTE_ARRAY for a zero modulus, whereas
+        // revm's byzantium_run left-pads to mod_len zero bytes.
+        let input = h(&format!("{:064x}{:064x}{:064x}030200", 1, 1, 1));
+        let tron = tron_modexp_run(&input, 1_000_000).unwrap();
+        assert!(tron.bytes.is_empty(), "zero modulus -> empty output (RETURNDATASIZE 0)");
+
+        let revm = modexp::byzantium_run(&input, 1_000_000).unwrap();
+        assert_eq!(
+            revm.bytes.as_ref(),
+            &[0u8],
+            "revm left-pads to one zero byte (RETURNDATASIZE 1)"
+        );
+        assert_eq!(tron.gas_used, revm.gas_used, "gas is identical (independent of modulus value)");
+        assert_ne!(tron.bytes, revm.bytes, "Tron modexp must reshape the zero-modulus output");
+    }
+
+    #[test]
+    fn modexp_zero_result_nonzero_modulus_keeps_modlen() {
+        // 0^2 mod 5 = 0: the result is zero but the *modulus* (5) is not, so the
+        // output must stay mod_len bytes and match revm exactly -- only a zero
+        // modulus collapses to empty, not a zero-valued result.
+        let input = h(&format!("{:064x}{:064x}{:064x}000205", 1, 1, 1));
+        let tron = tron_modexp_run(&input, 1_000_000).unwrap();
+        let revm = modexp::byzantium_run(&input, 1_000_000).unwrap();
+        assert_eq!(tron.bytes, revm.bytes, "non-zero modulus is passed through unchanged");
+        assert_eq!(tron.bytes.len(), 1, "a non-zero modulus keeps the mod_len-byte output");
+    }
+
     // ---------------------------------------------------------------------
     // 0x09 BatchValidateSign.
     // ---------------------------------------------------------------------
@@ -525,6 +612,53 @@ mod tests {
             revm::precompile::blake2::run(&input, 1_000_000).is_err(),
             "eth blake2f must reject the batchvalidatesign calldata"
         );
+    }
+
+    #[test]
+    fn recover_eth_address_only_accepts_v_27_28_form() {
+        let hash: [u8; 32] = h(HASH).try_into().unwrap();
+        let expected: [u8; 20] = h(ETH_ADDR).try_into().unwrap();
+        let sig_with_v = |v: u8| -> [u8; SIG_LENGTH] {
+            let mut sig = [0u8; SIG_LENGTH];
+            sig[..32].copy_from_slice(&h(R));
+            sig[32..64].copy_from_slice(&h(S));
+            sig[64] = v;
+            sig
+        };
+
+        // v = 28 (recovery id 1) recovers the canonical address; a bare v = 1 is
+        // lifted to 28 by Rsv.fromSignature and recovers the same address.
+        assert_eq!(recover_eth_address(&sig_with_v(28), &hash), Some(expected));
+        assert_eq!(recover_eth_address(&sig_with_v(1), &hash), Some(expected));
+
+        // validateComponents rejects every v ∉ {27, 28}. v = 31 (and v = 4, which
+        // normalizes to 31) were previously mis-mapped to recovery id 0 via a
+        // chain-tag -4 branch that is unreachable on this java-tron path; they
+        // must now return None. Likewise v = 29 (recovery id 2) is out of range.
+        assert_eq!(recover_eth_address(&sig_with_v(31), &hash), None);
+        assert_eq!(recover_eth_address(&sig_with_v(4), &hash), None);
+        assert_eq!(recover_eth_address(&sig_with_v(29), &hash), None);
+    }
+
+    #[test]
+    fn batch_validate_sign_rejects_chain_tagged_v() {
+        // The valid signature with its raw v swapped to 31 must NOT verify:
+        // java-tron's validateComponents accepts only v ∈ {27, 28}. Previously
+        // the raw 31 recovered with recovery id 0 and could flag a false match.
+        let hash: [u8; 32] = h(HASH).try_into().unwrap();
+        let good_addr: [u8; 20] = h(ETH_ADDR).try_into().unwrap();
+        let mut sig = valid_sig();
+        sig[64] = 31;
+        let input = abi_batch(&hash, &[(sig, good_addr)]);
+        let out = tron_batch_validate_sign_run(&input, 1_000_000).unwrap();
+        assert_eq!(out.bytes.as_ref(), &[0u8; 32], "v=31 must not verify (res[0]=0)");
+
+        // Sanity: the same signature with the correct v=28 does verify, so the
+        // rejection above is the v-gate, not a broken vector.
+        let ok = abi_batch(&hash, &[(valid_sig(), good_addr)]);
+        let mut expected = [0u8; 32];
+        expected[0] = 1;
+        assert_eq!(tron_batch_validate_sign_run(&ok, 1_000_000).unwrap().bytes.as_ref(), &expected);
     }
 
     #[test]
