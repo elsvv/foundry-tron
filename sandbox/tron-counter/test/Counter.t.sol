@@ -27,4 +27,12 @@ contract CounterTest {
             if iszero(eq(tload(0), 42)) { revert(0, 0) }
         }
     }
+
+    function testNonPayableGuardWithTvmOpcodes() public {
+        // Любой вызов non-payable функции tron-solc-контракта проходит через
+        // guard CALLVALUE -> CALLTOKENID (0xD3) -> CALLTOKENVALUE (0xD2).
+        // Если бы опкоды не исполнялись, setNumber ревертил бы OpcodeNotFound.
+        counter.setNumber(7);
+        require(counter.number() == 7, "guard blocked a plain call");
+    }
 }

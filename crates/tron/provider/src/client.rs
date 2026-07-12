@@ -1,14 +1,40 @@
 //! Typed async client for the Tron wallet HTTP API.
 
 use alloy_primitives::{Address, B256, hex};
+use alloy_signer::Signer;
 use foundry_tron_primitives::{
-    address::to_hex41,
+    address::{contract_address_from_txid, to_hex41},
     proto::{self, ContractType},
-    sign::{SignedTronTx, sign_raw},
+    sign::{SignedTronTx, sign_raw, sign_raw_with},
     tapos::{RefBlock, ref_block},
 };
 use prost::Message;
 use serde::de::DeserializeOwned;
+use std::time::Duration;
+
+/// Default `SmartContract.origin_energy_limit` (spec §4.7): the energy budget
+/// the deployer bankrolls for callers, in energy units.
+pub const DEFAULT_ORIGIN_ENERGY_LIMIT: i64 = 10_000_000;
+
+/// Default `SmartContract.consume_user_resource_percent` (spec §4.7): the share
+/// of execution energy paid by the caller rather than the contract (0-100).
+pub const DEFAULT_USER_FEE_PERCENT: i64 = 100;
+
+/// Transaction-level knobs shared by every write path: `fee_limit` is the burned
+/// cap in SUN (`TransactionRaw.fee_limit`, tag 18) and `expiration_ms` is the
+/// validity window past the reference-block timestamp. Defaults mirror the spec:
+/// 1000 TRX and 60s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxOptions {
+    pub fee_limit: i64,
+    pub expiration_ms: i64,
+}
+
+impl Default for TxOptions {
+    fn default() -> Self {
+        Self { fee_limit: 1_000_000_000, expiration_ms: 60_000 }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TronError {
@@ -89,6 +115,29 @@ impl TronProvider {
         parse_now_block(&v)
     }
 
+    /// Returns the chain id via the node's partial `eth_*` JSON-RPC endpoint at `<base>/jsonrpc`
+    /// (spec §4.5/§4.6: the read-side companion to the `/wallet/*` write API). Tron serves
+    /// `eth_chainId` there — not at the wallet base, which rejects JSON-RPC with `405` — so this
+    /// points at `/jsonrpc` explicitly and forwards the `TRON-PRO-API-KEY` header when set. Used to
+    /// resolve the `broadcast/<script>/<chain>/` directory (Nile = 3448148188).
+    pub async fn get_chain_id(&self) -> Result<u64, TronError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []
+        });
+        let mut req = self.client.post(format!("{}/jsonrpc", self.base_url)).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.header("TRON-PRO-API-KEY", key);
+        }
+        let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        let hex = v
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| TronError::Decode(format!("eth_chainId: no result in {v}")))?;
+        let hex = hex.strip_prefix("0x").unwrap_or(hex);
+        u64::from_str_radix(hex, 16)
+            .map_err(|e| TronError::Decode(format!("eth_chainId: invalid hex {hex}: {e}")))
+    }
+
     pub async fn tapos(&self) -> Result<(RefBlock, i64), TronError> {
         let nb = self.get_now_block().await?;
         Ok((ref_block(nb.number, &nb.block_id), nb.timestamp_ms))
@@ -141,24 +190,35 @@ impl TronProvider {
     /// Polls `get_transaction_info` until the transaction lands in a block, up to
     /// `max_attempts` times spaced by `interval`. The bound is mandatory: an
     /// unbounded poll (the TronBox lesson) can hang forever on a dropped tx.
+    ///
+    /// Transient HTTP hiccups (dropped connections, incomplete messages, request
+    /// timeouts — routine on public TronGrid) do not abort the wait; they are
+    /// treated like a still-pending poll and retried within the same budget. Only
+    /// node-level (`Api`) or decode errors propagate immediately.
     pub async fn wait_for_confirmation(
         &self,
         txid: B256,
         max_attempts: u32,
-        interval: std::time::Duration,
+        interval: Duration,
     ) -> Result<TxInfo, TronError> {
+        let mut last_http_err = None;
         for _ in 0..max_attempts {
-            if let Some(info) = self.get_transaction_info(txid).await? {
-                return Ok(info);
+            match self.get_transaction_info(txid).await {
+                Ok(Some(info)) => return Ok(info),
+                Ok(None) => {}
+                Err(e @ TronError::Http(_)) => last_http_err = Some(e),
+                Err(e) => return Err(e),
             }
             tokio::time::sleep(interval).await;
         }
-        Err(TronError::Timeout(format!("tx {txid} not confirmed after {max_attempts} attempts")))
+        Err(last_http_err.unwrap_or_else(|| {
+            TronError::Timeout(format!("tx {txid} not confirmed after {max_attempts} attempts"))
+        }))
     }
 
     /// Sends `amount_sun` SUN from `signer`'s account to `to` and waits for
     /// confirmation. Runs the full cycle: fetch TAPOS from a fresh block, build
-    /// and sign a `TransferContract` (expiration = block timestamp + 60s),
+    /// and sign a `TransferContract` (default expiration = block timestamp + 60s),
     /// broadcast it, then poll for confirmation (20 attempts, 3s apart).
     pub async fn send_transfer(
         &self,
@@ -167,51 +227,195 @@ impl TronProvider {
         amount_sun: i64,
     ) -> Result<(B256, TxInfo), TronError> {
         let (rb, now_ms) = self.tapos().await?;
-        let raw = build_transfer_raw(signer.address(), to, amount_sun, rb, now_ms);
+        let raw =
+            build_transfer_raw(signer.address(), to, amount_sun, rb, now_ms, &TxOptions::default());
         let signed = sign_raw(raw, signer).map_err(|e| TronError::Decode(e.to_string()))?;
         self.broadcast(&signed).await?;
-        let info =
-            self.wait_for_confirmation(signed.txid, 20, std::time::Duration::from_secs(3)).await?;
+        let info = self.wait_for_confirmation(signed.txid, 20, Duration::from_secs(3)).await?;
+        Ok((signed.txid, info))
+    }
+
+    /// Deploys `bytecode_with_args` (creation bytecode ++ constructor args) from
+    /// `signer`'s account and waits for confirmation. Generic over any
+    /// [`alloy_signer::Signer`] so every wallet backend (keystore, ledger, aws…)
+    /// works through the async signing path.
+    ///
+    /// The deploy address is derived locally from the txid via the java-tron
+    /// `WalletUtil` formula ([`contract_address_from_txid`]) — Tron has no EVM
+    /// CREATE nonce scheme — and is then cross-checked against the
+    /// `contract_address` the node reports once the transaction is mined; a
+    /// mismatch is a hard error. Returns `(txid, deploy_address, info)`.
+    pub async fn deploy_contract<S: Signer + ?Sized>(
+        &self,
+        signer: &S,
+        bytecode_with_args: Vec<u8>,
+        name: &str,
+        opts: &TxOptions,
+        poll: (u32, Duration),
+    ) -> Result<(B256, Address, TxInfo), TronError> {
+        let owner = signer.address();
+        let (rb, now_ms) = self.tapos().await?;
+        let raw = build_create_raw(
+            owner,
+            bytecode_with_args,
+            name,
+            0,
+            DEFAULT_ORIGIN_ENERGY_LIMIT,
+            DEFAULT_USER_FEE_PERCENT,
+            rb,
+            now_ms,
+            opts,
+        );
+        let signed =
+            sign_raw_with(raw, signer).await.map_err(|e| TronError::Decode(e.to_string()))?;
+        let local_addr = contract_address_from_txid(signed.txid, owner);
+        self.broadcast(&signed).await?;
+        let info = self.wait_for_confirmation(signed.txid, poll.0, poll.1).await?;
+        match info.contract_address {
+            Some(node_addr) if node_addr == local_addr => Ok((signed.txid, local_addr, info)),
+            Some(node_addr) => Err(TronError::Decode(format!(
+                "deploy address mismatch: local {} != node {}",
+                to_hex41(local_addr),
+                to_hex41(node_addr),
+            ))),
+            None => Err(TronError::Decode(format!(
+                "node reported no contract_address for deploy {} (local {}); tx may have failed",
+                signed.txid,
+                to_hex41(local_addr),
+            ))),
+        }
+    }
+
+    /// Calls `contract` from `signer`'s account with the ABI-encoded `data`
+    /// (selector + args; ABI encoding is the caller's job) and `call_value` SUN,
+    /// then waits for confirmation. Generic over any [`alloy_signer::Signer`].
+    pub async fn trigger_contract<S: Signer + ?Sized>(
+        &self,
+        signer: &S,
+        contract: Address,
+        call_value: i64,
+        data: Vec<u8>,
+        opts: &TxOptions,
+        poll: (u32, Duration),
+    ) -> Result<(B256, TxInfo), TronError> {
+        let (rb, now_ms) = self.tapos().await?;
+        let raw = build_trigger_raw(signer.address(), contract, call_value, data, rb, now_ms, opts);
+        let signed =
+            sign_raw_with(raw, signer).await.map_err(|e| TronError::Decode(e.to_string()))?;
+        self.broadcast(&signed).await?;
+        let info = self.wait_for_confirmation(signed.txid, poll.0, poll.1).await?;
         Ok((signed.txid, info))
     }
 }
 
+/// Prefixes a 20-byte address with the 0x41 Tron byte, yielding the 21-byte
+/// form protobuf contracts carry.
+fn addr21(a: Address) -> Vec<u8> {
+    let mut v = Vec::with_capacity(21);
+    v.push(0x41);
+    v.extend_from_slice(a.as_slice());
+    v
+}
+
+/// Wraps an already-encoded contract `value` of type `ct` in a `TransactionRaw`
+/// with the given TAPOS reference block, timestamp and [`TxOptions`]. The single
+/// place `fee_limit` and `expiration` are stamped, so every builder agrees.
+fn wrap_raw(
+    ct: ContractType,
+    value: Vec<u8>,
+    rb: RefBlock,
+    now_ms: i64,
+    opts: &TxOptions,
+) -> proto::TransactionRaw {
+    proto::TransactionRaw {
+        ref_block_bytes: rb.bytes,
+        ref_block_hash: rb.hash,
+        expiration: now_ms + opts.expiration_ms,
+        timestamp: now_ms,
+        fee_limit: opts.fee_limit,
+        contract: vec![proto::Contract {
+            r#type: ct as i32,
+            parameter: Some(prost_types::Any { type_url: proto::type_url(ct).to_string(), value }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
 /// Builds the `TransactionRaw` for a native TRX transfer. Deterministic and
-/// unit-testable offline: addresses are prefixed with the 0x41 Tron byte and
-/// the expiration window is fixed at 60s past `now_ms`.
-pub(crate) fn build_transfer_raw(
+/// unit-testable offline: addresses are prefixed with the 0x41 Tron byte and the
+/// expiration window comes from `opts`.
+pub fn build_transfer_raw(
     owner: Address,
     to: Address,
     amount_sun: i64,
     rb: RefBlock,
     now_ms: i64,
+    opts: &TxOptions,
 ) -> proto::TransactionRaw {
-    let addr21 = |a: Address| {
-        let mut v = Vec::with_capacity(21);
-        v.push(0x41);
-        v.extend_from_slice(a.as_slice());
-        v
-    };
     let transfer = proto::TransferContract {
         owner_address: addr21(owner),
         to_address: addr21(to),
         amount: amount_sun,
     };
-    proto::TransactionRaw {
-        ref_block_bytes: rb.bytes,
-        ref_block_hash: rb.hash,
-        expiration: now_ms + 60_000,
-        timestamp: now_ms,
-        contract: vec![proto::Contract {
-            r#type: ContractType::TransferContract as i32,
-            parameter: Some(prost_types::Any {
-                type_url: proto::type_url(ContractType::TransferContract).to_string(),
-                value: transfer.encode_to_vec(),
-            }),
-            ..Default::default()
-        }],
-        ..Default::default()
-    }
+    wrap_raw(ContractType::TransferContract, transfer.encode_to_vec(), rb, now_ms, opts)
+}
+
+/// Builds the `TransactionRaw` for a `TriggerSmartContract` call. `data` is the
+/// ABI-encoded selector + arguments; `call_value` is attached TRX in SUN.
+pub fn build_trigger_raw(
+    owner: Address,
+    contract: Address,
+    call_value: i64,
+    data: Vec<u8>,
+    rb: RefBlock,
+    now_ms: i64,
+    opts: &TxOptions,
+) -> proto::TransactionRaw {
+    let trigger = proto::TriggerSmartContract {
+        owner_address: addr21(owner),
+        contract_address: addr21(contract),
+        call_value,
+        data,
+        call_token_value: 0,
+        token_id: 0,
+    };
+    wrap_raw(ContractType::TriggerSmartContract, trigger.encode_to_vec(), rb, now_ms, opts)
+}
+
+/// Builds the `TransactionRaw` for a `CreateSmartContract` deploy.
+/// `bytecode_with_args` is the creation bytecode followed by the ABI-encoded
+/// constructor arguments; `origin_energy_limit` and `consume_user_resource_percent`
+/// are `SmartContract` fields (tags 8 and 6), distinct from the raw's `fee_limit`.
+/// The `abi` field is omitted (deployed as empty, matching tronweb `abi: []`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_create_raw(
+    owner: Address,
+    bytecode_with_args: Vec<u8>,
+    name: &str,
+    call_value: i64,
+    origin_energy_limit: i64,
+    consume_user_resource_percent: i64,
+    rb: RefBlock,
+    now_ms: i64,
+    opts: &TxOptions,
+) -> proto::TransactionRaw {
+    let owner21 = addr21(owner);
+    let create = proto::CreateSmartContract {
+        owner_address: owner21.clone(),
+        new_contract: Some(proto::SmartContract {
+            origin_address: owner21,
+            contract_address: Vec::new(),
+            bytecode: bytecode_with_args,
+            call_value,
+            consume_user_resource_percent,
+            name: name.to_string(),
+            origin_energy_limit,
+        }),
+        call_token_value: 0,
+        token_id: 0,
+    };
+    wrap_raw(ContractType::CreateSmartContract, create.encode_to_vec(), rb, now_ms, opts)
 }
 
 /// Parses a raw `/wallet/getnowblock` JSON response.
@@ -338,6 +542,17 @@ mod tests {
         assert_ne!(nb.block_id, [0u8; 32]);
     }
 
+    #[tokio::test]
+    async fn live_get_chain_id_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        let p = TronProvider::new("https://nile.trongrid.io").unwrap();
+        // Nile chain id, verified against `eth_chainId` (0xcd8690dc).
+        assert_eq!(p.get_chain_id().await.unwrap(), 3_448_148_188);
+    }
+
     #[test]
     fn parses_account_balance_fixture() {
         let v: serde_json::Value =
@@ -457,7 +672,8 @@ mod tests {
         let to =
             foundry_tron_primitives::address::parse("T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb").unwrap();
         let rb = RefBlock { bytes: vec![0x3c, 0x6f], hash: vec![1, 2, 3, 4, 5, 6, 7, 8] };
-        let raw = build_transfer_raw(owner, to, 1_000_000, rb, 1_783_775_034_896);
+        let raw =
+            build_transfer_raw(owner, to, 1_000_000, rb, 1_783_775_034_896, &TxOptions::default());
 
         assert_eq!(raw.ref_block_bytes, vec![0x3c, 0x6f]);
         assert_eq!(raw.expiration, 1_783_775_034_896 + 60_000);
@@ -475,6 +691,123 @@ mod tests {
         assert_eq!(tc.owner_address[1..], owner.as_slice()[..]);
         assert_eq!(tc.to_address[1..], to.as_slice()[..]);
         assert_eq!(tc.amount, 1_000_000);
+    }
+
+    #[test]
+    fn builds_trigger_raw_deterministically() {
+        let owner =
+            foundry_tron_primitives::address::parse("TX7izXWcmofRYonzdcThrS78jifMtVWCuf").unwrap();
+        let contract =
+            foundry_tron_primitives::address::parse("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj").unwrap();
+        let data = hex::decode("18160ddd").unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 30_000 };
+        let rb = RefBlock { bytes: vec![0x3c, 0x6f], hash: vec![1, 2, 3, 4, 5, 6, 7, 8] };
+        let raw = build_trigger_raw(owner, contract, 5, data.clone(), rb, 1_783_775_034_896, &opts);
+
+        assert_eq!(raw.expiration, 1_783_775_034_896 + 30_000);
+        assert_eq!(raw.fee_limit, 400_000_000);
+        assert_eq!(raw.contract[0].r#type, ContractType::TriggerSmartContract as i32);
+        let tc = <proto::TriggerSmartContract as Message>::decode(
+            raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(tc.owner_address[0], 0x41);
+        assert_eq!(tc.owner_address[1..], owner.as_slice()[..]);
+        assert_eq!(tc.contract_address[1..], contract.as_slice()[..]);
+        assert_eq!(tc.call_value, 5);
+        assert_eq!(tc.data, data);
+    }
+
+    /// Rebuilds the real Nile Counter deploy from its own inputs and asserts the
+    /// output is byte-identical to what the node stored, and that the java-tron
+    /// deploy-address formula on the rebuilt txid reproduces the node's
+    /// `contract_address`. Proves `build_create_raw` emits protobuf java-tron
+    /// accepts and mines. The fixture lives in the sibling primitives crate.
+    #[test]
+    fn build_create_raw_matches_real_nile_deploy() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/testdata/nile_create_tx.json"))
+                .unwrap();
+        let bytes = hex::decode(json["raw_data_hex"].as_str().unwrap()).unwrap();
+        let raw = proto::TransactionRaw::decode(bytes.as_slice()).unwrap();
+        let owner =
+            foundry_tron_primitives::address::parse(json["owner_address"].as_str().unwrap())
+                .unwrap();
+        let create = <proto::CreateSmartContract as Message>::decode(
+            raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        let sc = create.new_contract.as_ref().unwrap();
+        let rb = RefBlock { bytes: raw.ref_block_bytes.clone(), hash: raw.ref_block_hash.clone() };
+        let opts =
+            TxOptions { fee_limit: raw.fee_limit, expiration_ms: raw.expiration - raw.timestamp };
+        let rebuilt = build_create_raw(
+            owner,
+            sc.bytecode.clone(),
+            &sc.name,
+            sc.call_value,
+            sc.origin_energy_limit,
+            sc.consume_user_resource_percent,
+            rb,
+            raw.timestamp,
+            &opts,
+        );
+        assert_eq!(rebuilt.encode_to_vec(), bytes, "build_create_raw must match the real deploy");
+
+        let txid = proto::txid(&rebuilt);
+        assert_eq!(hex::encode(txid), json["txID"].as_str().unwrap());
+        assert_eq!(
+            to_hex41(contract_address_from_txid(txid, owner)),
+            json["contract_address"].as_str().unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn live_deploy_counter_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live deploy");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        let p = TronProvider::new("https://nile.trongrid.io").unwrap();
+        let creation = hex::decode(
+            include_str!("../../../evm/core/testdata/tron_counter_creation.hex").trim(),
+        )
+        .unwrap();
+        // 400 TRX cap per the plan's live-test budget.
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+
+        let (txid, addr, info) =
+            p.deploy_contract(&signer, creation, "Counter", &opts, poll).await.unwrap();
+        assert!(info.success, "deploy must succeed");
+        // deploy_contract already cross-checks, but assert it here too.
+        assert_eq!(info.contract_address, Some(addr));
+        eprintln!(
+            "live deploy tx {} -> {} ({})",
+            hex::encode(txid),
+            foundry_tron_primitives::to_base58(addr),
+            to_hex41(addr),
+        );
+
+        // setNumber(7).
+        let mut set = hex::decode("3fb5c1cb").unwrap();
+        set.extend_from_slice(&alloy_primitives::U256::from(7u64).to_be_bytes::<32>());
+        let (_txid2, info2) = p.trigger_contract(&signer, addr, 0, set, &opts, poll).await.unwrap();
+        assert!(info2.success, "setNumber must succeed");
+
+        // number() == 7 via a constant call.
+        let cr = p
+            .trigger_constant(signer.address(), addr, &hex::decode("8381f58a").unwrap())
+            .await
+            .unwrap();
+        assert!(cr.success);
+        assert_eq!(
+            alloy_primitives::U256::from_be_slice(&cr.result),
+            alloy_primitives::U256::from(7u64),
+        );
     }
 
     #[tokio::test]

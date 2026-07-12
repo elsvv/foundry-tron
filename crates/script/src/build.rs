@@ -301,6 +301,18 @@ impl<FEN: FoundryEvmNetwork> CompiledState<FEN> {
     pub async fn resume(self) -> Result<BundledState<FEN>> {
         let chain = if self.args.multi {
             None
+        } else if self.script_config.evm_opts.networks.is_tron() {
+            // Tron has no eth fork provider: `resolved_evm_opts` intentionally leaves `fork_url`
+            // unset (the endpoint speaks `/wallet/*`, not full `eth_*`), so the generic fork-url
+            // path below cannot resolve the chain id. Read it from the node's `/jsonrpc` endpoint
+            // instead, the same source the initial broadcast used to name `broadcast/<script>/
+            // <chain>/`.
+            let rpc = self
+                .script_config
+                .config
+                .get_rpc_url()
+                .ok_or_eyre("Tron --resume requires an rpc endpoint (--rpc-url)")??;
+            Some(crate::tron::tron_chain_id(&rpc).await?)
         } else {
             let fork_url = self.script_config.evm_opts.fork_url.clone().ok_or_eyre("Missing --fork-url field, if you were trying to broadcast a multi-chain sequence, please use --multi flag")?;
             let provider = Arc::new(ProviderBuilder::<AnyNetwork>::new(&fork_url).build()?);

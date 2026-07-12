@@ -3,7 +3,7 @@
 //! Internally addresses are 20-byte [`Address`]; the 0x41 prefix and
 //! base58check exist only at I/O boundaries.
 
-use alloy_primitives::{Address, hex};
+use alloy_primitives::{Address, B256, hex, keccak256};
 use sha2::{Digest, Sha256};
 
 pub const TRON_ADDRESS_PREFIX: u8 = 0x41;
@@ -38,6 +38,21 @@ pub fn to_base58(addr: Address) -> String {
 
 pub fn to_hex41(addr: Address) -> String {
     format!("41{}", hex::encode(addr.as_slice()))
+}
+
+/// Derives the address java-tron assigns to a contract created by a
+/// `CreateSmartContract` transaction: `keccak256(txid ‖ owner21)[12..]`, where
+/// `txid` = sha256(raw_data) and `owner21` is the 21-byte 0x41-prefixed owner.
+///
+/// Mirrors java-tron `WalletUtil.generateContractAddress` (chainbase). The EVM
+/// CREATE scheme (rlp(sender, nonce)) does NOT apply on Tron, so the deploy
+/// address is only known once the transaction is built and its txid computed.
+pub fn contract_address_from_txid(txid: B256, owner: Address) -> Address {
+    let mut combined = Vec::with_capacity(32 + 21);
+    combined.extend_from_slice(txid.as_slice());
+    combined.push(TRON_ADDRESS_PREFIX);
+    combined.extend_from_slice(owner.as_slice());
+    Address::from_slice(&keccak256(combined)[12..])
 }
 
 pub fn parse(s: &str) -> Result<Address, AddressError> {
@@ -110,6 +125,26 @@ mod tests {
         // последний символ изменён
         let bad = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6u";
         assert_eq!(parse(bad).unwrap_err(), AddressError::InvalidChecksum);
+    }
+
+    #[test]
+    fn contract_address_matches_real_nile_deploys() {
+        // Fixture: the tron-solc Counter deploy on Nile (empty abi).
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/nile_create_tx.json")).unwrap();
+        let txid = B256::from_slice(&hex::decode(json["txID"].as_str().unwrap()).unwrap());
+        let owner = parse(json["owner_address"].as_str().unwrap()).unwrap();
+        let expected = parse(json["contract_address"].as_str().unwrap()).unwrap();
+        assert_eq!(contract_address_from_txid(txid, owner), expected);
+
+        // Independent second vector: the WTRX deploy on Nile
+        // (tx 1614aa80…, contract 41fb3b31…). Guards against a formula tuned to
+        // the fixture alone; both come from java-tron `gettransactioninfobyid`.
+        let wtrx_txid: B256 =
+            "1614aa80e1d0c6f73a12b032f00dffb183ea65371361835604b1b6fb2485d465".parse().unwrap();
+        let wtrx_owner = address!("4f778d7cbfa90278c8225403a1485ec09945d418");
+        let wtrx_contract = address!("fb3b3134f13ccd2c81f4012e53024e8135d58fee");
+        assert_eq!(contract_address_from_txid(wtrx_txid, wtrx_owner), wtrx_contract);
     }
 
     #[test]

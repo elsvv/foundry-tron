@@ -134,6 +134,9 @@ use soldeer::{SoldeerConfig, SoldeerDependencyConfig};
 mod vyper;
 pub use vyper::VyperConfig;
 
+mod tron;
+pub use tron::TronConfig;
+
 mod bind_json;
 use bind_json::BindJsonConfig;
 
@@ -587,6 +590,10 @@ pub struct Config {
     #[serde(flatten)]
     pub networks: NetworkConfigs,
 
+    /// Configuration for the Tron network (`[tron]` section).
+    #[serde(default)]
+    pub tron: TronConfig,
+
     /// Timeout for transactions in seconds.
     pub transaction_timeout: u64,
 
@@ -751,6 +758,7 @@ impl Config {
         "soldeer",
         "vyper",
         "bind_json",
+        "tron",
     ];
 
     pub(crate) fn is_standalone_section<T: ?Sized + PartialEq<str>>(section: &T) -> bool {
@@ -2868,6 +2876,7 @@ impl Default for Config {
             warnings: vec![],
             extra_args: vec![],
             networks: Default::default(),
+            tron: TronConfig::default(),
             transaction_timeout: 120,
             additional_compiler_profiles: Default::default(),
             compilation_restrictions: Default::default(),
@@ -5378,6 +5387,66 @@ mod tests {
             let config = Config::load().unwrap();
             assert!(config.networks.is_tempo());
             assert_eq!(config.evm_spec_id::<TempoHardfork>(), latest_active_tempo_hardfork());
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn tron_config_defaults() {
+        // Per spec §4.7 the `[tron]` section defaults are these values.
+        let tron = crate::TronConfig::default();
+        assert_eq!(tron.fee_limit, 1_000_000_000);
+        assert_eq!(tron.origin_energy_limit, 10_000_000);
+        assert_eq!(tron.user_fee_percentage, 100);
+        assert_eq!(tron.expiration, 60);
+        // The section is present with defaults on a fresh `Config`.
+        assert_eq!(Config::default().tron, tron);
+    }
+
+    #[test]
+    fn tron_config_section_parses() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "foundry.toml",
+                r#"
+                [profile.default]
+                network = "tron"
+
+                [tron]
+                fee_limit = 5
+                expiration = 30
+            "#,
+            )?;
+
+            let config = Config::load().unwrap();
+            assert!(config.networks.is_tron());
+            // Explicitly provided fields override the defaults.
+            assert_eq!(config.tron.fee_limit, 5);
+            assert_eq!(config.tron.expiration, 30);
+            // Omitted fields fall back to their per-field serde defaults.
+            assert_eq!(config.tron.origin_energy_limit, 10_000_000);
+            assert_eq!(config.tron.user_fee_percentage, 100);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn tron_config_round_trips() {
+        figment::Jail::expect_with(|jail| {
+            let mut config = Config::default();
+            config.tron.fee_limit = 400_000_000;
+            config.tron.user_fee_percentage = 50;
+
+            let s = config.to_string_pretty().unwrap();
+            // The `[tron]` section is lifted out as a standalone top-level table.
+            assert!(s.contains("[tron]"), "serialized config is missing the [tron] section:\n{s}");
+
+            jail.create_file("foundry.toml", &s)?;
+            let mut reloaded = Config::load().unwrap();
+            clear_warning(&mut reloaded);
+            assert_eq!(reloaded.tron, config.tron);
 
             Ok(())
         });

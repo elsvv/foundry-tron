@@ -2899,6 +2899,8 @@ dependencies = [
  "foundry-evm-networks",
  "foundry-primitives",
  "foundry-test-utils",
+ "foundry-tron-primitives",
+ "foundry-tron-provider",
  "foundry-wallets",
  "futures",
  "itertools 0.15.0",
@@ -4989,6 +4991,8 @@ dependencies = [
  "foundry-evm-symbolic",
  "foundry-linking",
  "foundry-test-utils",
+ "foundry-tron-primitives",
+ "foundry-tron-provider",
  "foundry-wallets",
  "globset",
  "indicatif",
@@ -5105,6 +5109,8 @@ dependencies = [
  "foundry-evm",
  "foundry-evm-networks",
  "foundry-linking",
+ "foundry-tron-primitives",
+ "foundry-tron-provider",
  "foundry-wallets",
  "futures",
  "indicatif",
@@ -5982,6 +5988,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "tokio",
  "ureq",
 ]
 
@@ -5990,6 +5997,7 @@ name = "foundry-tron-provider"
 version = "1.7.2"
 dependencies = [
  "alloy-primitives",
+ "alloy-signer",
  "alloy-signer-local",
  "foundry-tron-primitives",
  "prost 0.13.5",

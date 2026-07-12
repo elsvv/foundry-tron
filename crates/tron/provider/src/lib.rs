@@ -4,4 +4,7 @@
 
 mod client;
 
-pub use client::{ConstantResult, NowBlock, TronError, TronProvider, TxInfo};
+pub use client::{
+    ConstantResult, DEFAULT_ORIGIN_ENERGY_LIMIT, DEFAULT_USER_FEE_PERCENT, NowBlock, TronError,
+    TronProvider, TxInfo, TxOptions, build_create_raw, build_transfer_raw, build_trigger_raw,
+};

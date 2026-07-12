@@ -4,14 +4,14 @@ use url::Url;
 use alloy_consensus::{SignableTransaction, Signed};
 use alloy_ens::NameOrAddress;
 use alloy_network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, hex};
 use alloy_provider::{Provider, ProviderBuilder as AlloyProviderBuilder};
 use alloy_rpc_client::BuiltInConnectionString;
 use alloy_signer::{Signature, Signer};
 use clap::Parser;
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr, eyre};
 use foundry_cli::{
-    opts::TransactionOpts,
+    opts::{TransactionOpts, TronOpts},
     utils::{LoadConfig, get_chain, maybe_print_resolved_lane, resolve_lane},
 };
 use foundry_common::{
@@ -20,7 +20,9 @@ use foundry_common::{
     provider::ProviderBuilder,
     tempo::{TEMPO_BROWSER_GAS_BUFFER, maybe_print_fee_token, resolve_and_set_fee_token},
 };
-use foundry_config::Chain;
+use foundry_config::{Chain, Config};
+use foundry_tron_primitives::{address::contract_address_from_txid, sign::sign_raw_with};
+use foundry_tron_provider::{build_create_raw, build_transfer_raw, build_trigger_raw};
 use foundry_wallets::{TempoAccessKeyConfig, WalletSigner};
 use tempo_alloy::{
     TempoNetwork,
@@ -40,7 +42,7 @@ pub struct SendTxArgs {
     /// The destination of the transaction.
     ///
     /// If not provided, you must use cast send --create.
-    #[arg(value_parser = NameOrAddress::from_str)]
+    #[arg(value_parser = crate::tron::parse_name_or_tron_address)]
     to: Option<NameOrAddress>,
 
     /// The signature of the function to call.
@@ -83,6 +85,10 @@ pub struct SendTxArgs {
         help_heading = "Transaction options"
     )]
     path: Option<PathBuf>,
+
+    /// Tron transaction options (`--tron.fee-limit`, `--tron.expiration`).
+    #[command(flatten)]
+    tron: TronOpts,
 }
 
 #[derive(Debug, Parser)]
@@ -104,6 +110,14 @@ pub enum SendTxSubcommands {
 
 impl SendTxArgs {
     pub async fn run(self) -> Result<()> {
+        // Tron is config-file driven (`network = "tron"`); it diverges before any alloy
+        // network dispatch because it broadcasts protobuf through `/wallet/*`, not
+        // `eth_sendRawTransaction`.
+        let config = self.send_tx.eth.load_config()?;
+        if config.networks.is_tron() {
+            return self.run_tron(config).await;
+        }
+
         if self.tx.tempo.session_id()?.is_some() {
             return self.run_generic::<TempoNetwork>(None, None).await;
         }
@@ -118,6 +132,106 @@ impl SendTxArgs {
         }
     }
 
+    /// Sends a transaction on Tron. The protobuf is assembled locally, signed over
+    /// `sha256(raw_data)` with the resolved [`WalletSigner`] (async `sign_hash`, so
+    /// every wallet backend works) and broadcast through the `/wallet/*` HTTP API.
+    ///
+    /// Classifies into deploy (`--create`), contract call (calldata present) or
+    /// native TRX transfer (value only). `--value` is denominated in SUN. `--async`
+    /// broadcasts without waiting for confirmation. Flags with no Tron equivalent
+    /// yet (`--unlocked`, `--browser`, EIP-7702/blob) are rejected.
+    async fn run_tron(self, config: Config) -> Result<()> {
+        if self.unlocked {
+            eyre::bail!("--unlocked is not supported on tron yet");
+        }
+        if self.send_tx.browser.browser {
+            eyre::bail!("--browser is not supported on tron yet");
+        }
+        if !self.tx.auth.is_empty() {
+            eyre::bail!("EIP-7702 authorizations are not supported on tron");
+        }
+        if self.path.is_some() || self.tx.blob {
+            eyre::bail!("blob transactions are not supported on tron");
+        }
+
+        let signer = self.send_tx.eth.wallet.signer().await?;
+        let from = signer.address();
+        tx::validate_from_address(self.send_tx.eth.wallet.from, from)?;
+
+        let provider = crate::tron::tron_provider(&config)?;
+        let tron_cfg = self.tron.apply(&config.tron);
+        let opts = crate::tron::tx_options(&tron_cfg);
+        let (attempts, interval) = crate::tron::poll_params(&tron_cfg);
+        let wait = !self.send_tx.cast_async;
+
+        // On Tron `--value` is denominated in SUN.
+        let value_sun = crate::tron::value_sun(self.tx.value)?;
+
+        // A single transaction: one fresh TAPOS reference block.
+        let (rb, now_ms) = provider.tapos().await?;
+
+        // `--create`: deploy creation bytecode + encoded constructor args. The deploy
+        // address is derived locally from the txID (java-tron formula) and cross-checked
+        // against the node once mined.
+        if let Some(SendTxSubcommands::Create { code, sig: ctor_sig, args: ctor_args }) =
+            &self.command
+        {
+            let code = code.trim();
+            let mut bytecode = hex::decode(code.strip_prefix("0x").unwrap_or(code))
+                .wrap_err("invalid --create bytecode hex")?;
+            let mut ctor = crate::tron::encode_constructor_args(ctor_sig.as_deref(), ctor_args)?;
+            bytecode.append(&mut ctor);
+            let raw = build_create_raw(
+                from,
+                bytecode,
+                "",
+                value_sun,
+                tron_cfg.origin_energy_limit,
+                tron_cfg.user_fee_percentage,
+                rb,
+                now_ms,
+                &opts,
+            );
+            let signed = sign_raw_with(raw, &signer).await?;
+            let addr = contract_address_from_txid(signed.txid, from);
+            sh_status!("Deploying contract on tron (txID {})", hex::encode(signed.txid))?;
+            provider.broadcast(&signed).await?;
+            if wait {
+                let info = provider.wait_for_confirmation(signed.txid, attempts, interval).await?;
+                crate::tron::verify_deploy_address(addr, &info)?;
+                crate::tron::print_tron_deploy(signed.txid, addr, &info)?;
+            } else {
+                crate::tron::print_tron_deploy_async(signed.txid, addr)?;
+            }
+            return Ok(());
+        }
+
+        // A recipient is required for calls and transfers.
+        let to = self.to.as_ref().ok_or_else(|| {
+            eyre!("a recipient address is required; use `cast send --create <code>` to deploy")
+        })?;
+        let dest = crate::tron::parse_tron_address(&crate::tron::name_or_address_str(to))?;
+
+        let sig = self.data.as_deref().or(self.sig.as_deref());
+        let (data, _func) = crate::tron::encode_calldata(sig, &self.args)?;
+
+        // Calldata present -> contract call; otherwise a native TRX transfer.
+        let raw = if data.is_empty() {
+            build_transfer_raw(from, dest, value_sun, rb, now_ms, &opts)
+        } else {
+            build_trigger_raw(from, dest, value_sun, data, rb, now_ms, &opts)
+        };
+        let signed = sign_raw_with(raw, &signer).await?;
+        provider.broadcast(&signed).await?;
+        if wait {
+            let info = provider.wait_for_confirmation(signed.txid, attempts, interval).await?;
+            crate::tron::print_tron_tx(signed.txid, &info)?;
+        } else {
+            sh_println!("{}", hex::encode(signed.txid))?;
+        }
+        Ok(())
+    }
+
     pub async fn run_generic<N: Network>(
         self,
         mut pre_resolved_signer: Option<WalletSigner>,
@@ -129,8 +243,19 @@ impl SendTxArgs {
         N::TransactionRequest: FoundryTransactionBuilder<N>,
         N::ReceiptResponse: UIfmt + UIfmtReceiptExt,
     {
-        let Self { to, mut sig, mut args, data, send_tx, mut tx, command, unlocked, force, path } =
-            self;
+        let Self {
+            to,
+            mut sig,
+            mut args,
+            data,
+            send_tx,
+            mut tx,
+            command,
+            unlocked,
+            force,
+            path,
+            tron: _,
+        } = self;
 
         let has_session = tx.tempo.session_id()?.is_some();
         if has_session && unlocked {

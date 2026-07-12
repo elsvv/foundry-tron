@@ -36,11 +36,13 @@ pub mod eth;
 #[cfg(feature = "optimism")]
 pub mod op;
 pub mod tempo;
+pub mod tron;
 
 pub use eth::*;
 #[cfg(feature = "optimism")]
 pub use op::*;
 pub use tempo::*;
+pub use tron::*;
 
 /// Foundry's supertrait associating [Network] with [FoundryEvmFactory]
 pub trait FoundryEvmNetwork: Copy + Debug + Default + 'static {
@@ -67,13 +69,13 @@ impl FoundryEvmNetwork for EthEvmNetwork {
     type EvmFactory = EthEvmFactory;
 }
 
-/// Tron network marker. Naive stage: executes as vanilla EVM (Cancun); chain id and compiler
-/// come from config. TVM specifics land in tron-revm later.
+/// Tron network marker. Executes on [`TronEvmFactory`]: vanilla revm plus the TVM opcodes
+/// 0xD0-0xD4 that tron-solc emits (TRC-10 guard). Chain id and compiler come from config.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TronEvmNetwork;
 impl FoundryEvmNetwork for TronEvmNetwork {
     type Network = Ethereum;
-    type EvmFactory = EthEvmFactory;
+    type EvmFactory = TronEvmFactory;
 }
 
 #[derive(Clone, Copy, Debug, Default)]

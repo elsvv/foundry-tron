@@ -171,6 +171,21 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let out = SimpleCast::to_wei(&value, &unit)?;
             print_scalar(out)?;
         }
+        CastSubcommand::ToSun { value } => {
+            let value = stdin::unwrap_line(value)?;
+            let out = SimpleCast::to_sun(&value)?;
+            print_scalar(out)?;
+        }
+        CastSubcommand::FromSun { value } => {
+            let value = stdin::unwrap_line(value)?;
+            let out = SimpleCast::from_sun(&value)?;
+            print_scalar(out)?;
+        }
+        CastSubcommand::TronAddress { address } => {
+            let value = stdin::unwrap_line(address)?;
+            let out = crate::tron::format_tron_address(&value)?;
+            print_scalar(out)?;
+        }
         CastSubcommand::FromRlp { value, as_int } => {
             let value = stdin::unwrap_line(value)?;
             let out = SimpleCast::from_rlp(value, as_int)?;
@@ -371,6 +386,29 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         }
         CastSubcommand::Balance { block, who, ether, rpc, erc20 } => {
             let config = rpc.load_config()?;
+
+            // Tron balances come from `/wallet/getaccount` (SUN), not `eth_getBalance`.
+            if config.networks.is_tron() {
+                if erc20.is_some() {
+                    eyre::bail!("--erc20 balance is not supported on tron yet");
+                }
+                if block.is_some() {
+                    eyre::bail!("historical --block balances are not supported on tron yet");
+                }
+                let addr =
+                    crate::tron::parse_tron_address(&crate::tron::name_or_address_str(&who))?;
+                let provider = crate::tron::tron_provider(&config)?;
+                let sun = provider.get_balance(addr).await?;
+                // `--ether` prints TRX (6 decimals), not an 18-decimal from_wei result.
+                let out = if ether {
+                    foundry_tron_primitives::units::format_sun_as_trx(sun)
+                } else {
+                    sun.to_string()
+                };
+                print_scalar(out)?;
+                return Ok(());
+            }
+
             let provider = utils::get_provider(&config)?;
             let account_addr = who.resolve(&provider).await?;
 

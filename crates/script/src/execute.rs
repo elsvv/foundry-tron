@@ -296,10 +296,27 @@ pub struct ExecutedState<FEN: FoundryEvmNetwork> {
 
 impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
     /// Collects the data we need for simulation and various post-execution tasks.
-    pub async fn prepare_simulation(self) -> Result<PreSimulationState<FEN>> {
+    pub async fn prepare_simulation(mut self) -> Result<PreSimulationState<FEN>> {
         let returns = self.get_returns()?;
 
         let decoder = self.build_trace_decoder(&self.build_data.known_contracts).await?;
+
+        // Tron runs the script locally with no EVM fork, so the broadcast cheatcode records no rpc
+        // on the transactions. Stamp the configured `/wallet/*` endpoint onto the executed
+        // transactions themselves — before both the `rpc_data` clone below and `fill_metadata`,
+        // which reads `execution_result.transactions` and panics on a missing rpc. Resolve the url
+        // first so the immutable config borrow is dropped before the mutable transactions borrow.
+        let is_tron = self.script_config.evm_opts.networks.is_tron();
+        if is_tron {
+            let url = self.script_config.config.get_rpc_url().transpose()?.map(|u| u.into_owned());
+            if let (Some(url), Some(txs)) = (url, self.execution_result.transactions.as_mut()) {
+                for tx in txs.iter_mut() {
+                    if tx.rpc.is_none() {
+                        tx.rpc = Some(url.clone());
+                    }
+                }
+            }
+        }
 
         let mut txs: BroadcastableTransactions<FEN::Network> =
             self.execution_result.transactions.clone().unwrap_or_default();
@@ -313,6 +330,7 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
                 *req = req.clone().with_input_kind(input, TransactionInputKind::Both);
             }
         }
+
         let rpc_data = RpcData::from_transactions(&txs);
 
         if rpc_data.is_multi_chain() {
@@ -323,7 +341,11 @@ impl<FEN: FoundryEvmNetwork> ExecutedState<FEN> {
                 )
             }
         }
-        rpc_data.check_shanghai_support().await?;
+        // The Shanghai (EIP-3855) probe queries `eth_chainId`/`NamedChain` support; Tron endpoints
+        // are not named chains and always run Cancun, so skip it and avoid the extra `eth_*` call.
+        if !is_tron {
+            rpc_data.check_shanghai_support().await?;
+        }
 
         Ok(PreSimulationState {
             args: self.args,
