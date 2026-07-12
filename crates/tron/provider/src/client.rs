@@ -505,6 +505,15 @@ pub(crate) fn parse_broadcast_result(v: &serde_json::Value) -> Result<(), TronEr
 #[allow(clippy::disallowed_macros)]
 mod tests {
     use super::*;
+    use alloy_evm::{Evm, EvmEnv, EvmFactory};
+    use alloy_primitives::{Bytes, TxKind, U256};
+    use foundry_evm_core::evm::TronEvmFactory;
+    use revm::{
+        context::{CfgEnv, TxEnv},
+        database::{CacheDB, EmptyDB},
+        primitives::hardfork::SpecId,
+        state::{AccountInfo, Bytecode},
+    };
 
     fn fixture() -> serde_json::Value {
         serde_json::from_str(include_str!("../testdata/nile_getnowblock.json")).unwrap()
@@ -983,6 +992,141 @@ mod tests {
         eprintln!(
             "live create2 on-chain deploy tx https://nile.tronscan.org/#/transaction/{}",
             hex::encode(deploy_txid),
+        );
+    }
+
+    // ---- golden energy parity harness (local tron-revm vs Nile node) ----
+
+    /// A CANCUN environment mirroring the tron sandbox (`evm_version = "cancun"`),
+    /// identical to the one the `foundry-evm-core` energy-model unit tests use, so
+    /// local energy is metered under the same conditions the node runs under.
+    fn tron_cancun_env() -> EvmEnv {
+        let mut env: EvmEnv<SpecId> =
+            EvmEnv { cfg_env: CfgEnv::new_with_spec(SpecId::CANCUN), ..Default::default() };
+        env.block_env.gas_limit = 30_000_000;
+        env.block_env.prevrandao = Some(B256::with_last_byte(0x11));
+        env
+    }
+
+    /// Deploys the sandbox `Counter` creation bytecode through the local
+    /// [`TronEvmFactory`] and returns the runtime code the constructor RETURNs --
+    /// the exact bytes java-tron stores and later executes on a call.
+    fn counter_runtime() -> Bytes {
+        let creation = hex::decode(
+            include_str!("../../../evm/core/testdata/tron_counter_creation.hex").trim(),
+        )
+        .unwrap();
+        let mut evm = TronEvmFactory.create_evm(CacheDB::<EmptyDB>::default(), tron_cancun_env());
+        let out = evm
+            .transact_raw(TxEnv {
+                kind: TxKind::Create,
+                data: creation.into(),
+                gas_limit: 10_000_000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.result.is_success(), "counter must deploy locally: {:?}", out.result);
+        out.result.output().unwrap().clone()
+    }
+
+    /// Runs `calldata` against a fresh account holding `runtime` on the local
+    /// [`TronEvmFactory`] and returns the metered energy (`tx_gas_used`). The
+    /// account starts with empty storage (slot 0 = 0), matching a freshly
+    /// deployed Counter before its first `setNumber`. Intrinsic tx gas is zero
+    /// under the Tron energy model (it is bandwidth, not energy), so this is pure
+    /// execution energy -- the quantity the node reports as `energy_used`
+    /// (constant call) / `energy_usage_total` (mined tx).
+    fn local_call_energy(runtime: &Bytes, calldata: Vec<u8>) -> u64 {
+        let contract = Address::from([0x42u8; 20]);
+        let mut db = CacheDB::<EmptyDB>::default();
+        db.insert_account_info(
+            contract,
+            AccountInfo::from_bytecode(Bytecode::new_raw(runtime.clone())),
+        );
+        let mut evm = TronEvmFactory.create_evm(db, tron_cancun_env());
+        let out = evm
+            .transact_raw(TxEnv {
+                kind: TxKind::Call(contract),
+                data: calldata.into(),
+                gas_limit: 10_000_000,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(out.result.is_success(), "local call must succeed: {:?}", out.result);
+        out.result.tx_gas_used()
+    }
+
+    /// GOLDEN energy parity against Nile: the local tron-revm energy model must
+    /// reproduce the node's energy **exactly** for both a read and a write on a
+    /// freshly deployed `Counter` (so the dynamic-energy factor is 1 and does not
+    /// inflate the node's number). This is the end-to-end proof that the
+    /// FRONTIER-table + TVM-delta energy model (plan E, Task 1) is faithful, not
+    /// merely internally self-consistent: the local number is computed from the
+    /// same runtime bytecode the node executes, and both are asserted equal with
+    /// no tolerance. Energy (not `fee_sun`) is compared: staked resources zero the
+    /// fee while energy is still metered.
+    #[tokio::test]
+    async fn live_golden_energy_parity_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live golden");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+        let owner = signer.address();
+
+        // Fresh Counter deploy (dynamic-energy factor = 1).
+        let creation = hex::decode(
+            include_str!("../../../evm/core/testdata/tron_counter_creation.hex").trim(),
+        )
+        .unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+        let (deploy_txid, addr, info) =
+            p.deploy_contract(&signer, creation, "Counter", &opts, poll).await.unwrap();
+        assert!(info.success, "counter deploy must succeed");
+        eprintln!(
+            "golden fresh counter tx {} -> {}",
+            hex::encode(deploy_txid),
+            foundry_tron_primitives::to_base58(addr),
+        );
+
+        // The runtime the node stored == the constructor's local output.
+        let runtime = counter_runtime();
+
+        // ---- READ path: number() via triggerconstantcontract ----
+        // Called before setNumber, so slot 0 is 0 both on-chain and locally.
+        let number_sel = hex::decode("8381f58a").unwrap();
+        let node_view = p.trigger_constant(owner, addr, &number_sel).await.unwrap();
+        assert!(node_view.success, "number() constant call must succeed");
+        let local_view = local_call_energy(&runtime, number_sel.clone());
+        assert_eq!(
+            local_view, node_view.energy_used,
+            "READ energy parity failed: local tron-revm {local_view} != Nile {}",
+            node_view.energy_used,
+        );
+        eprintln!("golden READ number(): local == node == {local_view} energy");
+
+        // ---- WRITE path: setNumber(7) mined, TxInfo.energy_usage_total ----
+        // First write on the fresh contract: slot 0 goes 0->7 = SSTORE SET (20000)
+        // both on-chain and locally.
+        let mut set = hex::decode("3fb5c1cb").unwrap();
+        set.extend_from_slice(&U256::from(7u64).to_be_bytes::<32>());
+        let (set_txid, set_info) =
+            p.trigger_contract(&signer, addr, 0, set.clone(), &opts, poll).await.unwrap();
+        assert!(set_info.success, "setNumber(7) must succeed");
+        let local_write = local_call_energy(&runtime, set);
+        assert_eq!(
+            local_write, set_info.energy_used,
+            "WRITE energy parity failed: local tron-revm {local_write} != Nile {}",
+            set_info.energy_used,
+        );
+        eprintln!(
+            "golden WRITE setNumber(7): local == node == {local_write} energy (tx {})",
+            hex::encode(set_txid),
         );
     }
 }
