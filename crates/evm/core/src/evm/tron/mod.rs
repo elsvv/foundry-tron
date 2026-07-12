@@ -46,6 +46,7 @@ use crate::{
 };
 
 mod energy;
+mod precompiles;
 pub use energy::TRON_ENERGY_FEE_SUN;
 
 /// EVM factory that extends vanilla revm with the TVM opcodes 0xD0-0xD4.
@@ -90,7 +91,9 @@ impl EvmFactory for TronEvmFactory {
 ///    the instruction inserts below so it does not wipe them;
 /// 2. the TVM opcodes 0xD0-0xD4 that tron-solc emits;
 /// 3. the Tron block/tx-op overrides (DIFFICULTY, GASLIMIT, BASEFEE, GASPRICE, BLOBHASH,
-///    BLOBBASEFEE) whose semantics diverge from Ethereum.
+///    BLOBBASEFEE) whose semantics diverge from Ethereum;
+/// 4. the java-tron precompile set ([`precompiles`]), which overrides revm's `0x03`/`0x05`/`0x09`/
+///    `0x0a` and adds the Tron-only precompile addresses.
 fn inject_tron_extensions<DB: Database, I: Inspector<EthEvmContext<DB>>>(
     evm: EthEvm<DB, I, PrecompilesMap>,
     inspect: bool,
@@ -120,6 +123,11 @@ fn inject_tron_extensions<DB: Database, I: Inspector<EthEvmContext<DB>>>(
     table.insert_instruction(opcode::GASPRICE, Instruction::new(op_gasprice), 2);
     table.insert_instruction(opcode::BLOBHASH, Instruction::new(op_blobhash), 3);
     table.insert_instruction(opcode::BLOBBASEFEE, Instruction::new(op_blobbasefee), 2);
+
+    // 4. java-tron precompile set. `extend_precompiles` both overrides revm's
+    // 0x03/0x05/0x09/0x0a and adds the Tron-only addresses (0x020003, 0x020009,
+    // and the shielded/vote/FreezeV2 stub range). This runs on both create paths.
+    inner.precompiles.extend_precompiles(precompiles::tron_precompiles());
 
     EthEvm::new(inner, inspect)
 }

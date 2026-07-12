@@ -831,4 +831,78 @@ mod tests {
             alloy_primitives::hex::encode(txid)
         );
     }
+
+    /// Live confirmation of the two highest-risk Tron precompile divergences on
+    /// Nile: `0x01` ECRecover's 21-byte (`0x41`-prefixed) address word and
+    /// `0x03`'s `sha256(sha256(x)[..20])` (not ripemd160). Precompile addresses
+    /// are not directly callable via `triggerconstantcontract` ("Smart contract
+    /// is not exist"), so this deploys a tiny generic STATICCALL proxy whose
+    /// calldata is `target_word(32) ‖ input`, then probes it. Cross-checks the
+    /// on-chain output against `foundry-evm-core`'s local precompile semantics.
+    #[tokio::test]
+    async fn live_precompile_probe_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live probe");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+
+        // Generic STATICCALL proxy: runtime reads calldata word 0 as the target
+        // address and forwards calldata[32..] to it, returning the raw output.
+        let creation =
+            hex::decode("601b8060095f395ff36020360360205f375f5f602036035f5f355afa503d5f5f3e3d5ff3")
+                .unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+        let (txid, proxy, info) =
+            p.deploy_contract(&signer, creation, "PrecompileProxy", &opts, poll).await.unwrap();
+        assert!(info.success, "proxy deploy must succeed");
+        eprintln!(
+            "live precompile proxy deploy tx {} -> {}",
+            hex::encode(txid),
+            foundry_tron_primitives::to_base58(proxy),
+        );
+
+        let target = |low: u8| {
+            let mut w = [0u8; 32];
+            w[31] = low;
+            w
+        };
+        let owner = signer.address();
+
+        // 0x03: sha256(sha256("abc")[..20]), not ripemd160("abc").
+        let mut data03 = target(0x03).to_vec();
+        data03.extend_from_slice(b"abc");
+        let cr03 = p.trigger_constant(owner, proxy, &data03).await.unwrap();
+        assert!(cr03.success, "0x03 staticcall must succeed");
+        assert_eq!(
+            hex::encode(&cr03.result),
+            "6b6ea134869d649e6f52658be1a5691e37db83c6b8b72b0f1b36d4f849929c9e",
+            "0x03 on Nile must be double-sha256, not ripemd160",
+        );
+        eprintln!("live 0x03(abc) = {}", hex::encode(&cr03.result));
+
+        // 0x01: canonical ecrecover vector -> Tron 21-byte address form (byte 11 = 0x41).
+        let ecrecover_input = hex::decode(
+            "456e9aea5e197a1f1af7a3e85a3212fa4049a3ba34c2289b4c860fc0b0c64ef3\
+             000000000000000000000000000000000000000000000000000000000000001c\
+             9242685bf161793cc25603c231bc2f568eb630ea16aa137d2664ac8038825608\
+             4f8ae3bd7535248d0bd448298cc2e2071e56992d0774dc340c368ae950852ada",
+        )
+        .unwrap();
+        let mut data01 = target(0x01).to_vec();
+        data01.extend_from_slice(&ecrecover_input);
+        let cr01 = p.trigger_constant(owner, proxy, &data01).await.unwrap();
+        assert!(cr01.success, "0x01 staticcall must succeed");
+        assert_eq!(
+            hex::encode(&cr01.result),
+            "0000000000000000000000417156526fbd7a3c72969b54f64e42c10fbb768c8a",
+            "0x01 on Nile must return the 21-byte (0x41-prefixed) address word",
+        );
+        eprintln!("live 0x01 ecrecover = {}", hex::encode(&cr01.result));
+    }
 }
