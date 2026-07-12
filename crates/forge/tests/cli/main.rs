@@ -30,6 +30,7 @@ mod script;
 mod soldeer;
 mod svm;
 mod test_cmd;
+mod tron;
 mod verify;
 mod verify_bytecode;
 mod version;
