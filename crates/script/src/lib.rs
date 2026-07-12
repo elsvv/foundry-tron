@@ -28,7 +28,7 @@ use eyre::{ContextCompat, Result};
 use forge_script_sequence::{AdditionalContract, NestedValue};
 use forge_verify::{RetryArgs, VerifierArgs};
 use foundry_cli::{
-    opts::{BuildOpts, EvmArgs, GlobalArgs, TempoOpts},
+    opts::{BuildOpts, EvmArgs, GlobalArgs, TempoOpts, TronOpts},
     utils::LoadConfig,
 };
 use foundry_common::{
@@ -52,7 +52,7 @@ use foundry_evm::{
     backend::Backend,
     core::{
         Breakpoints, FoundryTransaction,
-        evm::{EthEvmNetwork, FoundryEvmNetwork, TempoEvmNetwork, TxEnvFor},
+        evm::{EthEvmNetwork, FoundryEvmNetwork, TempoEvmNetwork, TronEvmNetwork, TxEnvFor},
     },
     executors::ExecutorBuilder,
     inspectors::{
@@ -80,6 +80,7 @@ mod sequence;
 mod session;
 mod simulate;
 mod transaction;
+mod tron;
 mod verify;
 mod wallet_session;
 
@@ -153,6 +154,10 @@ pub struct ScriptArgs {
     /// Tempo transaction options.
     #[command(flatten)]
     pub tempo: TempoOpts,
+
+    /// Tron transaction options (`--tron.fee-limit`, `--tron.expiration`).
+    #[command(flatten)]
+    pub tron: TronOpts,
 
     /// Create a temporary Tempo wallet session, run this script with it, then revoke it.
     #[command(flatten)]
@@ -273,7 +278,24 @@ impl ScriptArgs {
     async fn resolved_evm_opts(&self) -> Result<(Config, EvmOpts)> {
         let (config, mut evm_opts) = self.load_config_and_evm_opts()?;
 
-        if self.tempo.is_tempo() || self.has_tempo_session()? {
+        if config.networks.is_tron() {
+            // Tron is selected only via config (`network = "tron"`), never inferred: the endpoint
+            // speaks `/wallet/*`, not full `eth_*`, so `infer_network_from_fork` cannot detect it.
+            // The rpc endpoint is a broadcast target, not an EVM fork — drop `fork_url` so every
+            // simulation runs locally on the `TronEvmFactory` and no `eth_*` call is made. The
+            // resolved endpoint is still reachable through `config.get_rpc_url()` for broadcast.
+            //
+            // `--fork-url` is a visible alias of `--rpc-url` (the required broadcast target), so
+            // the flag itself cannot signal fork intent; `--fork-block-number` can.
+            // Pinning a fork block is the unambiguous "fork this node" request and
+            // needs full `eth_*` state, which Tron does not serve — reject it
+            // explicitly rather than fail deep inside the fork provider.
+            if evm_opts.fork_block_number.is_some() {
+                eyre::bail!("forking a Tron node is not supported (stage 2)");
+            }
+            evm_opts.networks = NetworkConfigs::with_tron();
+            evm_opts.fork_url = None;
+        } else if self.tempo.is_tempo() || self.has_tempo_session()? {
             // If Tempo tx options or a session are set, select the Tempo network.
             evm_opts.networks = NetworkConfigs::with_tempo();
         } else {
@@ -368,6 +390,26 @@ impl ScriptArgs {
                 if broadcasted.args.verify {
                     broadcasted.verify().await?;
                 }
+                Ok(())
+            })
+            .await;
+        }
+
+        // Tron dispatch precedes the Ethereum fallback. Simulation reuses `prepare_bundled`
+        // (already running on `TronEvmFactory`); broadcast diverges into `broadcast_tron`, which
+        // assembles protobuf transactions and sends them through `/wallet/*` rather than
+        // `eth_sendRawTransaction`. On-chain fork simulation (phase 2) needs full `eth_*` and is
+        // skipped by forcing `skip_simulation`.
+        if evm_opts.networks.is_tron() {
+            let mut this = self;
+            this.skip_simulation = true;
+            return Box::pin(async move {
+                let bundled = match this.prepare_bundled::<TronEvmNetwork>(config, evm_opts).await?
+                {
+                    Some(bundled) => bundled,
+                    None => return Ok(()),
+                };
+                bundled.broadcast_tron().await?;
                 Ok(())
             })
             .await;
@@ -789,7 +831,11 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
         batch: bool,
         tempo: TempoOpts,
     ) -> Result<Self> {
-        let sender_nonce = if let Some(fork_url) = evm_opts.fork_url.as_ref() {
+        let sender_nonce = if evm_opts.networks.is_tron() {
+            // Tron has no `eth_getTransactionCount`; TAPOS + expiration replace the nonce scheme.
+            // Deploy addresses derive from the txid, so the sender nonce is unused here.
+            1
+        } else if let Some(fork_url) = evm_opts.fork_url.as_ref() {
             next_nonce(evm_opts.sender, fork_url, evm_opts.fork_block_number).await?
         } else {
             // dapptools compatibility
@@ -800,7 +846,10 @@ impl<FEN: FoundryEvmNetwork> ScriptConfig<FEN> {
     }
 
     pub async fn update_sender(&mut self, sender: Address) -> Result<()> {
-        self.sender_nonce = if let Some(fork_url) = self.evm_opts.fork_url.as_ref() {
+        self.sender_nonce = if self.evm_opts.networks.is_tron() {
+            // No `eth_getTransactionCount` on Tron (see `ScriptConfig::new`).
+            1
+        } else if let Some(fork_url) = self.evm_opts.fork_url.as_ref() {
             next_nonce(sender, fork_url, None).await?
         } else {
             // dapptools compatibility
@@ -1159,6 +1208,75 @@ mod tests {
 
         let state = args.preprocess::<TempoEvmNetwork>(Config::default(), evm_opts).await.unwrap();
         assert_eq!(state.script_config.evm_opts.sender, root);
+    }
+
+    /// `network = "tron"` in config must select the Tron network and drop `fork_url`, so all
+    /// simulation runs locally on the `TronEvmFactory` without touching `eth_*`. The resolved rpc
+    /// endpoint is kept in `config.eth_rpc_url` for the broadcast path.
+    #[tokio::test]
+    async fn tron_config_selects_tron_network_and_drops_fork_url() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        let config = r#"
+                [profile.default]
+                network = "tron"
+
+                [rpc_endpoints]
+                nile = "https://nile.trongrid.io"
+            "#;
+        fs::write(root.join(Config::FILE_NAME), config).unwrap();
+
+        let args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "script/Deploy.s.sol",
+            "--rpc-url",
+            "nile",
+            "--broadcast",
+            "--root",
+            root.as_os_str().to_str().unwrap(),
+        ]);
+
+        let (config, evm_opts) = args.resolved_evm_opts().await.unwrap();
+        assert!(evm_opts.networks.is_tron());
+        // Tron never forks: the endpoint is a broadcast target, not an EVM fork.
+        assert!(evm_opts.fork_url.is_none());
+        // The alias is preserved for `config.get_rpc_url()` during broadcast.
+        assert_eq!(config.eth_rpc_url, Some("nile".to_string()));
+    }
+
+    /// Pinning a fork block (`--fork-block-number`) is the only unambiguous "fork this node"
+    /// request — `--fork-url` is just an alias of the required `--rpc-url` broadcast target — and
+    /// it cannot work on Tron, whose `/wallet/*` endpoint serves no `eth_*` state. It must be
+    /// rejected before any provider is built.
+    #[tokio::test]
+    async fn tron_config_rejects_fork_block_number() {
+        let temp = tempdir().unwrap();
+        let root = temp.path();
+
+        let config = r#"
+                [profile.default]
+                network = "tron"
+
+                [rpc_endpoints]
+                nile = "https://nile.trongrid.io"
+            "#;
+        fs::write(root.join(Config::FILE_NAME), config).unwrap();
+
+        let args = ScriptArgs::parse_from([
+            "foundry-cli",
+            "script/Deploy.s.sol",
+            "--rpc-url",
+            "nile",
+            "--fork-block-number",
+            "100",
+            "--broadcast",
+            "--root",
+            root.as_os_str().to_str().unwrap(),
+        ]);
+
+        let err = args.resolved_evm_opts().await.unwrap_err();
+        assert!(err.to_string().contains("forking a Tron node is not supported"), "{err}");
     }
 
     #[tokio::test]

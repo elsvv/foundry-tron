@@ -26,6 +26,8 @@ foundry-cheatcodes.workspace = true
 foundry-wallets = { workspace = true, features = ["browser", "tempo"] }
 foundry-linking.workspace = true
 forge-script-sequence.workspace = true
+foundry-tron-primitives.workspace = true
+foundry-tron-provider.workspace = true
 
 serde.workspace = true
 eyre.workspace = true

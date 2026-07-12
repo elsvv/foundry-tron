@@ -115,6 +115,29 @@ impl TronProvider {
         parse_now_block(&v)
     }
 
+    /// Returns the chain id via the node's partial `eth_*` JSON-RPC endpoint at `<base>/jsonrpc`
+    /// (spec §4.5/§4.6: the read-side companion to the `/wallet/*` write API). Tron serves
+    /// `eth_chainId` there — not at the wallet base, which rejects JSON-RPC with `405` — so this
+    /// points at `/jsonrpc` explicitly and forwards the `TRON-PRO-API-KEY` header when set. Used to
+    /// resolve the `broadcast/<script>/<chain>/` directory (Nile = 3448148188).
+    pub async fn get_chain_id(&self) -> Result<u64, TronError> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": []
+        });
+        let mut req = self.client.post(format!("{}/jsonrpc", self.base_url)).json(&body);
+        if let Some(key) = &self.api_key {
+            req = req.header("TRON-PRO-API-KEY", key);
+        }
+        let v: serde_json::Value = req.send().await?.error_for_status()?.json().await?;
+        let hex = v
+            .get("result")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| TronError::Decode(format!("eth_chainId: no result in {v}")))?;
+        let hex = hex.strip_prefix("0x").unwrap_or(hex);
+        u64::from_str_radix(hex, 16)
+            .map_err(|e| TronError::Decode(format!("eth_chainId: invalid hex {hex}: {e}")))
+    }
+
     pub async fn tapos(&self) -> Result<(RefBlock, i64), TronError> {
         let nb = self.get_now_block().await?;
         Ok((ref_block(nb.number, &nb.block_id), nb.timestamp_ms))
@@ -517,6 +540,17 @@ mod tests {
         let nb = p.get_now_block().await.unwrap();
         assert!(nb.number > 69_000_000);
         assert_ne!(nb.block_id, [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn live_get_chain_id_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        let p = TronProvider::new("https://nile.trongrid.io").unwrap();
+        // Nile chain id, verified against `eth_chainId` (0xcd8690dc).
+        assert_eq!(p.get_chain_id().await.unwrap(), 3_448_148_188);
     }
 
     #[test]

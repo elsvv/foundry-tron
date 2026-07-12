@@ -5107,6 +5107,8 @@ dependencies = [
  "foundry-evm",
  "foundry-evm-networks",
  "foundry-linking",
+ "foundry-tron-primitives",
+ "foundry-tron-provider",
  "foundry-wallets",
  "futures",
  "indicatif",
