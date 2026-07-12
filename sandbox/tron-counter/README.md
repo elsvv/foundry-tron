@@ -93,8 +93,11 @@ $CAST send TQuzjxWcqHSh1xDUw4wmMFmCcLjz4wSCBp --value 1000000 \
 $CAST balance TX7izXWcmofRYonzdcThrS78jifMtVWCuf --rpc-url nile --ether
 
 # Deploy the Counter creation bytecode; stdout = base58 contract address.
-ADDR=$($CAST send --create $(cat ../../crates/evm/core/testdata/tron_counter_creation.hex) \
-  --tron.fee-limit 400000000 --rpc-url nile --private-key $TRON_PRIVATE_KEY)
+# NOTE: `--create` is a subcommand whose bytecode is a positional, so every flag
+# (--tron.fee-limit, --rpc-url, --private-key) MUST come before `--create`;
+# anything placed after it is rejected as an unexpected argument.
+ADDR=$($CAST send --tron.fee-limit 400000000 --rpc-url nile --private-key $TRON_PRIVATE_KEY \
+  --create $(cat ../../crates/evm/core/testdata/tron_counter_creation.hex))
 
 # Contract call: setNumber(7) then read number() (constant call).
 $CAST send $ADDR "setNumber(uint256)" 7 --rpc-url nile --private-key $TRON_PRIVATE_KEY
