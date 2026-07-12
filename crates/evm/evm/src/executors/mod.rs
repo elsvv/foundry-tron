@@ -1367,10 +1367,20 @@ fn convert_executed_result<FEN: FoundryEvmNetwork>(
             (reason.into_instruction_result(), 0_u64, gas.tx_gas_used(), None, logs)
         }
     };
-    let gas = revm::interpreter::gas::calculate_initial_tx_gas_for_tx(
-        &tx_env,
-        evm_env.cfg_env.spec.into(),
-    );
+    // The `stipend` is the intrinsic tx gas that callers subtract from
+    // `gas_used` to report execution-only gas. On Tron the intrinsic is
+    // *bandwidth*, not energy, and is already excluded from `gas_used` by the
+    // TVM energy model, so there is no energy stipend to subtract; subtracting
+    // the standard EIP-2028 intrinsic would underflow the reported gas to 0.
+    // Other networks keep the standard intrinsic.
+    let gas = if inspector.networks.is_tron() {
+        revm::interpreter::gas::InitialAndFloorGas::default()
+    } else {
+        revm::interpreter::gas::calculate_initial_tx_gas_for_tx(
+            &tx_env,
+            evm_env.cfg_env.spec.into(),
+        )
+    };
 
     let result = match &out {
         Some(Output::Call(data)) => data.clone(),

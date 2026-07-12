@@ -41,6 +41,7 @@
 
 ## Ключевые находки (не потерять)
 
+0. **План E / Задача 1 (energy-модель) — известное ограничение call depth 64.** Tron `MAX_DEPTH=64` (`Program.java`), revm — 1024 (`CALL_STACK_LIMIT`, `pub const` в `revm-primitives`, читается напрямую во `frame.rs:175,287` дефолтного хендлера, НЕ поле конфига). Переопределение потребовало бы форка `make_call_frame`/`make_create_frame` — вне скоупа energy-модели. Контракты с рекурсией глубже 64 проходят локально, но ревертят on-chain. Зафиксировано в `crates/evm/core/src/evm/tron/energy.rs`. Также в Задаче 1: refund'ов у Tron НЕТ (`ProgramResult.java:25,221-230` — `futureRefund`/`addFutureRefund`/`getFutureRefund` закомментированы; `Program.java:1272-1278`), поэтому все refund-GasId'ы (sstore_clearing/set/reset, selfdestruct) занулены.
 1. **tron-solc вставляет TVM-опкоды `0xD3`/`0xD2` (CALLTOKENID/CALLTOKENVALUE) в non-payable guard каждого контракта** → байткод tron-solc не исполняется на ванильном revm (`OpcodeNotFound` в конструкторе). Флага отключения нет. Отсюда план C2.
 2. **Нативные бинарники tron-solc существуют**: github.com/tronprotocol/solidity/releases, ассет `solc-macos` (Intel, на Apple Silicon — через Rosetta 2), версии до 0.8.27_Democritus_v4.8.1. Скачан в `~/.foundry-tron/solc/tron-solc-0.8.27`. TronBox качает только wasm — нативные лежат именно в релизах.
 3. Chain id Tron mainnet: `728126428`. TVM ≈ Cancun (java-tron 4.8.x): PUSH0, TLOAD/TSTORE, MCOPY есть; BLOBHASH/BLOBBASEFEE — заглушки 0.
