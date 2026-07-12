@@ -10,7 +10,7 @@ use crate::{
     provider::{curl_transport::CurlTransport, runtime_transport::RuntimeTransportBuilder},
 };
 use alloy_chains::NamedChain;
-use alloy_json_rpc::{RequestPacket, ResponsePacket};
+use alloy_json_rpc::{Id, RequestPacket, Response, ResponsePacket, ResponsePayload};
 use alloy_network::{Network, NetworkWallet};
 use alloy_provider::{
     Identity, ProviderBuilder as AlloyProviderBuilder, RootProvider,
@@ -24,6 +24,7 @@ use alloy_transport::{
 use eyre::{Result, WrapErr};
 use foundry_config::Config;
 use reqwest::Url;
+use serde_json::value::to_raw_value;
 use std::{
     marker::PhantomData,
     net::SocketAddr,
@@ -36,7 +37,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tower::Service;
+use tower::{Layer, Service};
 use url::ParseError;
 
 /// The assumed block time for unknown chains.
@@ -135,6 +136,92 @@ where
     }
 }
 
+/// The JSON-RPC method that a Tron `/jsonrpc` node intentionally answers with a permanent
+/// `-32601` "method not found" stub.
+const ETH_GET_TRANSACTION_COUNT: &str = "eth_getTransactionCount";
+
+/// A [`tower::Layer`] that short-circuits `eth_getTransactionCount` requests with a synthetic
+/// `"0x0"` response before they reach the network.
+///
+/// java-tron's `/jsonrpc` endpoint serves everything the fork backend needs (balance, code,
+/// storage, blocks, chain id) but deliberately returns a permanent `-32601` for
+/// `eth_getTransactionCount` (there is no EVM CREATE-nonce on Tron — deploy addresses are
+/// txid-derived). foundry-fork-db loads accounts via `try_join3(balance, nonce, code)`, so that
+/// single `-32601` aborts every account fetch and makes a read-only fork non-functional. This
+/// layer answers `eth_getTransactionCount` locally with `0x0`, which is correct for Tron and
+/// harmless for read-only forks (foundry increments its own in-memory nonce from this base).
+///
+/// It is applied strictly on the Tron fork path (gated by [`NetworkConfigs::is_tron`] at the
+/// provider-construction seam); every other method passes through untouched.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TronNonceShimLayer;
+
+impl<S> Layer<S> for TronNonceShimLayer {
+    type Service = TronNonceShimService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TronNonceShimService { inner }
+    }
+}
+
+/// The [`tower::Service`] produced by [`TronNonceShimLayer`].
+#[derive(Clone, Debug)]
+pub struct TronNonceShimService<S> {
+    inner: S,
+}
+
+/// Builds a synthetic successful `eth_getTransactionCount` response of `0x0` for the given request
+/// [`Id`], without touching the network.
+fn tron_zero_nonce_response(id: Id) -> Response {
+    // Serializing a static hex quantity string can never fail.
+    let result = to_raw_value(&"0x0").expect("serializing a static hex string cannot fail");
+    Response { id, payload: ResponsePayload::Success(result) }
+}
+
+impl<S> Service<RequestPacket> for TronNonceShimService<S>
+where
+    S: Service<
+            RequestPacket,
+            Response = ResponsePacket,
+            Error = TransportError,
+            Future = TransportFut<'static>,
+        > + Clone
+        + Send
+        + 'static,
+{
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: RequestPacket) -> Self::Future {
+        match &req {
+            // Fast path: a lone `eth_getTransactionCount` is answered locally with `0x0`.
+            RequestPacket::Single(single) if single.method() == ETH_GET_TRANSACTION_COUNT => {
+                let response = tron_zero_nonce_response(single.id().clone());
+                Box::pin(async move { Ok(ResponsePacket::Single(response)) })
+            }
+            // A batch made up entirely of `eth_getTransactionCount` is answered locally too.
+            RequestPacket::Batch(reqs)
+                if !reqs.is_empty()
+                    && reqs.iter().all(|r| r.method() == ETH_GET_TRANSACTION_COUNT) =>
+            {
+                let responses =
+                    reqs.iter().map(|r| tron_zero_nonce_response(r.id().clone())).collect();
+                Box::pin(async move { Ok(ResponsePacket::Batch(responses)) })
+            }
+            // Everything else (including mixed batches) passes through untouched.
+            _ => {
+                let mut inner = self.inner.clone();
+                inner.call(req)
+            }
+        }
+    }
+}
+
 /// Helper type to construct a `RetryProvider`
 ///
 /// This builder is generic over the network type `N`, defaulting to `AnyNetwork`.
@@ -158,6 +245,12 @@ pub struct ProviderBuilder<N: Network = AnyNetwork> {
     no_proxy: bool,
     /// Whether to output curl commands instead of making requests.
     curl_mode: bool,
+    /// Whether to install the Tron nonce shim on the RPC client.
+    ///
+    /// When enabled, `eth_getTransactionCount` is answered locally with `0x0` instead of hitting
+    /// the network. This is required to fork a java-tron `/jsonrpc` node, which serves a permanent
+    /// `-32601` for that method. See [`TronNonceShimLayer`].
+    tron_shim: bool,
     /// Phantom data for the network type.
     _network: PhantomData<N>,
 }
@@ -212,6 +305,7 @@ impl<N: Network> ProviderBuilder<N> {
             accept_invalid_certs: false,
             no_proxy: false,
             curl_mode: false,
+            tron_shim: false,
             _network: PhantomData,
         }
     }
@@ -366,6 +460,15 @@ impl<N: Network> ProviderBuilder<N> {
         self
     }
 
+    /// Sets whether to install the Tron nonce shim on the RPC client.
+    ///
+    /// This must be enabled only when forking a Tron `/jsonrpc` node (gated by
+    /// [`NetworkConfigs::is_tron`] at the caller). See [`TronNonceShimLayer`].
+    pub const fn tron_shim(mut self, tron_shim: bool) -> Self {
+        self.tron_shim = tron_shim;
+        self
+    }
+
     /// Constructs the `RetryProvider` taking all configs into account.
     pub fn build(self) -> Result<RetryProvider<N>> {
         let Self {
@@ -381,6 +484,7 @@ impl<N: Network> ProviderBuilder<N> {
             accept_invalid_certs,
             no_proxy,
             curl_mode,
+            tron_shim,
             ..
         } = self;
         let url = url?;
@@ -392,7 +496,16 @@ impl<N: Network> ProviderBuilder<N> {
         // If curl_mode is enabled, use CurlTransport instead of RuntimeTransport
         if curl_mode {
             let transport = CurlTransport::new(url).with_headers(headers).with_jwt(jwt);
-            let client = ClientBuilder::default().layer(retry_layer).transport(transport, is_local);
+            // On the Tron fork path, the shim is the outermost layer so `eth_getTransactionCount`
+            // is answered locally before hitting retry/transport; every other method is unaffected.
+            let client = if tron_shim {
+                ClientBuilder::default()
+                    .layer(TronNonceShimLayer)
+                    .layer(retry_layer)
+                    .transport(transport, is_local)
+            } else {
+                ClientBuilder::default().layer(retry_layer).transport(transport, is_local)
+            };
 
             let provider = AlloyProviderBuilder::<_, _, N>::default()
                 .connect_provider(RootProvider::new(client));
@@ -407,7 +520,14 @@ impl<N: Network> ProviderBuilder<N> {
             .accept_invalid_certs(accept_invalid_certs)
             .no_proxy(no_proxy)
             .build();
-        let client = ClientBuilder::default().layer(retry_layer).transport(transport, is_local);
+        let client = if tron_shim {
+            ClientBuilder::default()
+                .layer(TronNonceShimLayer)
+                .layer(retry_layer)
+                .transport(transport, is_local)
+        } else {
+            ClientBuilder::default().layer(retry_layer).transport(transport, is_local)
+        };
 
         if !is_local {
             client.set_poll_interval(
@@ -621,5 +741,71 @@ mod tests {
         assert!(builder.accept_invalid_certs);
         assert!(builder.no_proxy);
         assert_eq!(builder.timeout, Duration::from_secs(7));
+    }
+
+    // --- Tron nonce shim -------------------------------------------------------------------------
+
+    fn single_request(method: &str) -> RequestPacket {
+        RequestPacket::Single(
+            alloy_json_rpc::Request::new(method.to_string(), Id::Number(1), ())
+                .serialize()
+                .unwrap(),
+        )
+    }
+
+    /// The shim answers `eth_getTransactionCount` with `0x0` without ever touching the inner
+    /// transport (java-tron returns a permanent `-32601` for it).
+    #[tokio::test]
+    async fn tron_shim_intercepts_get_transaction_count() {
+        let inner_calls = Arc::new(AtomicUsize::new(0));
+        let calls = inner_calls.clone();
+        let inner = tower::service_fn(move |_req: RequestPacket| -> TransportFut<'static> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            // Mimic java-tron's -32601 stub so a wrongful forward fails the test loudly.
+            Box::pin(async move {
+                Err(alloy_transport::TransportErrorKind::custom_str(
+                    "inner transport must not be called for eth_getTransactionCount",
+                ))
+            })
+        });
+
+        let mut service = TronNonceShimLayer.layer(inner);
+        let res = service.call(single_request(ETH_GET_TRANSACTION_COUNT)).await.unwrap();
+
+        // The inner transport was never invoked.
+        assert_eq!(inner_calls.load(Ordering::SeqCst), 0);
+
+        let ResponsePacket::Single(response) = res else { panic!("expected a single response") };
+        let ResponsePayload::Success(raw) = response.payload else {
+            panic!("expected a success payload")
+        };
+        assert_eq!(raw.get(), "\"0x0\"");
+    }
+
+    /// Every other method passes straight through to the inner transport untouched.
+    #[tokio::test]
+    async fn tron_shim_passes_other_methods_through() {
+        let inner_calls = Arc::new(AtomicUsize::new(0));
+        let calls = inner_calls.clone();
+        let inner = tower::service_fn(move |req: RequestPacket| -> TransportFut<'static> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let id = req.as_single().unwrap().id().clone();
+            Box::pin(async move {
+                let raw = to_raw_value(&"0xdeadbeef").unwrap();
+                Ok(ResponsePacket::Single(Response { id, payload: ResponsePayload::Success(raw) }))
+            })
+        });
+
+        let mut service = TronNonceShimLayer.layer(inner);
+        let res = service.call(single_request("eth_blockNumber")).await.unwrap();
+
+        // The inner transport handled the request.
+        assert_eq!(inner_calls.load(Ordering::SeqCst), 1);
+
+        let ResponsePacket::Single(response) = res else { panic!("expected a single response") };
+        let ResponsePayload::Success(raw) = response.payload else {
+            panic!("expected a success payload")
+        };
+        assert_eq!(raw.get(), "\"0xdeadbeef\"");
     }
 }
