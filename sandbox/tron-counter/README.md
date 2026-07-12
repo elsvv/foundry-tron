@@ -175,3 +175,53 @@ gains an optional `tron` block:
 
 The public Nile endpoint (`nile.trongrid.io`, no API key) WAF-throttles a burst
 of `/wallet/*` POSTs with HTTP 405; set `TRON_PRO_API_KEY` to avoid it.
+
+## Plan G — read-only fork over `/jsonrpc`
+
+`forge test --fork-url <host>/jsonrpc` with `network = "tron"` forks real Tron
+state into tron-revm (Plan E energy model + precompiles). It is **read-only** —
+no transaction is broadcast, no TRX is spent — and **mainnet-only**: the live
+`/jsonrpc` servlet is mounted on `api.trongrid.io` but **not** on `api.nileex.io`
+(nginx 404), and it is inherently **tip-only** (java-tron serves account/storage
+state only at the `latest` tag; a pinned block number returns `-32602`).
+
+Two shims on the foundry side make it work (java-tron's `/jsonrpc` intentionally
+answers `eth_getTransactionCount` with a permanent `-32601`, and rejects
+block-number state queries): a nonce shim (`eth_getTransactionCount → 0x0`) and a
+tip-only unpin of the fork state block. Both `--fork-url` (global fork) and
+`vm.createSelectFork` route through them.
+
+```bash
+cd sandbox/tron-counter
+FORGE=<repo>/target/debug/forge
+
+# Read the real mainnet USDT contract on a fork (drop this test into test/):
+cat > test/UsdtFork.t.sol <<'SOL'
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+interface Vm { function createSelectFork(string calldata) external returns (uint256); }
+interface IERC20 { function name() external view returns (string memory);
+                   function decimals() external view returns (uint8);
+                   function totalSupply() external view returns (uint256); }
+contract UsdtForkTest {
+    Vm constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
+    IERC20 constant USDT = IERC20(0xa614f803B6FD780986A42c78Ec9c7f77e6DeD13C);
+    function test_fork_usdt() public {
+        vm.createSelectFork("https://api.trongrid.io/jsonrpc");
+        require(keccak256(bytes(USDT.name())) == keccak256("Tether USD"), "name");
+        require(USDT.decimals() == 6, "decimals");
+        require(USDT.totalSupply() > 0, "supply");
+    }
+}
+SOL
+TRON_LIVE=1 $FORGE test --mt test_fork_usdt -vvv
+
+# Or a global fork from the command line:
+TRON_LIVE=1 $FORGE test --fork-url https://api.trongrid.io/jsonrpc -vvv
+```
+
+Canonical, gated coverage lives in `crates/forge/tests/cli/tron.rs`
+(`tron_mainnet_fork_reads_usdt`, `TRON_LIVE=1`): it also cross-checks a raw
+balances storage slot (`keccak256(abi.encode(holder, 0))`) against `balanceOf`
+and confirms `extcodesize > 0`. Forking a Tron node under `forge script`
+(broadcast) is still rejected with an actionable error.

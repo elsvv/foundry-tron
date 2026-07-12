@@ -153,8 +153,15 @@ java-tron/live golden — НЕ «revm-gas 1:1»; план E: FRONTIER-базис
 protobuf-tx). `--gas-report` показывает две колонки: energy и bandwidth.
 
 **Гибрид-страховка:**
-- `forge test --fork-url <nile/mainnet>` — fork-режим через частичный `eth_*`
-  java-tron; только tip чейна, на исторические блоки — явная ошибка;
+- `forge test --fork-url <host>/jsonrpc` — fork-режим через частичный `eth_*`
+  java-tron; только tip чейна, на исторические блоки — явная ошибка.
+  **Реализовано (план G, read-only):** два слоя на нашей стороне —
+  nonce-shim (`eth_getTransactionCount → 0x0`, java-tron отдаёт постоянный
+  `-32601`) и tip-only unpin state-блока (java-tron `/jsonrpc` отдаёт
+  account/storage/code только на TAG `latest`, на номер блока — `-32602`;
+  fork-db поэтому НЕ пиним на tron-пути). Live-канал только mainnet
+  (`api.trongrid.io/jsonrpc`; на `api.nileex.io` `/jsonrpc` не смонтирован).
+  Fork под `forge script` (broadcast) остаётся отклонённым;
 - команда-хелпер для поднятия java-tron в докере и интеграционных прогонов
   критичных контрактов перед мейннет-деплоем.
 
