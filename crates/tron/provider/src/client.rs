@@ -418,6 +418,79 @@ pub fn build_create_raw(
     wrap_raw(ContractType::CreateSmartContract, create.encode_to_vec(), rb, now_ms, opts)
 }
 
+/// `Constant.MAX_RESULT_SIZE_IN_TX` (java-tron `common/.../Constant.java`): java-tron charges an
+/// extra 64 bandwidth bytes per contract for the transaction's reserved result slot.
+const MAX_RESULT_SIZE_IN_TX: u64 = 64;
+
+/// Placeholder wall-clock (ms since epoch) used only for offline bandwidth estimation. Any epoch in
+/// `[2^35, 2^42)` ms serializes `expiration` and `timestamp` as fixed 6-byte varints, so the exact
+/// value never affects the byte count; this one (~2023-11) stays inside that window for decades.
+const ESTIMATE_NOW_MS: i64 = 1_700_000_000_000;
+
+/// Placeholder TAPOS reference block for offline estimation. `ref_block_bytes` is always 2 bytes
+/// and `ref_block_hash` always 8 bytes on the wire regardless of content, so zeroed fields
+/// reproduce the exact serialized size of a real reference block.
+fn estimate_ref_block() -> RefBlock {
+    RefBlock { bytes: vec![0u8; 2], hash: vec![0u8; 8] }
+}
+
+/// Bandwidth, in bytes, that java-tron charges to broadcast the signed transaction carrying `raw`:
+/// `serialized_size(signed tx, ret cleared) + MAX_RESULT_SIZE_IN_TX`
+/// (`BandwidthProcessor.consume`). A freshly built tx has an empty `ret`, so `clearRet()` is a
+/// no-op; the signature is a fixed 65-byte dummy (`PER_SIGN_LENGTH`) whose content does not change
+/// the size.
+fn signed_bandwidth(raw: proto::TransactionRaw) -> u64 {
+    let tx = proto::Transaction { raw_data: Some(raw), signature: vec![vec![0u8; 65]] };
+    tx.encode_to_vec().len() as u64 + MAX_RESULT_SIZE_IN_TX
+}
+
+/// Estimates the on-chain bandwidth, in bytes, that java-tron charges to broadcast a
+/// `TriggerSmartContract` call carrying `data` (ABI-encoded selector + args) with `call_value` SUN
+/// attached, under the fee limit in `opts`.
+///
+/// Exact for transactions built by this crate's broadcast path (same builder); a third-party wallet
+/// that additionally sets `ref_block_num` would serialize a few bytes larger.
+pub fn estimate_call_bandwidth(data: Vec<u8>, call_value: i64, opts: &TxOptions) -> u64 {
+    let raw = build_trigger_raw(
+        Address::ZERO,
+        Address::ZERO,
+        call_value,
+        data,
+        estimate_ref_block(),
+        ESTIMATE_NOW_MS,
+        opts,
+    );
+    signed_bandwidth(raw)
+}
+
+/// Estimates the on-chain bandwidth, in bytes, that java-tron charges to broadcast a
+/// `CreateSmartContract` deploy of `bytecode_with_args` (creation bytecode followed by ABI-encoded
+/// constructor args) named `name`, with the given `SmartContract` energy fields and `opts`.
+///
+/// Exact for transactions built by this crate's broadcast path; see [`estimate_call_bandwidth`].
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_create_bandwidth(
+    bytecode_with_args: Vec<u8>,
+    name: &str,
+    call_value: i64,
+    origin_energy_limit: i64,
+    consume_user_resource_percent: i64,
+    opts: &TxOptions,
+) -> u64 {
+    let raw = build_create_raw(
+        Address::ZERO,
+        bytecode_with_args,
+        name,
+        call_value,
+        origin_energy_limit,
+        consume_user_resource_percent,
+        estimate_ref_block(),
+        ESTIMATE_NOW_MS,
+        opts,
+    );
+    signed_bandwidth(raw)
+}
+
 /// Parses a raw `/wallet/getnowblock` JSON response.
 pub(crate) fn parse_now_block(v: &serde_json::Value) -> Result<NowBlock, TronError> {
     let missing = |f: &str| TronError::Decode(format!("getnowblock: missing {f}"));
@@ -768,6 +841,72 @@ mod tests {
         assert_eq!(
             to_hex41(contract_address_from_txid(txid, owner)),
             json["contract_address"].as_str().unwrap(),
+        );
+    }
+
+    /// Signed-transaction size of a fixture's own `raw_data`, plus the +64 result slot: the
+    /// ground-truth bandwidth against which the estimators are checked. Reuses the fixture's
+    /// byte-identical `raw_data` (proven to round-trip in the primitives crate).
+    fn fixture_bandwidth(raw: proto::TransactionRaw) -> u64 {
+        signed_bandwidth(raw)
+    }
+
+    /// The call-bandwidth estimator reproduces the real mainnet `transfer(address,uint256)`
+    /// fixture's on-chain bandwidth (345 bytes = node `net_fee` 345000 SUN / 1000 SUN-per-byte),
+    /// both directly from the fixture's `raw_data` and by rebuilding from its semantic inputs.
+    #[test]
+    fn estimate_call_bandwidth_matches_mainnet_trigger_fixture() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/testdata/mainnet_trigger_tx.json"))
+                .unwrap();
+        let bytes = hex::decode(json["raw_data_hex"].as_str().unwrap()).unwrap();
+        let raw = proto::TransactionRaw::decode(bytes.as_slice()).unwrap();
+
+        // Ground truth: the fixture's own raw_data wrapped in a signed tx is 345 bandwidth bytes.
+        assert_eq!(fixture_bandwidth(raw.clone()), 345);
+
+        // Estimator: rebuilding from the semantic inputs (calldata, call_value, fee_limit)
+        // reproduces the exact byte count. Placeholder TAPOS/timestamp match the fixture's widths.
+        let trigger = <proto::TriggerSmartContract as Message>::decode(
+            raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        let opts =
+            TxOptions { fee_limit: raw.fee_limit, expiration_ms: raw.expiration - raw.timestamp };
+        assert_eq!(estimate_call_bandwidth(trigger.data, trigger.call_value, &opts), 345);
+    }
+
+    /// The create-bandwidth estimator reproduces the real Nile Counter deploy fixture's on-chain
+    /// bandwidth (853 bytes), both directly from the fixture and by rebuilding from its inputs.
+    #[test]
+    fn estimate_create_bandwidth_matches_nile_deploy_fixture() {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/testdata/nile_create_tx.json"))
+                .unwrap();
+        let bytes = hex::decode(json["raw_data_hex"].as_str().unwrap()).unwrap();
+        let raw = proto::TransactionRaw::decode(bytes.as_slice()).unwrap();
+
+        // Ground truth: the fixture's own raw_data wrapped in a signed tx is 853 bandwidth bytes.
+        assert_eq!(fixture_bandwidth(raw.clone()), 853);
+
+        // Estimator: rebuilding from the deploy's semantic inputs reproduces the exact byte count.
+        let create = <proto::CreateSmartContract as Message>::decode(
+            raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        let sc = create.new_contract.as_ref().unwrap();
+        let opts =
+            TxOptions { fee_limit: raw.fee_limit, expiration_ms: raw.expiration - raw.timestamp };
+        assert_eq!(
+            estimate_create_bandwidth(
+                sc.bytecode.clone(),
+                &sc.name,
+                sc.call_value,
+                sc.origin_energy_limit,
+                sc.consume_user_resource_percent,
+                &opts,
+            ),
+            853,
         );
     }
 

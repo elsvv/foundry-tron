@@ -41,9 +41,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // The short version information for the Foundry CLI.
     // - The latest version from Cargo.toml
+    // - A `tron;` marker identifying this as the Tron fork of Foundry.
     // - The short SHA of the latest commit.
-    // Example: 0.3.0-dev (3cb96bde9b)
-    println!("cargo:rustc-env=FOUNDRY_SHORT_VERSION={version} ({sha_short} {build_timestamp})");
+    // The `tron;` marker sits inside the existing parenthetical so the version keeps the
+    // upstream `<version> (<...>)` shape and stays parseable by the version snapshot tests.
+    // The SemVer string above is deliberately left untouched so `strip_semver_metadata`
+    // (the `foundryVersionCmp`/`foundryVersionAtLeast` cheatcodes) still parses cleanly.
+    // Example: 0.3.0-dev (tron; 3cb96bde9b 2025-01-16T15:04:03.522021223Z)
+    println!(
+        "cargo:rustc-env=FOUNDRY_SHORT_VERSION={version} (tron; {sha_short} {build_timestamp})"
+    );
 
     // The long version information for the Foundry CLI.
     // - The latest version from Cargo.toml.
@@ -55,14 +62,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     //
     // ```text
     // <BIN>
-    // Version: 0.3.0-dev
+    // Version: 0.3.0-dev (tron fork)
     // Commit SHA: 5186142d3bb4d1be7bb4ade548b77c8e2270717e
     // Build Timestamp: 2025-01-16T15:04:03.522021223Z (1737039843)
     // Build Profile: debug
     // ```
+    //
+    // The `(tron fork)` marker on the `Version:` line identifies this build as the Tron fork
+    // without adding a line (the assert below pins the line count) or disturbing the SemVer string.
     let long_version = format!(
         "\
-Version: {version}
+Version: {version} (tron fork)
 Commit SHA: {sha}
 Build Timestamp: {build_timestamp} ({build_timestamp_unix})
 Build Profile: {profile}"

@@ -110,6 +110,7 @@ alloy-hardforks.workspace = true
 anvil.workspace = true
 forge-script-sequence.workspace = true
 foundry-test-utils.workspace = true
+foundry-tron-solc.workspace = true
 
 mockall = "0.15"
 globset = "0.4"

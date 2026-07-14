@@ -1,6 +1,6 @@
 use super::{
     install,
-    test::{TestArgs, TestExecutionOptions},
+    test::{TestArgs, TestExecutionOptions, ensure_tron_fork_is_tip_only},
     watch::WatchArgs,
 };
 use crate::coverage::{
@@ -123,6 +123,13 @@ impl CoverageArgs {
 
     pub async fn run(mut self) -> Result<()> {
         let (mut config, evm_opts) = self.load_config_and_evm_opts()?;
+
+        // Reject an explicit historical `--fork-block-number` on Tron before installing
+        // dependencies, compiling, or constructing the fork. `forge coverage` builds and runs tests
+        // on its own (`self.build` + `self.test.run_tests`) instead of going through
+        // `compile_project`, so it needs this fail-fast guard up front to match `forge test`;
+        // `run_tests` re-checks it as the shared backstop (Tron forks are tip-only).
+        ensure_tron_fork_is_tip_only(&evm_opts)?;
 
         // install missing dependencies
         if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings

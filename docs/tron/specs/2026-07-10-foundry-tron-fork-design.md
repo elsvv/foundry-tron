@@ -151,6 +151,13 @@ java-tron/live golden — НЕ «revm-gas 1:1»; план E: FRONTIER-базис
 дельт, MLOAD/MSTORE/MSTORE8 = SPECIAL_TIER, no-refund, no-EIP-3860; exact-match
 на Nile подтверждён на view и write), bandwidth — отдельный проход (размер
 protobuf-tx). `--gas-report` показывает две колонки: energy и bandwidth.
+**Реализовано (план H, gas-report):** на tron-прогоне (`config.networks.is_tron()`,
+run-level) колонка gas переименована в energy (`trace.gas_used` = TVM energy),
+добавлен bandwidth-блок (байты) — оценка per-frame через реальные билдеры
+provider'а (`build_trigger_raw`/`build_create_raw`, 65-байтовая dummy-подпись) + 64
+(java-tron `BandwidthProcessor.consume`), точная для нашего broadcast-пути. EVM-вывод
+байт-в-байт не изменён (гейт is_tron + `skip_serializing_if` в JSON). Юниты против
+committed-фикстур (trigger → 345, create → 853).
 
 **Гибрид-страховка:**
 - `forge test --fork-url <host>/jsonrpc` — fork-режим через частичный `eth_*`
@@ -161,7 +168,11 @@ protobuf-tx). `--gas-report` показывает две колонки: energy 
   account/storage/code только на TAG `latest`, на номер блока — `-32602`;
   fork-db поэтому НЕ пиним на tron-пути). Live-канал только mainnet
   (`api.trongrid.io/jsonrpc`; на `api.nileex.io` `/jsonrpc` не смонтирован).
-  Fork под `forge script` (broadcast) остаётся отклонённым;
+  Fork под `forge script` (broadcast) остаётся отклонённым.
+  Явная ошибка на исторический `--fork-block-number` — **реализовано (план H, H1):**
+  bail «Tron forks are tip-only: state is served only at the chain tip …» в общей
+  точке `TestArgs::run_tests` (покрывает `forge test`/`snapshot`/`coverage`) +
+  зеркальный гард в чит-коде `vm.createFork`/`createSelectFork` с явным блоком;
 - команда-хелпер для поднятия java-tron в докере и интеграционных прогонов
   критичных контрактов перед мейннет-деплоем.
 
@@ -220,6 +231,23 @@ API-ключ TronGrid — через env (header `TRON-PRO-API-KEY`).
 ### 4.8 Верификация (этап 3)
 
 Новый `VerificationProvider` (`crates/verify/src/provider.rs`) под TRONSCAN API.
+
+**Реализовано (план H):** провайдер `crates/verify/src/tronscan/mod.rs`
+(`VerificationProviderType::Tronscan`) — keyless, СИНХРОННЫЙ. `VerifyArgs::run`
+ветвится на `config.networks.is_tron()` до alloy chain-резолюции (зеркало
+`forge create`), форсит TronScan-провайдера, пропускает aux-Sourcify. Submit —
+`multipart/form-data` POST `/api/solidity/contract/verify`: base58-адрес, флаттеный
+исходник (`foundry_common::flatten`, без vanilla-solc dry-run и ipfs-ассерта),
+`constructorParams`=hex без `0x`, пин `compiler = tron_v<longVersion>`
+(`crates/tron/solc/src/pins.rs`), `evmVersion` нормализован против компилятора.
+Маппинг `data.status`: 2006=успех, 2001=already verified, 2007/2008=fail;
+`check`/`--watch` — re-query `/api/solidity/contract/info` (`status==2`). Host-routing
+по chain id: mainnet 728126428 → `apilist.tronscanapi.com`, Nile 3448148188 →
+`nileapi.tronscan.org`, оверрайд `--verifier-url`. Доступно как standalone
+`forge verify-contract` (адрес `T…`/`41…`/`0x…`) и embedded `forge create --verify`
+(с pre-broadcast preflight до траты TRX). `forge script --verify` — пока явный bail
+(шов асимметричен, follow-up). Live acceptance-гейт на Nile пройден
+(`tron_v0.8.27+commit.19164bed`, `/info` status 2).
 
 ## 5. Вне скоупа (YAGNI)
 
