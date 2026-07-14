@@ -609,7 +609,13 @@ async fn create_fork<
 
     let provider = fork.evm_opts.fork_provider_with_url::<N>(&fork.url)?;
     let db = BlockchainDb::new(meta, cache_path);
-    let (backend, handler) = SharedBackend::new(provider, db, Some(number.into()));
+    // java-tron's `/jsonrpc` only serves account/storage state at the `latest` TAG and rejects a
+    // block-number QUANTITY with `-32602 "QUANTITY not supported, just support TAG as latest"`. A
+    // read-only Tron fork is therefore tip-only: leave the state-fetch block unpinned so fork-db
+    // defaults to `latest` and account/storage/code loads succeed. The block environment above is
+    // still pinned to `number`. Every other network keeps the exact block pin.
+    let pin_block = (!fork.evm_opts.networks.is_tron()).then(|| number.into());
+    let (backend, handler) = SharedBackend::new(provider, db, pin_block);
     let fork_id = ForkId::new(&fork.url, Some(number));
     let fork = CreatedFork::new(fork, evm_env, backend);
 

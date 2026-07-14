@@ -5582,6 +5582,7 @@ dependencies = [
  "foundry-compilers",
  "foundry-evm-hardforks",
  "foundry-evm-networks",
+ "foundry-tron-solc",
  "glob",
  "globset",
  "heck",
@@ -5715,6 +5716,7 @@ dependencies = [
  "foundry-evm-networks",
  "foundry-fork-db",
  "foundry-test-utils",
+ "foundry-tron-primitives",
  "futures",
  "itertools 0.15.0",
  "op-alloy-consensus",
@@ -5996,15 +5998,31 @@ dependencies = [
 name = "foundry-tron-provider"
 version = "1.7.2"
 dependencies = [
+ "alloy-evm",
  "alloy-primitives",
  "alloy-signer",
  "alloy-signer-local",
+ "foundry-evm-core",
  "foundry-tron-primitives",
  "prost 0.13.5",
  "prost-types 0.13.5",
  "reqwest 0.13.4",
+ "revm",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "foundry-tron-solc"
+version = "1.7.2"
+dependencies = [
+ "dirs",
+ "reqwest 0.13.4",
+ "semver 1.0.28",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]

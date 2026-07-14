@@ -27,3 +27,8 @@ tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# golden energy parity: run the same call through the local tron-revm energy
+# model and assert it matches the Nile node byte-for-byte.
+foundry-evm-core.workspace = true
+alloy-evm.workspace = true
+revm.workspace = true

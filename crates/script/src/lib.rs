@@ -291,7 +291,11 @@ impl ScriptArgs {
             // needs full `eth_*` state, which Tron does not serve — reject it
             // explicitly rather than fail deep inside the fork provider.
             if evm_opts.fork_block_number.is_some() {
-                eyre::bail!("forking a Tron node is not supported (stage 2)");
+                eyre::bail!(
+                    "forking a Tron node is not supported under forge script; use \
+                     `forge test --fork-url <host>/jsonrpc` for a read-only fork \
+                     (script broadcast on a fork is unsupported)"
+                );
             }
             evm_opts.networks = NetworkConfigs::with_tron();
             evm_opts.fork_url = None;

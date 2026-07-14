@@ -40,9 +40,16 @@ Tron пуста — форка Foundry под TVM не существует).
    - precompiles: `0x09` = BatchValidateSign (TIP-43), `0x0a` = ValidateMultiSign
      (TIP-60), Ripemd160 → `0x20003`, Blake2F → `0x20009`, shielded-TRC20 —
      `0x1000001–0x1000004`;
-   - CREATE2: префикс адреса `0x41` вместо `0xff`;
-   - GASPRICE/BASEFEE возвращают energyPrice; CHAINID mainnet = 728126428;
-   - модель ресурсов: energy (стоимости опкодов совпадают с EVM-gas) +
+   - CREATE2: `addr = keccak256(0x41 ‖ sender21 ‖ salt ‖ keccak256(initcode))[12..]`
+     (префикс `0x41`, sender — 21-байтовый, БЕЗ `0xff`; **уточнено 2026-07-12** по
+     `WalletUtil.generateContractAddress2`, подтверждено golden на Nile);
+   - GASPRICE = 0 (CompatibleEvm выкл. на mainnet/Nile), BASEFEE = `getEnergyFee()`
+     = **100** SUN (**уточнено 2026-07-12** live на mainnet и Nile — прежнее
+     «energyPrice/420» неверно); CHAINID mainnet = 728126428;
+   - модель ресурсов: energy = pre-EIP-150 (FRONTIER) gas-таблицы revm + TVM-дельты
+     (**уточнено 2026-07-12**: «стоимости опкодов совпадают с EVM-gas» верно ТОЛЬКО
+     для FRONTIER-базиса, НЕ для CANCUN — cold/warm EIP-2929 и EXP-byte расходятся;
+     MLOAD/MSTORE/MSTORE8 = SPECIAL_TIER 1; refund'ов нет; НЕТ EIP-170/EIP-3860) +
      bandwidth (байты сериализованной транзакции), `fee_limit` в TRX.
    Перед реализацией нумерация precompiles и поведение опкодов сверяются с
    исходниками java-tron (доки противоречивы).
@@ -138,13 +145,23 @@ BLOBHASH/BLOBBASEFEE = 0). Существующий стек
 precompiles 0x09/0x0a и опкоды 0xD0–0xDF не поддержаны.
 
 **Этап 2 — `tron-revm`:** кастомная таблица инструкций (0xD0–0xDF поверх
-journaled state), Tron-таблица precompiles, CREATE2-префикс 0x41,
-energy = revm-gas 1:1, bandwidth — отдельный проход (размер protobuf-tx).
-`--gas-report` показывает две колонки: energy и bandwidth.
+journaled state), Tron-таблица precompiles, CREATE2 по формуле Tron (0x41),
+energy = FRONTIER gas-таблицы revm + TVM-дельты (**уточнено 2026-07-12** по
+java-tron/live golden — НЕ «revm-gas 1:1»; план E: FRONTIER-базис + `override_gas`
+дельт, MLOAD/MSTORE/MSTORE8 = SPECIAL_TIER, no-refund, no-EIP-3860; exact-match
+на Nile подтверждён на view и write), bandwidth — отдельный проход (размер
+protobuf-tx). `--gas-report` показывает две колонки: energy и bandwidth.
 
 **Гибрид-страховка:**
-- `forge test --fork-url <nile/mainnet>` — fork-режим через частичный `eth_*`
-  java-tron; только tip чейна, на исторические блоки — явная ошибка;
+- `forge test --fork-url <host>/jsonrpc` — fork-режим через частичный `eth_*`
+  java-tron; только tip чейна, на исторические блоки — явная ошибка.
+  **Реализовано (план G, read-only):** два слоя на нашей стороне —
+  nonce-shim (`eth_getTransactionCount → 0x0`, java-tron отдаёт постоянный
+  `-32601`) и tip-only unpin state-блока (java-tron `/jsonrpc` отдаёт
+  account/storage/code только на TAG `latest`, на номер блока — `-32602`;
+  fork-db поэтому НЕ пиним на tron-пути). Live-канал только mainnet
+  (`api.trongrid.io/jsonrpc`; на `api.nileex.io` `/jsonrpc` не смонтирован).
+  Fork под `forge script` (broadcast) остаётся отклонённым;
 - команда-хелпер для поднятия java-tron в докере и интеграционных прогонов
   критичных контрактов перед мейннет-деплоем.
 

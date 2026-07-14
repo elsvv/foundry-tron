@@ -26,9 +26,12 @@ use tempo_contracts::precompiles::{
 
 pub mod arbitrum;
 pub mod celo;
+pub mod tron;
 
 #[cfg(feature = "optimism")]
 mod optimism;
+
+use tron::TRON_PRECOMPILES;
 
 const TEMPO_PRECOMPILES: &[(&str, Address)] = &[
     ("Nonce", NONCE_PRECOMPILE_ADDRESS),
@@ -359,6 +362,14 @@ impl NetworkConfigs {
                     .map(|(label, address)| (address, label.to_string())),
             );
         }
+        if self.is_tron() {
+            labels.extend(
+                TRON_PRECOMPILES
+                    .iter()
+                    .copied()
+                    .map(|(label, address)| (address, label.to_string())),
+            );
+        }
         labels
     }
 
@@ -379,6 +390,14 @@ impl NetworkConfigs {
                             is_tempo_precompile_active_at(*address, hardfork)
                         })
                     })
+                    .map(|(label, address)| (label.to_string(), address)),
+            );
+        }
+        if self.is_tron() {
+            precompiles.extend(
+                TRON_PRECOMPILES
+                    .iter()
+                    .copied()
                     .map(|(label, address)| (label.to_string(), address)),
             );
         }
@@ -583,5 +602,24 @@ mod tron_tests {
         assert!(!c.is_tempo());
         let via_from: NetworkConfigs = NetworkVariant::Tron.into();
         assert!(via_from.is_tron());
+    }
+
+    #[test]
+    fn tron_network_reports_precompile_labels() {
+        let cfg = NetworkConfigs::with_tron();
+        let labels = cfg.precompiles_label(None);
+        // The three highest-blast-radius overrides get named in traces.
+        assert_eq!(labels.get(&tron::RIPEMD160_BROKEN), Some(&"RIPEMD160".to_string()));
+        assert_eq!(labels.get(&tron::BATCH_VALIDATE_SIGN), Some(&"BatchValidateSign".to_string()));
+        assert_eq!(labels.get(&tron::VALIDATE_MULTISIGN), Some(&"ValidateMultiSign".to_string()));
+        assert_eq!(labels.len(), TRON_PRECOMPILES.len());
+
+        let report = cfg.precompiles(None);
+        assert_eq!(report.get("EthRipemd160"), Some(&tron::ETH_RIPEMD160));
+        assert_eq!(report.get("Blake2F"), Some(&tron::BLAKE2F));
+
+        // A plain Ethereum config must not surface any Tron precompiles.
+        assert!(NetworkConfigs::default().precompiles_label(None).is_empty());
+        assert!(NetworkConfigs::default().precompiles(None).is_empty());
     }
 }
