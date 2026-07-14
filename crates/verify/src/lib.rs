@@ -11,6 +11,8 @@ extern crate tracing;
 
 mod etherscan;
 
+mod tronscan;
+
 pub mod provider;
 
 pub mod bytecode;

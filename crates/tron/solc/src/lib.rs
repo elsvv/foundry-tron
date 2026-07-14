@@ -181,6 +181,29 @@ pub fn pinned_sha256(version: &Version, platform: Platform) -> Option<&'static s
         .map(|pin| pin.sha256)
 }
 
+/// Returns the pinned solc long version (`<version>+commit.<8hex>`) for a
+/// semantic version, or `None` if the version is not pinned.
+///
+/// This is the platform-independent `builds[].longVersion` from the same
+/// `solc-bin` list.json the checksum table is sourced from.
+pub fn tron_solc_long_version(version: &Version) -> Option<&'static str> {
+    let version = version.to_string();
+    pins::LONG_VERSIONS
+        .iter()
+        .find(|entry| entry.version == version)
+        .map(|entry| entry.long_version)
+}
+
+/// Returns the TronScan `compiler` field for a pinned tron-solc version:
+/// `tron_v<longVersion>`, e.g. `tron_v0.8.27+commit.19164bed`.
+///
+/// TronScan's contract-verification API validates the compiler by this exact
+/// string (live-confirmed for 0.8.25). Returns `None` when the version is not
+/// pinned, so callers can surface a clear error instead of a bad guess.
+pub fn tronscan_compiler_string(version: &Version) -> Option<String> {
+    tron_solc_long_version(version).map(|long| format!("tron_v{long}"))
+}
+
 /// Returns the GitHub release download URL for a version/platform.
 pub fn download_url(version: &Version, platform: Platform) -> Result<String, TronSolcError> {
     let asset = platform.asset_name()?;
@@ -385,6 +408,30 @@ mod tests {
         // Unknown version and unsupported platform have no pin.
         assert_eq!(pinned_sha256(&Version::new(0, 8, 99), Platform::MacOs), None);
         assert_eq!(pinned_sha256(&v27, Platform::LinuxAarch64), None);
+    }
+
+    #[test]
+    fn tronscan_compiler_string_matches_pinned_long_versions() {
+        // 0.8.25 is live-confirmed against a verified mainnet contract's /info
+        // (compiler == "tron_v0.8.25+commit.77bd169f").
+        assert_eq!(
+            tronscan_compiler_string(&Version::new(0, 8, 25)).as_deref(),
+            Some("tron_v0.8.25+commit.77bd169f")
+        );
+        // 0.8.26 / 0.8.27 come from the authoritative list.json longVersion.
+        assert_eq!(
+            tronscan_compiler_string(&Version::new(0, 8, 26)).as_deref(),
+            Some("tron_v0.8.26+commit.733b4d28")
+        );
+        assert_eq!(
+            tronscan_compiler_string(&Version::new(0, 8, 27)).as_deref(),
+            Some("tron_v0.8.27+commit.19164bed")
+        );
+        // The long version alone (no tron_v prefix) is also exposed.
+        assert_eq!(tron_solc_long_version(&Version::new(0, 8, 27)), Some("0.8.27+commit.19164bed"));
+        // Unpinned versions have no compiler string.
+        assert_eq!(tronscan_compiler_string(&Version::new(0, 8, 99)), None);
+        assert_eq!(tron_solc_long_version(&Version::new(0, 4, 25)), None);
     }
 
     #[test]

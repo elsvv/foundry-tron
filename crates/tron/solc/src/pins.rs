@@ -24,6 +24,34 @@ pub(crate) struct Pin {
     pub sha256: &'static str,
 }
 
+/// A pinned solc long version (`<version>+commit.<8hex>`), keyed by semantic
+/// version. Platform-independent, so it is tracked separately from [`Pin`].
+///
+/// The value is exactly `builds[].longVersion` from the same
+/// `tronprotocol.github.io/solc-bin/{platform}/list.json` used for the checksum
+/// table. TronScan's contract-verification `compiler` field wants this form
+/// prefixed with `tron_v` (e.g. `tron_v0.8.25+commit.77bd169f`), because the
+/// native `tron-solc` resolver skips the `solc --version` exec and so never
+/// captures the commit itself.
+pub(crate) struct LongVersion {
+    /// Semantic version string, e.g. `"0.8.27"`.
+    pub version: &'static str,
+    /// Full solc long version, e.g. `"0.8.27+commit.19164bed"`.
+    pub long_version: &'static str,
+}
+
+/// Embedded long-version table for the supported tron-solc versions.
+///
+/// Source: `list.json` `builds[].longVersion` (fetched 2026-07-14). The 0.8.25
+/// entry is additionally confirmed live: TronScan stores
+/// `compiler="tron_v0.8.25+commit.77bd169f"` for the verified mainnet contract
+/// `TMv7hAfswe2EvXG4nUeNFGEgNWE8Joedtu`.
+pub(crate) const LONG_VERSIONS: &[LongVersion] = &[
+    LongVersion { version: "0.8.25", long_version: "0.8.25+commit.77bd169f" },
+    LongVersion { version: "0.8.26", long_version: "0.8.26+commit.733b4d28" },
+    LongVersion { version: "0.8.27", long_version: "0.8.27+commit.19164bed" },
+];
+
 /// Embedded checksum table for the supported tron-solc versions and platforms.
 pub(crate) const PINS: &[Pin] = &[
     // linux-amd64 (solc-static-linux, x86_64).

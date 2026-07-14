@@ -5,6 +5,7 @@ use crate::{
     etherscan::EtherscanVerificationProvider,
     provider::{VerificationContext, VerificationProvider, VerificationProviderType},
     sourcify::SourcifyVerificationProvider,
+    tronscan::{TronscanVerificationProvider, resolve_tronscan_hosts},
     utils::wrap_verifier_url_error,
 };
 use alloy_primitives::{Address, TxHash, map::HashSet};
@@ -239,6 +240,10 @@ impl VerifierArgs {
                         }
                     }
                 }
+            }
+            VerificationProviderType::Tronscan => {
+                // TronScan verification is keyless; there are no credentials to probe. Routing to
+                // this arm only happens on the Tron path, which bypasses `check_credentials`.
             }
             VerificationProviderType::Sourcify => {
                 // Only probe custom URLs; the default public endpoint is assumed reachable.
@@ -556,6 +561,14 @@ impl VerifyArgs {
     pub async fn run(mut self) -> Result<()> {
         let config = self.load_config()?;
 
+        // Tron is config-file driven (`network = "tron"`). It routes to TronScan's keyless,
+        // synchronous verify API and must branch *before* the alloy chain-resolution below, which
+        // a Tron node's partial `eth_*` surface would make unreliable. Mirrors `forge create`
+        // (`create.rs`: `if config.networks.is_tron() { return self.run_tron(config).await; }`).
+        if config.networks.is_tron() {
+            return self.run_tron(config).await;
+        }
+
         if self.guess_constructor_args && config.get_rpc_url().is_none() {
             eyre::bail!(
                 "You have to provide a valid RPC URL to use --guess-constructor-args feature"
@@ -674,6 +687,93 @@ impl VerifyArgs {
         }
 
         required_err.map_or(Ok(()), Err)
+    }
+
+    /// Verifies a Tron contract through TronScan. Config-file driven (`network = "tron"`): resolves
+    /// the flattened source and pinned tron-solc compiler string, routes to the mainnet/Nile
+    /// TronScan API host (or a `--verifier-url` override), and submits the keyless, synchronous
+    /// multipart verify request. TronScan returns the terminal result directly (no async GUID), so
+    /// when `--watch` is set the contract's `/info` is re-queried until `status == 2`.
+    async fn run_tron(self, config: Config) -> Result<()> {
+        // Route by chain id from config (`chain_id` in foundry.toml). A Tron node's partial `eth_*`
+        // surface makes alloy chain-resolution unreliable, so we deliberately do not query it here;
+        // when the chain id is unknown, `resolve_tronscan_hosts` requires `--verifier-url`.
+        let chain_id = config.chain.map(|c| c.id());
+        let verifier_url = self.verifier.verifier_url.clone();
+        let context = self.resolve_tron_context(config)?;
+        let hosts = resolve_tronscan_hosts(chain_id, verifier_url.as_deref())?;
+
+        sh_status!(
+            "Start verifying contract `{}` on TronScan ({})",
+            foundry_tron_primitives::to_base58(self.address),
+            hosts.api
+        )?;
+        if let Some(version) = &self.compiler_version {
+            sh_status!("Compiler version: {version}")?;
+        }
+        if let Some(args) = &self.constructor_args
+            && !args.is_empty()
+        {
+            sh_status!("Constructor args: {args}")?;
+        }
+
+        let mut provider = TronscanVerificationProvider::new(hosts);
+        let watch = self.watch;
+        let check_args = provider.submit(self.clone(), context).await?;
+        if watch && let Some(check_args) = check_args {
+            sh_status!("\nWaiting for TronScan verification result...")?;
+            return provider.check(check_args).await;
+        }
+        Ok(())
+    }
+
+    /// Resolves a [`VerificationContext`] for the Tron path.
+    ///
+    /// Unlike [`Self::resolve_context`], this keeps the native `tron-solc` compiler on the project
+    /// (via `config.project()`, which routes through `Config::ensure_solc`'s tron resolver) instead
+    /// of installing vanilla solc: the flattener needs the Tron toolchain's AST, and no vanilla
+    /// bytecode is ever produced. The contract identifier (`<path>:<name>`) is required because
+    /// bytecode-matching against a Tron RPC is not supported.
+    fn resolve_tron_context(&self, mut config: Config) -> Result<VerificationContext> {
+        config.libraries.extend(self.libraries.clone());
+
+        let Some(contract) = &self.contract else {
+            eyre::bail!(
+                "verifying a Tron contract requires the `<path>:<name>` identifier (e.g. \
+                 `src/Counter.sol:Counter`); bytecode-matching against a Tron RPC is not supported."
+            );
+        };
+
+        let mut project = config.project()?;
+        project.no_artifacts = true;
+
+        let target_path = if let Some(path) = &contract.path {
+            project.root().join(PathBuf::from(path))
+        } else {
+            project.find_contract_path(&contract.name)?
+        };
+
+        // Compiler version precedence mirrors the tron-solc auto-resolver (`Config::ensure_solc`):
+        // explicit `--compiler-version`, then an explicit `solc` config version, else the pinned
+        // tron-solc default. On Tron the compiler is always the pinned native tron-solc, so this
+        // fully determines the TronScan compiler string.
+        let compiler_version = if let Some(version) = &self.compiler_version {
+            version.trim_start_matches('v').parse()?
+        } else if let Some(SolcReq::Version(version)) = &config.solc {
+            version.clone()
+        } else {
+            foundry_tron_solc::default_version()
+        };
+
+        let compiler_settings = project.settings.clone();
+        Ok(VerificationContext {
+            config,
+            project,
+            target_path,
+            target_name: contract.name.clone(),
+            compiler_version,
+            compiler_settings,
+        })
     }
 
     /// Plans the set of verification submissions to run for this invocation.

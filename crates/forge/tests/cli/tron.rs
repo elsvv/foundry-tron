@@ -411,3 +411,109 @@ Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
         );
     }
 );
+
+// Live acceptance gate for the TronScan verification path: deploy a fresh Counter on Nile with
+// `forge create`, then verify it end-to-end through the new `forge verify-contract` TronScan
+// provider. This is the ONLY test that spends TRX, so it is double-gated on `TRON_LIVE=1` AND
+// `TRON_VERIFY_E2E=1` and needs the funded Nile key in `TRON_PRIVATE_KEY`; it is never run in cron.
+// It proves the full round trip our unit tests cannot: multipart submit, the pinned
+// `tron_v0.8.27+commit.19164bed` compiler string being accepted by TronScan, and the `--watch`
+// `/info` re-query reaching `status == 2`. The 0.8.27 compiler string was live-confirmed accepted
+// during implementation (Nile contract `TDKFWYmx4D4makUGMg6kuVvWCjuXnCTJHQ`). `eprintln!` for the
+// skip notice is the sanctioned gated-test pattern, so allow the workspace's disallowed-macro lint.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    live_tron_verify_contract_e2e_on_nile,
+    |prj, cmd| {
+        if std::env::var("TRON_LIVE").is_err() || std::env::var("TRON_VERIFY_E2E").is_err() {
+            eprintln!(
+                "skipped live_tron_verify_contract_e2e_on_nile: set TRON_LIVE=1 AND TRON_VERIFY_E2E=1 (this test spends TRX on Nile) to run the deploy+verify acceptance gate"
+            );
+            return;
+        }
+        let Ok(private_key) = std::env::var("TRON_PRIVATE_KEY") else {
+            eprintln!(
+                "skipped live_tron_verify_contract_e2e_on_nile: TRON_PRIVATE_KEY is not set (funded Nile key required to deploy)"
+            );
+            return;
+        };
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Nile chain id routes verification to nileapi.tronscan.org (mirrors the sandbox's
+            // `chain_id = 3448148188`).
+            config.chain = Some(3_448_148_188u64.into());
+            // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
+            // back to its pinned default (0.8.27); the Counter's `^0.8.13` pragma is satisfied.
+            config.solc = None;
+        });
+
+        // Own the Counter source with its own `^0.8.13` pragma so the harness does not inject
+        // `=SOLC_VERSION` (0.8.35), which has no native tron-solc build.
+        prj.add_source(
+            "Counter.sol",
+            r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+contract Counter {
+    uint256 public number;
+
+    function setNumber(uint256 newNumber) public {
+        number = newNumber;
+    }
+
+    function increment() public {
+        number++;
+    }
+}
+"#,
+        );
+
+        // 1) Deploy a fresh Counter on Nile. `--json` gives us the deployed address to verify.
+        cmd.forge_fuse().args([
+            "create",
+            "src/Counter.sol:Counter",
+            "--rpc-url",
+            "https://api.nileex.io",
+            "--private-key",
+            &private_key,
+            "--broadcast",
+            "--json",
+        ]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "deploy failed\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let deploy: serde_json::Value =
+            serde_json::from_str(&stdout).expect("deploy did not emit JSON");
+        let hex41 = deploy["deployedToHex"].as_str().expect("deployedToHex missing");
+        // Standalone verify-contract parses a 20-byte `0x` address; strip the 0x41 Tron prefix.
+        let address = format!("0x{}", hex41.strip_prefix("41").expect("hex41 prefix"));
+
+        // 2) Verify the freshly deployed contract through the TronScan provider; `--watch` polls
+        //    `/info` until `status == 2`. Success (exit 0 + the confirmation line) is the gate.
+        cmd.forge_fuse().args([
+            "verify-contract",
+            &address,
+            "src/Counter.sol:Counter",
+            "--license-type",
+            "MIT",
+            "--watch",
+        ]);
+        let output = cmd.execute();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "verify failed\nstdout: {}\nstderr: {stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("Contract successfully verified on TronScan"),
+            "expected TronScan verification confirmation\nstderr: {stderr}"
+        );
+    }
+);

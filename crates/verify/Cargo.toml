@@ -19,6 +19,8 @@ foundry-cli.workspace = true
 foundry-common.workspace = true
 foundry-evm.workspace = true
 foundry-evm-networks.workspace = true
+foundry-tron-primitives.workspace = true
+foundry-tron-solc.workspace = true
 serde_json.workspace = true
 alloy-consensus.workspace = true
 alloy-json-abi.workspace = true
@@ -35,7 +37,7 @@ revm.workspace = true
 alloy-evm = { workspace = true, features = ["rpc"] }
 
 clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
-reqwest = { workspace = true, features = ["json"] }
+reqwest = { workspace = true, features = ["json", "multipart"] }
 tokio = { workspace = true, features = ["time"] }
 async-trait.workspace = true
 futures.workspace = true
