@@ -9,6 +9,15 @@
 //! mainnet fork.
 
 use foundry_evm_networks::NetworkConfigs;
+use foundry_tron_solc::{binary_path, default_version};
+
+/// True when the pinned native `tron-solc` binary is cached on this machine
+/// (`~/.foundry-tron/solc/tron-solc-<version>`), so an offline compile-and-run Tron test can build
+/// without a network or a download. Used to gate compile-based Tron tests that must skip cleanly on
+/// a CI box without the sha-pinned binary (rather than weaken the assertions).
+fn tron_solc_cached() -> bool {
+    binary_path(&default_version()).map(|p| p.exists()).unwrap_or(false)
+}
 
 /// Mainnet TronGrid `/jsonrpc` endpoint. It is the only reachable public java-tron `/jsonrpc`
 /// (nileex.io does not mount `/jsonrpc`), so the live fork channel is mainnet-only. All reads
@@ -262,5 +271,143 @@ contract TronForkGuardTest is Test {
 
         cmd.args(["test", "--mt", "test_tron_createselectfork_historical_block_reverts", "-vvv"])
             .assert_success();
+    }
+);
+
+// Offline gas report on the Tron path: `forge test --gas-report` relabels the report to energy
+// (`trace.gas_used` is TVM energy on Tron) and adds a bandwidth (bytes) block estimated from each
+// transaction's protobuf size (`serialized_size(signed tx) + 64`). This compiles the Counter with
+// the native `tron-solc` and runs locally (no fork, no network), so it is gated on the cached
+// compiler and skipped cleanly when it is absent. The deterministic (non-fuzz) test keeps energy
+// and bandwidth reproducible; the bandwidth figures are chain-derived constants for the default
+// `fee_limit` (increment() -> 280, setNumber(uint256) -> 314; deployment from the init code).
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_gas_report_energy_and_bandwidth,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_gas_report_energy_and_bandwidth: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
+            // back to its pinned default; the Counter's `^0.8.13` pragma is satisfied
+            // by tron-solc 0.8.27.
+            config.solc = None;
+            config.gas_reports = vec!["*".to_string()];
+            config.gas_reports_ignore = vec![];
+        });
+
+        // Own the Counter source so the test is self-contained (`forgetest_init!` sets up forge-std
+        // but not the default Counter contracts). Own `^0.8.13` pragma so the harness does not
+        // inject `=SOLC_VERSION` (0.8.35), which has no native tron-solc build.
+        prj.add_source(
+            "Counter.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+contract Counter {
+    uint256 public number;
+
+    function setNumber(uint256 newNumber) public {
+        number = newNumber;
+    }
+
+    function increment() public {
+        number++;
+    }
+}
+"#,
+        );
+
+        // Deterministic, non-fuzz test: fixed calldata and storage transitions keep the energy and
+        // bandwidth numbers reproducible for the snapshot.
+        prj.add_test(
+            "Counter.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import {Test} from "forge-std/Test.sol";
+import {Counter} from "../src/Counter.sol";
+
+contract CounterTest is Test {
+    Counter public counter;
+
+    function setUp() public {
+        counter = new Counter();
+    }
+
+    function test_Increment() public {
+        counter.increment();
+        assertEq(counter.number(), 1);
+    }
+
+    function test_SetNumber() public {
+        counter.setNumber(42);
+        assertEq(counter.number(), 42);
+    }
+}
+"#,
+        );
+
+        // Warm the build cache first so the `--gas-report` snapshots below stay focused on the
+        // report (compilation is skipped and forge-std's compiler warnings do not appear in
+        // stdout).
+        cmd.forge_fuse().args(["build"]).assert_success();
+
+        // Table: the deployment row is relabeled to "Deployment Energy" and gains a "Deployment
+        // Bandwidth" cell (853 bytes for the 555-byte Counter init code), and each function gains a
+        // "Bandwidth {Min,Avg,Median,Max}" block. Energy matches the plan-E golden (read `number()`
+        // 414, write `setNumber`/`increment` ~20438). Deployment Energy is 0 because the local Tron
+        // model does not meter create-frame energy (a pre-existing property of `trace.gas_used` for
+        // creates, unrelated to this report); deployment bandwidth is still exact from the init
+        // code.
+        cmd.forge_fuse().args(["test", "--gas-report"]).assert_success().stdout_eq(str![[r#"
+No files changed, compilation skipped
+
+Ran 2 tests for test/Counter.t.sol:CounterTest
+[PASS] test_Increment() ([GAS])
+[PASS] test_SetNumber() ([GAS])
+Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
+
+╭----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------╮
+| src/Counter.sol:Counter Contract |                 |                      |        |       |         |               |               |                  |               |
++=========================================================================================================================================================================+
+| Deployment Energy                | Deployment Size | Deployment Bandwidth |        |       |         |               |               |                  |               |
+|----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
+|                                0 |             555 |                  853 |        |       |         |               |               |                  |               |
+|----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
+|                                  |                 |                      |        |       |         |               |               |                  |               |
+|----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
+| Function Name                    | Min             | Avg                  | Median | Max   | # Calls | Bandwidth Min | Bandwidth Avg | Bandwidth Median | Bandwidth Max |
+|----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
+| increment                        |           20414 |                20414 |  20414 | 20414 |       1 |           280 |           280 |              280 |           280 |
+|----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
+| number                           |             414 |                  414 |    414 |   414 |       2 |           280 |           280 |              280 |           280 |
+|----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
+| setNumber                        |           20438 |                20438 |  20438 | 20438 |       1 |           314 |           314 |              314 |           314 |
+╰----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------╯
+
+
+Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
+
+"#]]);
+
+        // JSON: `gas` (= energy on Tron) and `size` stay as before; the Tron-only `bandwidth` keys
+        // (deployment scalar + per-function stats) are the only additions, gated by
+        // `skip_serializing_if` so EVM `--gas-report --json` output is unaffected.
+        cmd.forge_fuse().args(["test", "--gas-report", "--json"]).assert_success().stdout_eq(
+            str![[r#"
+[{"contract":"src/Counter.sol:Counter","deployment":{"gas":0,"size":555,"bandwidth":853},"functions":{"increment()":{"calls":1,"min":20414,"mean":20414,"median":20414,"max":20414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"number()":{"calls":2,"min":414,"mean":414,"median":414,"max":414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"setNumber(uint256)":{"calls":1,"min":20438,"mean":20438,"median":20438,"max":20438,"bandwidth":{"min":314,"mean":314,"median":314,"max":314}}}}]
+
+
+"#]],
+        );
     }
 );

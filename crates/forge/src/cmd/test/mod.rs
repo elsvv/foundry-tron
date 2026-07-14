@@ -2801,11 +2801,15 @@ impl TestArgs {
         let mut decoder = builder.build();
 
         let mut gas_report = self.gas_report.then(|| {
-            GasReport::new(
+            let report = GasReport::new(
                 config.gas_reports.clone(),
                 config.gas_reports_ignore.clone(),
                 config.gas_reports_include_tests,
-            )
+            );
+            // On a Tron run, relabel the report to energy and add the bandwidth (bytes) column.
+            // Gated on the run-level network: a per-test network override combined with
+            // `--gas-report` is unsupported (the report is built once for the whole run).
+            if config.networks.is_tron() { report.with_tron(&config.tron) } else { report }
         });
 
         let mut gas_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();

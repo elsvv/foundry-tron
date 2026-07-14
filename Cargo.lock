@@ -4993,6 +4993,7 @@ dependencies = [
  "foundry-test-utils",
  "foundry-tron-primitives",
  "foundry-tron-provider",
+ "foundry-tron-solc",
  "foundry-wallets",
  "globset",
  "indicatif",
