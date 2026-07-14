@@ -68,6 +68,21 @@ anvil --fork-url https://eth.merkle.io
 
 Read the [Foundry Docs][foundry-docs] to learn more.
 
+## Tron support
+
+This fork adds first-class support for the [Tron](https://tron.network) network
+(TVM) while leaving the Ethereum toolchain untouched. Set `network = "tron"` in
+`foundry.toml` and `forge` builds with the native tron-solc, `forge test` runs on
+a faithful `tron-revm` (energy model, java-tron precompiles, Tron CREATE2), and
+`forge create` / `forge script` / `cast` deploy and interact over Tron's protobuf
+API. It also covers read-only mainnet forks, an energy + bandwidth gas report,
+and keyless TronScan verification (`forge verify-contract` / `forge create
+--verify`).
+
+See the [Tron user guide](./docs/tron/USER_GUIDE.md) for the quickstart, the full
+command-coverage matrix, the `[tron]` config reference, and the VM/energy-model
+differences.
+
 ## Contributing
 
 Contributions are welcome and highly appreciated. To get started, check out the [contributing guidelines](./CONTRIBUTING.md).

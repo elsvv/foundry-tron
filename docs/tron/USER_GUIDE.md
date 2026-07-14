@@ -1,0 +1,410 @@
+# Foundry for Tron — User Guide
+
+This is a fork of [Foundry](https://github.com/foundry-rs/foundry) that adds
+first-class support for the [Tron](https://tron.network) network (TVM). It keeps
+the entire Ethereum toolchain intact and adds a Tron execution path that is
+selected explicitly with a single config key: `network = "tron"`.
+
+Everything here is a fork addition. When `network = "tron"` is **not** set,
+`forge`, `cast`, `anvil` and `chisel` behave exactly like upstream Foundry.
+
+- **Tron mainnet** chain id: `728126428` (`0x2b6653dc`)
+- **Tron Nile testnet** chain id: `3448148188` (`0xcd8690dc`)
+
+> This build identifies itself in `forge --version` / `cast --version` with a
+> `tron` marker (e.g. `forge 1.7.2-dev (tron; <sha> <ts>)`), so you can tell a
+> Tron build apart from an upstream one.
+
+---
+
+## Contents
+
+1. [Quickstart](#quickstart)
+2. [Command coverage matrix](#command-coverage-matrix)
+3. [`[tron]` configuration reference](#tron-configuration-reference)
+4. [Address formats](#address-formats)
+5. [The tron-solc compiler](#the-tron-solc-compiler)
+6. [Gas report: energy and bandwidth](#gas-report-energy-and-bandwidth)
+7. [Fork mode (read-only, tip-only)](#fork-mode-read-only-tip-only)
+8. [Contract verification (TronScan)](#contract-verification-tronscan)
+9. [VM and energy-model differences](#vm-and-energy-model-differences)
+10. [Live-test environment gates](#live-test-environment-gates)
+11. [Installing from the fork](#installing-from-the-fork)
+
+---
+
+## Quickstart
+
+A Tron project is an ordinary Foundry project with `network = "tron"` in
+`foundry.toml`. That one key routes builds, tests, deploys and verification
+through the Tron path.
+
+```toml
+# foundry.toml
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+network = "tron"          # <- selects the Tron execution + broadcast path
+chain_id = 728126428      # 728126428 = mainnet, 3448148188 = Nile testnet
+evm_version = "cancun"    # TVM (java-tron 4.8.x) is Cancun-equivalent
+# No `solc` key: forge auto-resolves the native tron-solc compiler (see below).
+
+[rpc_endpoints]
+mainnet = "https://api.trongrid.io"     # /wallet writes; /jsonrpc reads (fork)
+nile    = "https://api.nileex.io"        # Nile testnet, /wallet only (no /jsonrpc)
+```
+
+Then:
+
+```sh
+forge build         # compiles with the native tron-solc, auto-resolved
+forge test          # runs against tron-revm (energy model + TVM precompiles)
+```
+
+A ready-made example project lives in [`sandbox/tron-counter`](../../sandbox/tron-counter)
+(no `forge-std`; it asserts `block.chainid == 728126428` and exercises Cancun
+transient storage). See its `README.md` for a full build/test/deploy
+walkthrough.
+
+Deploying to Nile (the write path goes over the protobuf `/wallet/*` API, not
+`eth_sendRawTransaction`):
+
+```sh
+# Load a funded Nile key (base58 T-address holds test TRX from the faucet).
+export TRON_PRIVATE_KEY=<hex-private-key>
+
+forge create src/Counter.sol:Counter \
+  --rpc-url nile --private-key "$TRON_PRIVATE_KEY" \
+  --tron.fee-limit 400000000 --broadcast
+```
+
+`cast` works the same way once `network = "tron"` is set:
+
+```sh
+cast to-sun 1.5                          # 1500000   (TRX -> SUN)
+cast from-sun 1500000                    # 1.500000  (SUN -> TRX)
+cast tron-address TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t  # convert address forms
+cast balance TX7izXWcmof... --rpc-url nile --ether    # balance in TRX
+cast call <addr> "number()(uint256)" --rpc-url nile   # constant call
+```
+
+---
+
+## Command coverage matrix
+
+Derived from the project status log and the code. "Works" means it is exercised
+by tests and/or confirmed live on Nile/mainnet.
+
+### Works on Tron
+
+| Command | Notes |
+|---|---|
+| `forge build` | Auto-resolves and compiles with the native tron-solc. |
+| `forge test` | Runs on `tron-revm`: faithful energy model, java-tron precompiles, Tron CREATE2, Cancun feature set. |
+| `forge test --gas-report` | Report is relabeled to **energy** and gains **bandwidth** columns (see [Gas report](#gas-report-energy-and-bandwidth)). |
+| `forge test --fork-url <host>/jsonrpc` | Read-only, tip-only, **mainnet only** (see [Fork mode](#fork-mode-read-only-tip-only)). |
+| `forge snapshot`, `forge coverage` | Share the `forge test` execution path; same Tron behavior. |
+| `forge create` | Deploys via `CreateSmartContract`; the contract address is derived locally and cross-checked against the node. |
+| `forge create --verify` | Deploy **and** verify on TronScan in one command (a pre-broadcast preflight validates compiler pin / host / flatten before spending TRX). |
+| `forge script --broadcast` | Replays collected `CreateSmartContract` / `TriggerSmartContract` transactions; artifact keeps the standard Foundry shape plus an optional `tron { ... }` block. |
+| `forge verify-contract` | Standalone TronScan verification (see [Verification](#contract-verification-tronscan)). |
+| `cast to-sun` / `from-sun` / `tron-address` | Offline unit and address converters. |
+| `cast call` / `send` / `balance` | Route through the protobuf `/wallet/*` path; `send --create <bytecode>` deploys; `balance --ether` prints TRX. |
+
+### Explicit error (guarded, not silent)
+
+| Command | Error |
+|---|---|
+| `forge create --unlocked` | `--unlocked is not supported on tron yet` |
+| `forge create --browser` | `--browser is not supported on tron yet` |
+| `forge script --verify` | Not supported on Tron yet (script verification does not map cleanly onto the TronScan provider; use `forge verify-contract` or `forge create --verify` instead). |
+| `forge script --fork-url ...` | Forking a Tron node is rejected under `forge script` (broadcast context); use `forge test --fork-url .../jsonrpc` for a read-only fork. |
+| `forge test/snapshot/coverage --fork-url ... --fork-block-number <N>` | `Tron forks are tip-only: state is served only at the chain tip (/jsonrpc serves state only at TAG latest). Drop --fork-block-number for a tip fork.` |
+| `vm.createFork(url, block)` / `vm.createSelectFork(url, block)` | Same tip-only explanation, as a cheatcode revert. The block-less variants are unaffected. |
+
+### Out of scope
+
+- `anvil` — no local Tron node (Tron is protobuf, not RLP; there is no
+  `eth_sendRawTransaction`).
+- `chisel` — the Solidity REPL is Ethereum-only.
+- The TUI debugger.
+
+---
+
+## `[tron]` configuration reference
+
+The `[tron]` section of `foundry.toml` carries the Tron-specific transaction
+parameters. Values are raw protobuf fields; the defaults below come straight
+from `crates/config/src/tron.rs`.
+
+| Key | Default | Units | Maps to |
+|---|---|---|---|
+| `fee_limit` | `1_000_000_000` (1000 TRX) | SUN | `Transaction.raw_data.fee_limit` — the maximum TRX (in SUN) that may be burned for one transaction. |
+| `origin_energy_limit` | `10_000_000` | energy | `SmartContract` tag 8 — energy the contract owner contributes on deployment. |
+| `user_fee_percentage` | `100` | percent (0–100) | `SmartContract.consume_user_resource_percent` (tag 6) — share of energy paid by the caller. |
+| `expiration` | `60` | seconds | Added to the current time when building a transaction (converted to ms by the sender). |
+
+`1 TRX = 1_000_000 SUN`.
+
+Example:
+
+```toml
+[tron]
+fee_limit = 1000000000
+origin_energy_limit = 10000000
+user_fee_percentage = 100
+expiration = 60
+```
+
+### Per-command overrides
+
+Two of these can be overridden per command without editing `foundry.toml`:
+
+- `--tron.fee-limit <SUN>`
+- `--tron.expiration <SECONDS>`
+
+```sh
+forge create src/Counter.sol:Counter --rpc-url nile \
+  --private-key "$TRON_PRIVATE_KEY" --tron.fee-limit 400000000 --broadcast
+```
+
+---
+
+## Address formats
+
+Every Tron path accepts an address in three interchangeable forms:
+
+- **base58check** — `T...` (the canonical Tron display form)
+- **41-hex** — `41` followed by the 20-byte hex address (Tron's on-chain 21-byte form)
+- **0x-hex** — the plain 20-byte EVM form, `0x...`
+
+When `network = "tron"`, addresses are **printed** in base58 (`T...`). Converters
+and address-taking arguments (including `forge verify-contract <address>` and
+`cast tron-address`) accept all three forms.
+
+---
+
+## The tron-solc compiler
+
+Tron's solc emits TVM-only opcodes (the `0xD0–0xDF` range, e.g. `CALLTOKENID` /
+`CALLTOKENVALUE`) into the non-payable guard of **every** contract. That
+bytecode does not run on a vanilla EVM, and the standard `svm` compiler manager
+cannot fetch or checksum Tron binaries. This fork solves both:
+
+- On `network = "tron"` with no `solc` key, forge auto-resolves the native
+  tron-solc from the `tronprotocol/solidity` GitHub releases into
+  `~/.foundry-tron/solc/tron-solc-<version>`, verifying it against a pinned
+  sha256 the first time (skipped when `offline`). The default version is
+  **0.8.27**; pinned versions are **0.8.25 / 0.8.26 / 0.8.27** for
+  linux-amd64 / macos (universal) / windows-amd64.
+- On Apple Silicon the macOS binary is a universal build — no Rosetta.
+- An explicit `solc = "/abs/path"` still overrides the resolver so you can point
+  at a locally built compiler.
+- `tron-revm` then executes the resulting TVM bytecode, so `forge test` runs the
+  real tron-solc output rather than a vanilla-solc stand-in.
+
+There is no native `linux-arm64` tron-solc release; on Linux ARM (and any other
+non-macOS/Windows/linux-x86_64 target) the resolver returns a clear
+`UnsupportedPlatform` error (build from source or supply an explicit `solc`).
+Apple Silicon is unaffected — macOS aarch64 is served by the universal
+`solc-macos` binary above.
+
+---
+
+## Gas report: energy and bandwidth
+
+Tron meters execution in **energy** (its analogue of EVM gas) and separately
+charges **bandwidth** in bytes for the serialized transaction. On the Tron path,
+`forge test --gas-report` reflects both:
+
+- The `gas` figures are **energy** (`trace.gas_used` is TVM energy under the
+  faithful energy model; the intrinsic cost is bandwidth, not energy, and is
+  zeroed). The deployment row is relabeled **Deployment Energy**, and per-call
+  columns are energy.
+- Each contract gains a **Deployment Bandwidth** cell and each function gains a
+  **Bandwidth Min / Avg / Median / Max** block (bytes).
+
+Bandwidth is an estimate for the transaction this toolchain broadcasts:
+
+```
+bandwidth (bytes) = serialized_size(signed protobuf Transaction, ret cleared) + 64
+```
+
+The `+ 64` is java-tron's `MAX_RESULT_SIZE_IN_TX`; the signature is a fixed 65
+bytes. This has been validated live to the byte (a real mainnet
+`transfer(address,uint256)` → 345 bytes, matching the node's `net_fee` of
+345000 SUN at 1000 SUN/byte). The estimate is exact for transactions built by
+this fork's broadcast path; wallets that populate extra protobuf fields (e.g.
+`ref_block_num`) may differ by a few bytes.
+
+The `--json` output adds these fields only on the Tron path, guarded so that
+EVM `--gas-report --json` output is byte-for-byte unchanged.
+
+`forge snapshot` is unaffected — it parses the `(gas: N)` value from result
+text, which on Tron already carries energy.
+
+---
+
+## Fork mode (read-only, tip-only)
+
+`forge test --fork-url <host>/jsonrpc` with `network = "tron"` forks real Tron
+state into `tron-revm` (the same energy model and precompiles used for local
+tests). Three properties follow from java-tron's `/jsonrpc` servlet:
+
+- **Read-only.** No transaction is broadcast; no TRX is spent.
+- **Mainnet only.** `/jsonrpc` is mounted on `https://api.trongrid.io` but not on
+  `https://api.nileex.io` (Nile serves only `/wallet/*`).
+- **Tip-only.** java-tron serves account/storage/code **only** at the `latest`
+  tag; a pinned block number is rejected. State therefore always reflects the
+  current chain tip.
+
+Because of tip-only state, passing an explicit historical `--fork-block-number`
+would produce a silent mix of pinned block env and tip state. That case is now a
+**hard error**:
+
+```
+Tron forks are tip-only: state is served only at the chain tip
+(/jsonrpc serves state only at TAG latest). Drop --fork-block-number for a tip fork.
+```
+
+The same guard applies to `forge snapshot` / `forge coverage` and to the
+cheatcodes `vm.createFork(url, block)` / `vm.createSelectFork(url, block)`. The
+block-less fork forms (a tip fork) stay green.
+
+Example (read the live mainnet USDT contract on a fork):
+
+```sh
+TRON_LIVE=1 forge test --fork-url https://api.trongrid.io/jsonrpc -vvv
+```
+
+---
+
+## Contract verification (TronScan)
+
+Source verification goes to **TronScan** (Etherscan is Ethereum-only). The
+TronScan verify endpoint is **keyless** and **synchronous** (no API key, no GUID
+polling), and accepts a single **flattened** Solidity file.
+
+Standalone verification:
+
+```sh
+forge verify-contract <address> src/Counter.sol:Counter \
+  --license-type MIT \
+  --watch
+```
+
+- `<address>` accepts `T...`, `41...` or `0x...`.
+- The Tron path is selected by `network = "tron"`; the host is chosen from the
+  chain id (mainnet or Nile), or overridden with `--verifier-url <https://host>`.
+- `--verifier tronscan` selects the provider explicitly if needed.
+- `--watch` polls TronScan's `/info` endpoint until the contract reports
+  `status == 2` (verified).
+
+One-shot deploy + verify:
+
+```sh
+forge create src/Counter.sol:Counter --rpc-url nile \
+  --private-key "$TRON_PRIVATE_KEY" --broadcast \
+  --verify --license-type MIT
+```
+
+### Hosts
+
+| Network | Chain id | API host | Contract page |
+|---|---|---|---|
+| Mainnet | `728126428` | `https://apilist.tronscanapi.com` | `https://tronscan.org/#/contract/<addr>` |
+| Nile | `3448148188` | `https://nileapi.tronscan.org` | `https://nile.tronscan.org/#/contract/<addr>` |
+
+If the chain id cannot be determined, verification asks you to pass
+`--verifier-url` explicitly.
+
+### License codes
+
+`--license-type` accepts either an SPDX name (e.g. `MIT`) or the numeric
+Etherscan license code that TronScan expects. Common codes: **3 = MIT**,
+**12 = Apache-2.0**, **14 = BUSL-1.1**. When omitted, the submission defaults to
+`1` (No License).
+
+### Compiler string
+
+TronScan stores the compiler as `tron_v<solc long version>` (e.g.
+`tron_v0.8.27+commit.19164bed`). The fork resolves the correct long-version
+commit from a pinned table (source: `tronprotocol.github.io/solc-bin`
+`list.json`) because the tron-solc resolver does not exec `--version`.
+
+---
+
+## VM and energy-model differences
+
+`tron-revm` reproduces java-tron 4.8.x semantics on top of a Cancun base. Notable
+differences from a stock EVM, worth knowing when a local result and an on-chain
+result could diverge:
+
+- **Energy model.** Tron uses pre-EIP-150 (FRONTIER) gas as a base plus TVM
+  deltas, applied as a data override on Cancun execution. Refunds are disabled
+  (Tron has none), EIP-150's 63/64 call-gas rule is off, and EIP-3860 per-word
+  init-code metering and the EIP-170 code-size cap are removed. Golden energy
+  parity is confirmed exact against Nile (read `number()` = 414, write
+  `setNumber(7)` = 20438 energy).
+- **CREATE2** uses the Tron formula:
+  `address = keccak256(0x41 ‖ sender20 ‖ salt ‖ keccak256(initcode))[12..]`, and
+  the `computeCreate2Address*` cheatcodes are specialized accordingly.
+- **CREATE (internal)** still uses the EVM address scheme, not Tron's
+  `keccak(rootTxId ‖ nonce)` — the root tx id is not reproducible locally. This
+  is a documented local delta.
+- **Call depth** is EVM's 1024 locally versus Tron's 64 on-chain; a contract that
+  recurses deeper than 64 passes locally but reverts on-chain.
+- **Precompiles** follow java-tron's table: `0x03` is a double-sha256 (not
+  ripemd160), `0x09` / `0x0a` are TIP-43 / TIP-60 signature validators (replacing
+  blake2f / KZG), real ripemd160 and blake2f move to `0x020003` / `0x020009`.
+- **ISCONTRACT (`0xD4`)** is a stub that checks for a non-empty code account;
+  it can differ from java-tron's contract-account check in edge cases (e.g. a
+  self-check inside a constructor).
+- Trace mnemonics for `0xD0–0xD4` still render as unknown opcodes (cosmetic).
+
+Contract addresses for real deploys are computed as
+`keccak256(txID ‖ owner21)[12..]` (java-tron `WalletUtil.generateContractAddress`,
+where `txID = sha256(raw_data)` and `owner21 = 0x41 ‖ owner20`) and hard-checked
+against the address the node reports once mined.
+
+---
+
+## Live-test environment gates
+
+Tests that touch the network are gated behind environment variables and skip
+cleanly (with an explicit message) when unset, so a normal `cargo test` /
+`forge test` run spends no TRX and needs no network:
+
+| Variable | Enables |
+|---|---|
+| `TRON_LIVE=1` | Read-only live tests (mainnet `/jsonrpc` fork, Nile read probes). |
+| `TRON_PRIVATE_KEY` | Write-path live tests (deploy / send). Must be a funded Nile key. |
+| `TRON_PRO_API_KEY` | A TronGrid API key to avoid WAF throttling on `/wallet/*` bursts. |
+| `TRON_VERIFY_E2E=1` | The deploy-and-verify acceptance test (spends TRX; also needs `TRON_LIVE=1` + `TRON_PRIVATE_KEY`). |
+| `TRON_SOLC_DOWNLOAD=1` | The test that actually downloads a tron-solc binary and checks its pin. |
+
+Nile faucet: <https://nileex.io/join/getJoinPage>.
+
+---
+
+## Installing from the fork
+
+`foundryup` is parameterized by `FOUNDRYUP_REPO`, so the standard installer can
+target this fork:
+
+```sh
+FOUNDRYUP_REPO=elsvv/foundry-tron foundryup
+```
+
+Or build from source:
+
+```sh
+git clone https://github.com/elsvv/foundry-tron
+cd foundry-tron
+cargo build --release --bins        # forge, cast, anvil, chisel
+```
+
+A Tron build reports a `tron` marker in its version string
+(`forge --version` / `cast --version`), so you can confirm you are running the
+fork.

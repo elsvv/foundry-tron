@@ -31,10 +31,10 @@ revm / Cancun, chain id 728126428).
 
 > **Update (Plan C2):** the blocker below was closed by the mini `tron-revm`
 > (`TronEvmFactory` with instruction stubs for `0xD0–0xD4`). `forge test` now
-> runs the **real tron-solc bytecode** and passes **4/4**
+> runs the **real tron-solc bytecode** and passes **5/5**
 > (`testIncrement`, `testTronChainId`, `testTransientStorageCancun`,
-> `testNonPayableGuardWithTvmOpcodes`). The original analysis is kept below for
-> the record.
+> `testNonPayableGuardWithTvmOpcodes`, `testCreate2TripleConsistency`). The
+> original analysis is kept below for the record.
 
 `forge test` with the **tron-solc-compiled** bytecode fails with
 `EvmError: OpcodeNotFound`. Root cause: tron-solc injects TVM-only opcodes into
@@ -58,21 +58,28 @@ gate ("forge test 3/3 with tron-solc bytecode"): that gate is **not achievable**
 at the naive stage. Executing tron-solc output requires Stage 2 (`tron-revm`,
 custom instruction table for `0xD0–0xDF`), which is out of Plan C scope.
 
-## Reproduce
+## Walkthrough
+
+`FORGE` points at the forge binary you built from this repo (`cargo build -p
+forge --bin forge` → `target/debug/forge`).
 
 ```bash
-FORGE=/Users/vaceslaveliseev/@dev/foundry-tron/foundry/target/debug/forge
-cd /Users/vaceslaveliseev/@dev/foundry-tron/sandbox/tron-counter
-$FORGE build              # OK: compiles with tron-solc
-$FORGE test  -vv          # FAIL: EvmError: OpcodeNotFound (0xD3 CALLTOKENID)
-
-# Plumbing proof (vanilla solc): edit foundry.toml -> solc = "0.8.27", then:
-$FORGE test  -vv          # 3/3 PASS
+cd sandbox/tron-counter             # from the repo root
+FORGE=../../target/debug/forge      # resolves to <repo>/target/debug/forge from here
+$FORGE build                        # compiles with the real tron-solc (auto-resolved)
+$FORGE test                         # 5/5 PASS on the tron-solc bytecode (mini tron-revm)
 ```
 
-The committed `foundry.toml` has no `solc` key: forge auto-resolves the real
-tron-solc (compiling with it is the point of the sandbox). To see the 3/3
-vanilla-solc plumbing pass instead, add `solc = "0.8.27"` back.
+The committed `foundry.toml` has no `solc` key: on `network = "tron"` forge
+auto-resolves the native tron-solc into `~/.foundry-tron/solc/tron-solc-0.8.27`
+(downloading and sha256-pinning it once if the cache is empty; skipped under
+`offline`). Compiling with the real tron-solc — TVM opcode preamble included —
+is the whole point of the sandbox, and the mini tron-revm (`TronEvmFactory`)
+executes that bytecode so `forge test` passes 5/5. To fall back to vanilla solc
+for a plumbing-only check, add `solc = "0.8.27"` to `foundry.toml`.
+
+See `docs/tron/USER_GUIDE.md` for the full Tron command reference (fork mode,
+gas report, TronScan verification, config keys, address formats).
 
 ## Plan D — `cast` on Tron (offline utilities + Nile deploy/read)
 
@@ -131,7 +138,7 @@ address the node reports once mined (mismatch = hard error).
 cd sandbox/tron-counter
 set -a && source ../../.env.tron-dev && set +a   # loads TRON_PRIVATE_KEY
 
-# forge build (real tron-solc) and forge test (4/4 on tron-solc bytecode).
+# forge build (real tron-solc) and forge test (5/5 on tron-solc bytecode).
 $FORGE build
 $FORGE test
 
