@@ -145,3 +145,122 @@ contract TronUsdtForkTest is Test {
             .assert_success();
     }
 );
+
+// Offline guard: `forge test --fork-url .../jsonrpc --fork-block-number <historical>` on Tron must
+// bail with the tip-only explanation. Tron forks are tip-only (java-tron `/jsonrpc` serves state
+// only at TAG `latest`), so an explicit historical block would silently mix a historical block env
+// with tip-only state. The guard fires before compilation and before the fork is constructed, so
+// this test needs neither the `tron-solc` compiler nor a live endpoint: no `.sol` file is compiled
+// and the URL is never contacted. The `fork` token in the name satisfies the forking-test naming
+// rule.
+forgetest_init!(tron_historical_fork_block_bails, |prj, cmd| {
+    prj.update_config(|config| {
+        config.networks = NetworkConfigs::with_tron();
+        config.solc = None;
+    });
+
+    cmd.args([
+        "test",
+        "--fork-url",
+        "https://api.trongrid.io/jsonrpc",
+        "--fork-block-number",
+        "12345678",
+    ])
+    .assert_failure()
+    .stderr_eq(str![[r#"
+...
+Error: Tron forks are tip-only: state is served only at the chain tip (/jsonrpc serves state only at TAG latest). Drop --fork-block-number for a tip fork.
+
+"#]]);
+});
+
+// Offline guard: `forge coverage --fork-url .../jsonrpc --fork-block-number <historical>` on Tron
+// must bail with the same tip-only explanation as `forge test`. `forge coverage` builds and runs
+// tests through its own path (not `compile_project`), so this exercises the fail-fast guard in
+// `CoverageArgs::run` and the shared backstop in `TestArgs::run_tests`. Like the `forge test` case,
+// the guard fires before compilation and before the fork is constructed, so no `.sol` file is
+// compiled, the `tron-solc` compiler is never invoked, and the URL is never contacted. The `fork`
+// token in the name satisfies the forking-test naming rule.
+forgetest_init!(tron_historical_coverage_fork_block_bails, |prj, cmd| {
+    prj.update_config(|config| {
+        config.networks = NetworkConfigs::with_tron();
+        config.solc = None;
+    });
+
+    cmd.args([
+        "coverage",
+        "--fork-url",
+        "https://api.trongrid.io/jsonrpc",
+        "--fork-block-number",
+        "12345678",
+    ])
+    .assert_failure()
+    .stderr_eq(str![[r#"
+...
+Error: Tron forks are tip-only: state is served only at the chain tip (/jsonrpc serves state only at TAG latest). Drop --fork-block-number for a tip fork.
+
+"#]]);
+});
+
+// Cheatcode guard E2E: `vm.createSelectFork(url, blockNumber)` with an explicit block on Tron must
+// revert with the tip-only explanation, while the block-less `vm.createSelectFork(url)` stays
+// legal. This proves the cheatcode dispatch wiring (that `createSelectFork_1` reads the Tron
+// network flag and reaches the guard), which the crate-level `ensure_tron_tip_only_fork` unit test
+// cannot cover. The guard fires before any network I/O, so no endpoint is contacted
+// (`vm.createSelectFork` never reaches the fork backend). Gated on `TRON_LIVE=1` because compiling
+// the test contract needs the native `tron-solc` compiler; the `fork` token in the name satisfies
+// the forking-test naming rule.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_createselectfork_historical_block_fork_reverts,
+    |prj, cmd| {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!(
+                "skipped tron_createselectfork_historical_block_fork_reverts: set TRON_LIVE=1 to compile with tron-solc and run"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            config.solc = None;
+        });
+
+        prj.add_test(
+            "TronForkGuard.t.sol",
+            r#"
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Own pragma so the harness does not inject `=SOLC_VERSION`, for which no native tron-solc build is
+// pinned; the caret range is satisfied by the resolved tron-solc 0.8.27.
+pragma solidity ^0.8.0;
+
+import "forge-std/Test.sol";
+
+contract TronForkGuardTest is Test {
+    // The cheatcode-variant message from `ensure_tron_tip_only_fork` in fork.rs, prefixed by the
+    // cheatcode name (`vm.createSelectFork: `) that the cheatcode dispatcher prepends to errors.
+    string constant EXPECTED =
+        "vm.createSelectFork: Tron forks are tip-only: state is served only at the chain tip (/jsonrpc serves state only at TAG latest). Drop the block number argument to fork at the tip.";
+
+    // Wrapper so the cheatcode revert unwinds to the try/catch in the test below.
+    function forkAtHistoricalBlock() external {
+        vm.createSelectFork("https://api.trongrid.io/jsonrpc", 12345678);
+    }
+
+    // An explicit historical block through the `createSelectFork_1` cheatcode variant must revert
+    // with the tip-only `CheatcodeError(string)`.
+    function test_tron_createselectfork_historical_block_reverts() public {
+        try this.forkAtHistoricalBlock() {
+            revert("expected createSelectFork with a historical block to bail on tron");
+        } catch (bytes memory err) {
+            assertEq(err, abi.encodeWithSignature("CheatcodeError(string)", EXPECTED));
+        }
+    }
+}
+"#,
+        );
+
+        cmd.args(["test", "--mt", "test_tron_createselectfork_historical_block_reverts", "-vvv"])
+            .assert_success();
+    }
+);

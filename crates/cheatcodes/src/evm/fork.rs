@@ -369,6 +369,7 @@ fn create_fork_request<FEN: FoundryEvmNetwork>(
     url_or_alias: &str,
     block: Option<u64>,
 ) -> Result<CreateFork> {
+    ensure_tron_tip_only_fork(ccx.state.config.evm_opts.networks.is_tron(), block)?;
     persist_caller(ccx);
 
     let rpc_endpoint = ccx.state.config.rpc_endpoint(url_or_alias)?;
@@ -416,6 +417,24 @@ fn check_broadcast<FEN: FoundryEvmNetwork>(state: &Cheatcodes<FEN>) -> Result<()
     } else {
         Err(fmt_err!("cannot select forks during a broadcast"))
     }
+}
+
+/// Rejects an explicit historical `blockNumber` on a Tron fork cheatcode.
+///
+/// Tron forks are tip-only: java-tron's `/jsonrpc` serves account/storage/code only at TAG
+/// `latest`, so pinning a fork to a historical block would pair a historical block environment with
+/// tip-only state and silently return wrong reads. Only the `createFork`/`createSelectFork`
+/// variants that take an explicit block number (`createFork_1` / `createSelectFork_1`) reach this
+/// with `block.is_some()`; the block-less and at-transaction variants pass `None` and stay legal.
+fn ensure_tron_tip_only_fork(is_tron: bool, block: Option<u64>) -> Result<()> {
+    if is_tron && block.is_some() {
+        bail!(
+            "Tron forks are tip-only: state is served only at the chain tip \
+             (/jsonrpc serves state only at TAG latest). \
+             Drop the block number argument to fork at the tip."
+        );
+    }
+    Ok(())
 }
 
 fn transact<FEN: FoundryEvmNetwork>(
@@ -520,5 +539,26 @@ fn convert_to_bytes(token: &DynSolValue) -> DynSolValue {
         }
         DynSolValue::Address(addr) => DynSolValue::Bytes(addr.to_vec()),
         val => val.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_tron_tip_only_fork;
+
+    #[test]
+    fn tron_tip_only_fork_guard() {
+        // An explicit historical block on Tron is rejected with the tip-only explanation.
+        let err = ensure_tron_tip_only_fork(true, Some(123)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("tip-only"), "unexpected message: {msg}");
+        assert!(msg.contains("Drop the block number"), "unexpected message: {msg}");
+
+        // A tip fork (no block number) on Tron is allowed.
+        assert!(ensure_tron_tip_only_fork(true, None).is_ok());
+
+        // Non-Tron networks are unaffected, even with an explicit block number.
+        assert!(ensure_tron_tip_only_fork(false, Some(123)).is_ok());
+        assert!(ensure_tron_tip_only_fork(false, None).is_ok());
     }
 }
