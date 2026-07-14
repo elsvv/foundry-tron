@@ -183,12 +183,10 @@ impl CreateArgs {
     /// cross-checked against the address the node reports once mined.
     ///
     /// Compilation and linking mirror [`run_generic`](Self::run_generic) up to the point a
-    /// transaction would be assembled. Options with no Tron equivalent yet (`--verify`,
-    /// `--unlocked`, `--browser`) are rejected up front rather than silently ignored.
+    /// transaction would be assembled. `--unlocked`/`--browser` have no Tron equivalent yet and are
+    /// rejected up front; `--verify` is supported and routes the deployed contract to the TronScan
+    /// provider after broadcast (with a pre-broadcast preflight, mirroring `run_generic`).
     async fn run_tron(mut self, mut config: Config) -> Result<()> {
-        if self.verify {
-            eyre::bail!("--verify is not supported on tron yet");
-        }
         if self.unlocked {
             eyre::bail!("--unlocked is not supported on tron yet");
         }
@@ -210,7 +208,7 @@ impl CreateArgs {
             project.find_contract_path(&self.contract.name)?
         };
         let output = compile::compile_target(&target_path, &project, shell::is_json())?;
-        let (abi, bin, _id) = find_contract_artifacts(output, &target_path, &self.contract.name)?;
+        let (abi, bin, id) = find_contract_artifacts(output, &target_path, &self.contract.name)?;
 
         let bin = match bin.object {
             BytecodeObject::Bytecode(_) => bin.object,
@@ -252,10 +250,25 @@ impl CreateArgs {
             vec![]
         };
         let mut bytecode = bin.to_vec();
-        if let Some(constructor) = abi.constructor()
+        // Encode the constructor args once: appended to the creation bytecode for the deploy and
+        // reused as the `--verify` `constructorParams` (hex; the TronScan provider strips any
+        // `0x`).
+        let constructor_args = if let Some(constructor) = abi.constructor()
             && !params.is_empty()
         {
-            bytecode.extend_from_slice(&constructor.abi_encode_input(&params)?);
+            let encoded = constructor.abi_encode_input(&params)?;
+            bytecode.extend_from_slice(&encoded);
+            Some(hex::encode(&encoded))
+        } else {
+            None
+        };
+
+        // Validate the verify request before touching the network (mirrors `run_generic`'s
+        // pre-broadcast preflight): a missing tron-solc compiler pin, an unroutable chain, or an
+        // unflattenable source surfaces here, before a deploy would spend TRX.
+        if self.verify {
+            let preflight = self.tron_verify_args(Address::ZERO, &id, constructor_args.clone());
+            preflight.tron_preflight_check(config.clone()).await?;
         }
 
         // Tron `fee_limit`/`expiration` come from the `[tron]` config, overridden by `--tron.*`.
@@ -298,7 +311,64 @@ impl CreateArgs {
             sh_println!("Deployed to: {} ({})", to_base58(addr), to_hex41(addr))?;
             sh_println!("Transaction hash: {}", hex::encode(txid))?;
         }
+
+        // Verify the freshly deployed contract through the TronScan provider. `VerifyArgs::run`
+        // re-enters the Tron branch (`network = "tron"`), so this reuses the same keyless,
+        // synchronous TronScan submit as standalone `forge verify-contract`.
+        if self.verify {
+            sh_status!("Starting contract verification...")?;
+            self.tron_verify_args(addr, &id, constructor_args).run().await?;
+        }
+
         Ok(())
+    }
+
+    /// Builds the [`VerifyArgs`] that verifies this contract on TronScan, mirroring the generic
+    /// `run_generic` construction. `address` is the deployed Tron address (or a placeholder for the
+    /// pre-broadcast preflight, which never reads it); calling [`VerifyArgs::run`] routes to the
+    /// TronScan provider because the project's `network = "tron"`. `--unlocked`/`--browser` stay
+    /// rejected, so only the signer-based deploy reaches here.
+    fn tron_verify_args(
+        &self,
+        address: Address,
+        id: &ArtifactId,
+        constructor_args: Option<String>,
+    ) -> VerifyArgs {
+        let num_of_optimizations = if let Some(optimizer) = self.build.compiler.optimize {
+            optimizer.then(|| self.build.compiler.optimizer_runs.unwrap_or(200))
+        } else {
+            self.build.compiler.optimizer_runs
+        };
+
+        VerifyArgs {
+            address,
+            contract: Some(self.contract.clone()),
+            compiler_version: Some(id.version.to_string()),
+            constructor_args,
+            constructor_args_path: None,
+            no_auto_detect: false,
+            use_solc: None,
+            num_of_optimizations,
+            etherscan: self.eth.etherscan.clone(),
+            rpc: Default::default(),
+            flatten: false,
+            force: false,
+            skip_is_verified_check: true,
+            watch: true,
+            print_submission_result_to_stdout: false,
+            retry: self.retry,
+            libraries: self.build.libraries.clone(),
+            root: None,
+            verifier: self.verifier.clone(),
+            via_ir: self.build.compiler.via_ir,
+            license_type: self.license_type.clone(),
+            evm_version: self.build.compiler.evm_version,
+            show_standard_json_input: self.show_standard_json_input,
+            guess_constructor_args: false,
+            compilation_profile: Some(id.profile.clone()),
+            language: None,
+            creation_transaction_hash: None,
+        }
     }
 
     async fn run_generic<N: Network>(

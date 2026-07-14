@@ -310,6 +310,9 @@ impl VerifierArgs {
 #[derive(Clone, Debug, Parser)]
 pub struct VerifyArgs {
     /// The address of the contract to verify.
+    ///
+    /// Accepts an EVM `0x…` address or a Tron address in base58check (`T…`) or `41…`-hex form.
+    #[arg(value_parser = parse_tron_or_evm_address)]
     pub address: Address,
 
     /// The contract identifier in the form `<path>:<contractname>`.
@@ -504,6 +507,23 @@ fn normalize_license_type(value: &str) -> String {
     }
 
     normalized.trim_matches('-').to_string()
+}
+
+/// Parses a contract address for `forge verify-contract`, accepting both EVM and Tron forms.
+///
+/// The standard EVM parse (`0x…`/bare-hex, EIP-55 checksum) is tried first, so no non-Tron
+/// command's behavior changes. Only when that fails and the input is not `0x`-prefixed does it fall
+/// back to the Tron address codec, which also accepts base58check (`T…`) and `41…`-hex; the 20-byte
+/// result round-trips (the TronScan provider re-derives the base58 form for submission).
+fn parse_tron_or_evm_address(s: &str) -> Result<Address, String> {
+    if let Ok(address) = s.parse::<Address>() {
+        return Ok(address);
+    }
+    if s.starts_with("0x") {
+        // A malformed `0x` value can only be an EVM address; surface alloy's exact error.
+        return s.parse::<Address>().map_err(|e| e.to_string());
+    }
+    foundry_tron_primitives::parse_address(s).map_err(|e| e.to_string())
 }
 
 impl_figment_convert!(VerifyArgs);
@@ -725,6 +745,20 @@ impl VerifyArgs {
             return provider.check(check_args).await;
         }
         Ok(())
+    }
+
+    /// Validates that a Tron verification request can be assembled offline (routable TronScan host,
+    /// pinned tron-solc compiler string, flattenable source) without contacting the network.
+    /// Mirrors the generic pre-broadcast `verify_preflight_check`, letting `forge create
+    /// --verify` fail fast on a misconfigured verify request before it deploys and spends TRX.
+    /// The `address` is not read (a placeholder is fine for the pre-broadcast preflight).
+    pub async fn tron_preflight_check(&self, config: Config) -> Result<()> {
+        let chain_id = config.chain.map(|c| c.id());
+        let verifier_url = self.verifier.verifier_url.clone();
+        let hosts = resolve_tronscan_hosts(chain_id, verifier_url.as_deref())?;
+        let context = self.resolve_tron_context(config)?;
+        let mut provider = TronscanVerificationProvider::new(hosts);
+        provider.preflight_verify_check(self.clone(), context).await
     }
 
     /// Resolves a [`VerificationContext`] for the Tron path.
@@ -1165,6 +1199,50 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("unsupported Etherscan license type"));
+    }
+
+    #[test]
+    fn verify_address_accepts_evm_and_tron_forms() {
+        // Tron mainnet USDT, 0x41 prefix stripped to the 20-byte EVM form. The (base58, 41-hex,
+        // 0x-hex) triple all resolve to the same address, so `verify-contract` no longer forces the
+        // caller to hand-strip the 0x41 Tron prefix into a `0x` address.
+        let expected = alloy_primitives::address!("a614f803b6fd780986a42c78ec9c7f77e6ded13c");
+        assert_eq!(
+            parse_tron_or_evm_address("0xa614f803b6fd780986a42c78ec9c7f77e6ded13c").unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_tron_or_evm_address("41a614f803b6fd780986a42c78ec9c7f77e6ded13c").unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_tron_or_evm_address("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn verify_address_rejects_malformed_and_preserves_0x_path() {
+        // A malformed `0x` value stays on alloy's error path (never reinterpreted as Tron).
+        assert!(parse_tron_or_evm_address("0x1234").is_err());
+        // Neither an EVM nor a Tron address.
+        assert!(parse_tron_or_evm_address("not-an-address").is_err());
+        // A base58 address with a corrupted checksum is rejected by the Tron codec.
+        assert!(parse_tron_or_evm_address("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6u").is_err());
+    }
+
+    #[test]
+    fn verify_contract_parses_tron_base58_address_arg() {
+        // The positional address arg accepts a Tron base58 address end-to-end through clap.
+        let args: VerifyArgs = VerifyArgs::parse_from([
+            "foundry-cli",
+            "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+            "src/Counter.sol:Counter",
+        ]);
+        assert_eq!(
+            args.address,
+            alloy_primitives::address!("a614f803b6fd780986a42c78ec9c7f77e6ded13c")
+        );
     }
 
     #[test]

@@ -412,6 +412,87 @@ Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
     }
 );
 
+// Offline: `forge create --verify` on Tron no longer bails at argument validation. Before plan H
+// (task H4) the Tron path rejected `--verify` up front ("--verify is not supported on tron yet").
+// It now assembles a `VerifyArgs` and routes the deployed contract to the TronScan provider, with a
+// pre-broadcast preflight (pinned tron-solc compiler string, routable TronScan host, flattenable
+// source) that mirrors the generic `forge create` path. This test drives the dry run (no
+// `--broadcast`, so no network and no TRX): the preflight must pass offline and the command must
+// reach the dry-run output instead of the removed bail. Compiling and flattening the Counter needs
+// the native `tron-solc`, so it is gated on the cached compiler and skipped cleanly when absent.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_create_verify_preflight_no_longer_bails,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_create_verify_preflight_no_longer_bails: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Nile chain id routes the verify preflight to nileapi.tronscan.org (mirrors the
+            // sandbox's `chain_id = 3448148188`). Without it the preflight would (correctly) demand
+            // `--verifier-url`; setting it exercises the real host-routing path offline.
+            config.chain = Some(3_448_148_188u64.into());
+            // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
+            // back to its pinned default (0.8.27); the Counter's `^0.8.13` pragma is satisfied.
+            config.solc = None;
+        });
+
+        // Own the Counter source with its own `^0.8.13` pragma so the harness does not inject
+        // `=SOLC_VERSION` (0.8.35), which has no native tron-solc build.
+        prj.add_source(
+            "Counter.sol",
+            r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+contract Counter {
+    uint256 public number;
+
+    function setNumber(uint256 newNumber) public {
+        number = newNumber;
+    }
+
+    function increment() public {
+        number++;
+    }
+}
+"#,
+        );
+
+        // Dry run (no `--broadcast`): compiles, runs the TronScan verify preflight, then prints the
+        // dry-run output. No signer, RPC, or TRX involved.
+        cmd.forge_fuse().args([
+            "create",
+            "src/Counter.sol:Counter",
+            "--verify",
+            "--license-type",
+            "MIT",
+        ]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "forge create --verify dry run failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The stage-1 rejection is gone: `--verify` is honored, not bailed at arg validation.
+        assert!(
+            !stderr.contains("--verify is not supported"),
+            "forge create --verify must no longer bail on tron\nstderr: {stderr}"
+        );
+        // The preflight passed and the command reached the dry-run stop-before-network output.
+        assert!(
+            stderr.contains("Dry run enabled"),
+            "expected the dry-run banner after a passing verify preflight\nstderr: {stderr}"
+        );
+    }
+);
+
 // Live acceptance gate for the TronScan verification path: deploy a fresh Counter on Nile with
 // `forge create`, then verify it end-to-end through the new `forge verify-contract` TronScan
 // provider. This is the ONLY test that spends TRX, so it is double-gated on `TRON_LIVE=1` AND
@@ -490,15 +571,15 @@ contract Counter {
         );
         let deploy: serde_json::Value =
             serde_json::from_str(&stdout).expect("deploy did not emit JSON");
-        let hex41 = deploy["deployedToHex"].as_str().expect("deployedToHex missing");
-        // Standalone verify-contract parses a 20-byte `0x` address; strip the 0x41 Tron prefix.
-        let address = format!("0x{}", hex41.strip_prefix("41").expect("hex41 prefix"));
+        // `verify-contract` accepts a Tron address in `41…`-hex (or base58 `T…`) form directly
+        // (plan H, H4) — no manual 0x41 stripping. `deployedToHex` is exactly the `41…` form.
+        let address = deploy["deployedToHex"].as_str().expect("deployedToHex missing");
 
         // 2) Verify the freshly deployed contract through the TronScan provider; `--watch` polls
         //    `/info` until `status == 2`. Success (exit 0 + the confirmation line) is the gate.
         cmd.forge_fuse().args([
             "verify-contract",
-            &address,
+            address,
             "src/Counter.sol:Counter",
             "--license-type",
             "MIT",

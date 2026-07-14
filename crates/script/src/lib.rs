@@ -405,6 +405,20 @@ impl ScriptArgs {
         // `eth_sendRawTransaction`. On-chain fork simulation (phase 2) needs full `eth_*` and is
         // skipped by forcing `skip_simulation`.
         if evm_opts.networks.is_tron() {
+            // `forge script --verify` is not wired to the TronScan provider yet. Unlike `forge
+            // create`, script verification runs through the etherscan-centric `verify_contracts`/
+            // `VerifyBundle` flow (gated on an Etherscan key, never calling `broadcasted.verify()`
+            // on the Tron branch), which does not route to the Tron provider the way `forge create`
+            // and `forge verify-contract` do. Bail with a precise reason rather than silently
+            // broadcasting without verifying; the follow-up is tracked in docs/tron/STATUS.md.
+            if self.verify {
+                eyre::bail!(
+                    "--verify is not supported under `forge script` on tron yet; broadcast without \
+                     --verify, then verify each deployed contract with `forge verify-contract \
+                     <address> <path>:<name>` (or deploy with `forge create --verify`) — both \
+                     route to the TronScan provider"
+                );
+            }
             let mut this = self;
             this.skip_simulation = true;
             return Box::pin(async move {
