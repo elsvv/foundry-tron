@@ -288,26 +288,53 @@ impl<FEN: FoundryEvmNetwork> FilledTransactionsState<FEN> {
         let mut manager = ProvidersManager::<FEN::Network>::default();
         let mut sequences = vec![];
 
+        // Tron reads its chain id from the node's `/jsonrpc` endpoint (the wallet base used for
+        // broadcast does not serve `eth_chainId`); every other network reads it via `eth_chainId`
+        // through the alloy provider inside `get_or_init_provider`. Tron always forces
+        // `skip_simulation`, so the per-rpc gas estimation below never runs for it.
+        let tron_chain = if self.script_config.evm_opts.networks.is_tron() {
+            let rpc = self
+                .transactions
+                .front()
+                .map(|tx| tx.rpc.clone())
+                .filter(|rpc| !rpc.is_empty())
+                .ok_or_else(|| {
+                    eyre::eyre!("tron broadcast requires an rpc endpoint (--rpc-url)")
+                })?;
+            Some(crate::tron::tron_chain_id(&rpc).await?)
+        } else {
+            None
+        };
+
         // Peeking is used to check if the next rpc url is different. If so, it creates a
         // [`ScriptSequence`] from all the collected transactions up to this point.
         let mut txes_iter = mem::take(&mut self.transactions).into_iter().peekable();
 
         while let Some(mut tx) = txes_iter.next() {
             let tx_rpc = tx.rpc.clone();
-            let provider_info = manager
-                .get_or_init_provider(
-                    &tx.rpc,
-                    self.args.legacy,
-                    self.script_config.config.eip1559_fee_estimate,
-                )
-                .await?;
+            let chain = match tron_chain {
+                Some(chain) => chain,
+                None => {
+                    manager
+                        .get_or_init_provider(
+                            &tx.rpc,
+                            self.args.legacy,
+                            self.script_config.config.eip1559_fee_estimate,
+                        )
+                        .await?
+                        .chain
+                }
+            };
 
             if let Some(tx) = tx.tx_mut().as_unsigned_mut() {
                 // Handles chain specific requirements for unsigned transactions.
-                tx.set_chain_id(provider_info.chain);
+                tx.set_chain_id(chain);
             }
 
             if !self.args.skip_simulation {
+                // Only reached for non-Tron networks (Tron forces `skip_simulation`), so the
+                // provider is already cached in `manager` from the call above.
+                let provider_info = manager.get(&tx_rpc).expect("provider is set");
                 let tx = tx.tx_mut();
 
                 if has_different_gas_calc(provider_info.chain) {
@@ -355,8 +382,7 @@ impl<FEN: FoundryEvmNetwork> FilledTransactionsState<FEN> {
                 continue;
             }
 
-            let sequence =
-                self.create_sequence(is_multi_deployment, provider_info.chain, new_sequence)?;
+            let sequence = self.create_sequence(is_multi_deployment, chain, new_sequence)?;
 
             sequences.push(sequence);
 

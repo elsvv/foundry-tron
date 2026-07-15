@@ -36,14 +36,22 @@ pub mod eth;
 #[cfg(feature = "optimism")]
 pub mod op;
 pub mod tempo;
+pub mod tron;
 
 pub use eth::*;
 #[cfg(feature = "optimism")]
 pub use op::*;
 pub use tempo::*;
+pub use tron::*;
 
 /// Foundry's supertrait associating [Network] with [FoundryEvmFactory]
 pub trait FoundryEvmNetwork: Copy + Debug + Default + 'static {
+    /// Whether this network runs the Tron EVM (TVM opcodes, TVM energy model,
+    /// and the Tron CREATE2 address scheme). Lets network-agnostic code such as
+    /// the `computeCreate2Address` cheatcode pick the Tron-specific behavior at
+    /// compile time without threading a runtime network handle.
+    const IS_TRON: bool = false;
+
     type Network: Network<
             TxEnvelope: Decodable
                             + SignerRecoverable
@@ -65,6 +73,17 @@ pub struct EthEvmNetwork;
 impl FoundryEvmNetwork for EthEvmNetwork {
     type Network = Ethereum;
     type EvmFactory = EthEvmFactory;
+}
+
+/// Tron network marker. Executes on [`TronEvmFactory`]: vanilla revm plus the TVM opcodes
+/// 0xD0-0xD4 that tron-solc emits (TRC-10 guard). Chain id and compiler come from config.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TronEvmNetwork;
+impl FoundryEvmNetwork for TronEvmNetwork {
+    const IS_TRON: bool = true;
+
+    type Network = Ethereum;
+    type EvmFactory = TronEvmFactory;
 }
 
 #[derive(Clone, Copy, Debug, Default)]

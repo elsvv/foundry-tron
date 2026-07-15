@@ -1,0 +1,92 @@
+# Live Tron tests against real java-tron endpoints. Kept in its own workflow so a
+# trongrid hiccup can never red the PR tree (it does not run on push/pull_request).
+# The scheduled job is keyless and read-only; the manual golden job spends Nile TRX
+# and is opt-in only.
+
+name: tron-live
+
+permissions: {}
+
+on:
+  schedule:
+    # Weekly, Mondays at 06:00 UTC (offset from the daily crate-checks/test-flaky crons).
+    - cron: "0 6 * * 1"
+  workflow_dispatch: # Manual trigger, also the only way to run the golden job below.
+
+concurrency:
+  group: tron-live-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+
+jobs:
+  # Keyless, read-only, mainnet-only. Runs on the weekly cron and on manual dispatch.
+  # `tron_mainnet_fork_reads_usdt` forks Tron mainnet over the public `/jsonrpc`
+  # endpoint and asserts USDT constants plus the Tron energy model — no key, no TRX.
+  # The native tron-solc compiler auto-resolves (downloads on the empty CI cache).
+  fork-reads:
+    name: keyless mainnet fork reads
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      TRON_LIVE: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2.82.6
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Live mainnet fork reads (keyless, read-only)
+        shell: bash
+        run: cargo nextest run --locked -p forge -E 'test(tron_mainnet_fork_reads_usdt)'
+
+  # Full Nile golden set. Deploys fresh contracts and spends test TRX on every run,
+  # so it is manual-only (`workflow_dispatch`) and never on the weekly cron.
+  #
+  # Requires two repository secrets:
+  #   TRON_PRIVATE_KEY  a funded Nile key — each run deploys a fresh Counter and
+  #                     sends TRX, draining the faucet balance; top it up at
+  #                     https://nileex.io/join/getJoinPage when it runs low.
+  #   TRON_PRO_API_KEY  a TronGrid Pro key so the WAF does not rate-limit the
+  #                     `/wallet/*` bursts these tests make.
+  #
+  # The verify-contract acceptance E2E (`live_tron_verify_contract_e2e_on_nile`)
+  # stays skipped here on purpose: it is double-gated on TRON_VERIFY_E2E, which this
+  # job deliberately does not set — it is a one-time acceptance gate, not a recurring
+  # golden.
+  golden:
+    name: full golden (manual, spends Nile TRX)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TRON_LIVE: "1"
+      TRON_PRIVATE_KEY: ${{ secrets.TRON_PRIVATE_KEY }}
+      TRON_PRO_API_KEY: ${{ secrets.TRON_PRO_API_KEY }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+      - uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6 # v2.82.6
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Live Nile goldens (spends TRX)
+        shell: bash
+        run: cargo nextest run --locked -p foundry-tron-provider -E 'test(live_)'

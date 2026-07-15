@@ -6,6 +6,7 @@ use crate::{
     traces::TraceKind,
     tx::{CastTxBuilder, SenderKind},
 };
+use alloy_dyn_abi::FunctionExt;
 use alloy_ens::NameOrAddress;
 use alloy_network::{Network, NetworkTransactionBuilder, TransactionBuilder};
 use alloy_primitives::{
@@ -22,7 +23,7 @@ use alloy_rpc_types::{
     },
 };
 use clap::Parser;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use foundry_cli::{
     opts::{ChainValueParser, RpcOpts, TransactionOpts},
     utils::{LoadConfig, TraceResult, parse_ether_value},
@@ -85,7 +86,7 @@ static OVERRIDE_PATTERN: LazyLock<Regex> =
 #[derive(Debug, Parser)]
 pub struct CallArgs {
     /// The destination of the transaction.
-    #[arg(value_parser = NameOrAddress::from_str)]
+    #[arg(value_parser = crate::tron::parse_name_or_tron_address)]
     to: Option<NameOrAddress>,
 
     /// The signature of the function to call.
@@ -249,6 +250,13 @@ impl CallArgs {
 
         if self.tx.tempo.is_tempo() {
             return self.run_with_network::<TempoEvmNetwork>().await;
+        }
+
+        // Tron is config-file / `--network`-driven and cannot use the eth provider path;
+        // constant calls go through `/wallet/triggerconstantcontract`.
+        let tron_config = self.rpc.load_config()?;
+        if tron_config.networks.is_tron() {
+            return self.run_tron(tron_config).await;
         }
 
         let figment = self.rpc.clone().into_figment(self.with_local_artifacts).merge(&self);
@@ -568,6 +576,55 @@ impl CallArgs {
 
         sh_println!("{}", response)?;
 
+        Ok(())
+    }
+
+    /// Runs a Tron constant (read-only) call through the wallet HTTP API.
+    ///
+    /// The calldata is ABI-encoded exactly as on the eth path (selector + args, or
+    /// raw `--data`); the caller (`--from`, or the zero address) and destination are
+    /// parsed as Tron addresses. Local-execution flags (`--trace`, `--debug`,
+    /// `--debug-trace-call`) have no Tron equivalent yet and are rejected.
+    async fn run_tron(self, config: Config) -> Result<()> {
+        if self.trace || self.debug || self.debug_trace_call {
+            eyre::bail!("--trace / --debug / --debug-trace-call are not supported on tron yet");
+        }
+
+        let to = self.to.ok_or_else(|| {
+            eyre::eyre!("a destination contract address is required for a tron call")
+        })?;
+        let contract = crate::tron::parse_tron_address(&crate::tron::name_or_address_str(&to))?;
+        let owner = self.wallet.from.unwrap_or(Address::ZERO);
+
+        let sig = self.data.as_deref().or(self.sig.as_deref());
+        let (data, func) = crate::tron::encode_calldata(sig, &self.args)?;
+
+        let provider = crate::tron::tron_provider(&config)?;
+        let result = provider.trigger_constant(owner, contract, &data).await?;
+        if !result.success {
+            eyre::bail!("tron constant call reverted");
+        }
+
+        // Decode with the parsed function (matching `cast call`'s eth output), or fall
+        // back to raw hex when only calldata was given.
+        let out = match func {
+            Some(func) => {
+                let decoded = func.abi_decode_output(&result.result).wrap_err(
+                    "could not decode output; did you specify the wrong function return data type?",
+                )?;
+                if decoded.is_empty() {
+                    hex::encode_prefixed(&result.result)
+                } else {
+                    decoded
+                        .iter()
+                        .map(foundry_common::fmt::format_token)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }
+            }
+            None => hex::encode_prefixed(&result.result),
+        };
+        sh_println!("{out}")?;
         Ok(())
     }
 

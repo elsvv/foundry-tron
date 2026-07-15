@@ -1966,6 +1966,42 @@ casttest!(to_base, |_prj, cmd| {
     }
 });
 
+// tests the Tron offline utilities: `to-sun`, `from-sun` and `tron-address`.
+casttest!(tron_offline_utils, |_prj, cmd| {
+    cmd.cast_fuse().args(["to-sun", "1.5"]).assert_success().stdout_eq(str![[r#"
+1500000
+
+"#]]);
+
+    cmd.cast_fuse().args(["from-sun", "1500000"]).assert_success().stdout_eq(str![[r#"
+1.500000
+
+"#]]);
+
+    // All three address forms round-trip to the same underlying 20-byte address.
+    let expected = str![[r#"
+Base58:  TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t
+Hex(41): 41a614f803b6fd780986a42c78ec9c7f77e6ded13c
+0x:      0xa614f803b6fd780986a42c78ec9c7f77e6ded13c
+
+"#]];
+    cmd.cast_fuse()
+        .args(["tron-address", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"])
+        .assert_success()
+        .stdout_eq(expected.clone());
+    cmd.cast_fuse()
+        .args(["tron-address", "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"])
+        .assert_success()
+        .stdout_eq(expected.clone());
+    cmd.cast_fuse()
+        .args(["tron-address", "0xa614f803b6fd780986a42c78ec9c7f77e6ded13c"])
+        .assert_success()
+        .stdout_eq(expected);
+
+    // A bad base58 checksum is a hard error.
+    cmd.cast_fuse().args(["tron-address", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6u"]).assert_failure();
+});
+
 // tests that revert reason is only present if transaction has reverted.
 
 casttest!(receipt_revert_reason, |_prj, cmd| {

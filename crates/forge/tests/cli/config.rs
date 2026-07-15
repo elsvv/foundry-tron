@@ -296,6 +296,12 @@ out = "utils/JsonBindings.sol"
 include = []
 exclude = []
 
+[tron]
+fee_limit = 1000000000
+origin_energy_limit = 10000000
+user_fee_percentage = 100
+expiration = 60
+
 "#;
 
 // tests all config values that are in use
@@ -486,6 +492,7 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         experimental: false,
         via_ssa_cfg: false,
         networks: Default::default(),
+        tron: Default::default(),
         transaction_timeout: 120,
         additional_compiler_profiles: Default::default(),
         compilation_restrictions: Default::default(),
@@ -1716,6 +1723,12 @@ forgetest_init!(test_default_config, |prj, cmd| {
   "network": null,
   "celo": false,
   "bypass_prevrandao": false,
+  "tron": {
+    "fee_limit": 1000000000,
+    "origin_energy_limit": 10000000,
+    "user_fee_percentage": 100,
+    "expiration": 60
+  },
   "transaction_timeout": 120,
   "additional_compiler_profiles": [],
   "compilation_restrictions": [],

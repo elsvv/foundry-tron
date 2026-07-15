@@ -32,6 +32,8 @@ foundry-evm.workspace = true
 foundry-evm-networks.workspace = true
 foundry-evm-symbolic.workspace = true
 foundry-linking.workspace = true
+foundry-tron-primitives.workspace = true
+foundry-tron-provider.workspace = true
 
 comfy-table.workspace = true
 eyre.workspace = true
@@ -108,6 +110,7 @@ alloy-hardforks.workspace = true
 anvil.workspace = true
 forge-script-sequence.workspace = true
 foundry-test-utils.workspace = true
+foundry-tron-solc.workspace = true
 
 mockall = "0.15"
 globset = "0.4"

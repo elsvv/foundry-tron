@@ -21,3 +21,4 @@ _
 .vite
 .wrangler
 *.zip
+.env.tron-dev

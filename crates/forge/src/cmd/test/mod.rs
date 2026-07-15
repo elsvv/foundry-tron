@@ -62,7 +62,8 @@ use foundry_debugger::{Debugger, DebuggerLayout};
 use foundry_evm::core::evm::OpEvmNetwork;
 use foundry_evm::{
     core::evm::{
-        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor,
+        BlockEnvFor, EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TronEvmNetwork,
+        TxEnvFor,
     },
     executors::ShowmapDomain,
     fuzz::{BasicTxDetails, CounterExample},
@@ -262,12 +263,44 @@ fn count_fuzz_minimize_targets<FEN: FoundryEvmNetwork>(
 #[derive(Clone, Copy)]
 enum NetworkDispatchKind {
     Tempo,
+    Tron,
     #[cfg(feature = "optimism")]
     Optimism,
     Eth,
 }
 
+/// Rejects an explicit historical `--fork-block-number` when forking Tron.
+///
+/// Tron forks are tip-only: java-tron's `/jsonrpc` serves account/storage/code only at TAG
+/// `latest`, so pinning a fork to a historical block would pair a historical block environment with
+/// tip-only state and silently return wrong reads. This is keyed on the *raw* user value in
+/// [`EvmOpts::fork_block_number`]; [`EvmOpts::get_fork`] later auto-pins that field to the fetched
+/// tip, so the guard must run before the fork is constructed.
+///
+/// `TestArgs::run_tests` is the single choke point every test-executing command funnels through
+/// (`forge test`, `forge snapshot`, and `forge coverage`), and it calls this guard before
+/// [`EvmOpts::infer_network_from_fork`] — before the fork is constructed or the endpoint is
+/// contacted — so no such command can silently mix a historical block env with tip-only state.
+/// The per-command build paths (`TestArgs::compile_project`,
+/// `TestArgs::compile_and_run_brutalized`, and `CoverageArgs::run`) call it a second time up front
+/// purely as a fail-fast optimization, so the error surfaces immediately without invoking the
+/// `tron-solc` compiler.
+pub(crate) fn ensure_tron_fork_is_tip_only(evm_opts: &EvmOpts) -> Result<()> {
+    if evm_opts.networks.is_tron() && evm_opts.fork_block_number.is_some() {
+        bail!(
+            "Tron forks are tip-only: state is served only at the chain tip \
+             (/jsonrpc serves state only at TAG latest). \
+             Drop --fork-block-number for a tip fork."
+        );
+    }
+    Ok(())
+}
+
 const fn network_dispatch_kind(evm_opts: &EvmOpts) -> NetworkDispatchKind {
+    if evm_opts.networks.is_tron() {
+        return NetworkDispatchKind::Tron;
+    }
+
     if evm_opts.networks.is_tempo() {
         return NetworkDispatchKind::Tempo;
     }
@@ -1553,6 +1586,9 @@ impl TestArgs {
     async fn compile_and_run_brutalized(&mut self) -> Result<TestOutcome> {
         let (mut config, evm_opts) = self.load_config_and_evm_opts()?;
 
+        // Reject an explicit historical `--fork-block-number` on Tron up front (tip-only forks).
+        ensure_tron_fork_is_tip_only(&evm_opts)?;
+
         if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
         {
             config = self.load_config()?;
@@ -1631,6 +1667,10 @@ impl TestArgs {
 
         // Merge all configs.
         let (mut config, evm_opts) = self.load_config_and_evm_opts()?;
+
+        // Reject an explicit historical `--fork-block-number` on Tron before any dependency
+        // install, compilation, or fork construction (Tron forks are tip-only).
+        ensure_tron_fork_is_tip_only(&evm_opts)?;
 
         if install::install_missing_dependencies(&mut config).await && config.auto_detect_remappings
         {
@@ -1902,6 +1942,13 @@ impl TestArgs {
         } else {
             InternalTraceMode::None
         };
+
+        // Reject an explicit historical `--fork-block-number` on Tron at the shared choke point
+        // every test-executing command reaches (`forge test`, `forge snapshot`, `forge
+        // coverage`). This runs before `infer_network_from_fork` so it bails before the
+        // fork is constructed or the endpoint is contacted, keyed on the raw user value
+        // before `get_fork` auto-pins it.
+        ensure_tron_fork_is_tip_only(&evm_opts)?;
 
         // Auto-detect network from fork chain ID when not explicitly configured.
         evm_opts.infer_network_from_fork().await;
@@ -2498,6 +2545,12 @@ impl TestArgs {
                 )
                 .await
             }
+            NetworkDispatchKind::Tron => {
+                self.build_and_run_tests::<TronEvmNetwork>(
+                    config, evm_opts, output, filter, execution,
+                )
+                .await
+            }
             #[cfg(feature = "optimism")]
             NetworkDispatchKind::Optimism => {
                 self.build_and_run_tests::<OpEvmNetwork>(
@@ -2526,6 +2579,10 @@ impl TestArgs {
         match network_dispatch_kind(dispatch_opts) {
             NetworkDispatchKind::Tempo => self
                 .build_fuzz_minimize_runner::<TempoEvmNetwork>(config, evm_opts, output, options)
+                .await
+                .map(|runner| fuzz_minimize_replay(runner, filter)),
+            NetworkDispatchKind::Tron => self
+                .build_fuzz_minimize_runner::<TronEvmNetwork>(config, evm_opts, output, options)
                 .await
                 .map(|runner| fuzz_minimize_replay(runner, filter)),
             #[cfg(feature = "optimism")]
@@ -2744,11 +2801,15 @@ impl TestArgs {
         let mut decoder = builder.build();
 
         let mut gas_report = self.gas_report.then(|| {
-            GasReport::new(
+            let report = GasReport::new(
                 config.gas_reports.clone(),
                 config.gas_reports_ignore.clone(),
                 config.gas_reports_include_tests,
-            )
+            );
+            // On a Tron run, relabel the report to energy and add the bandwidth (bytes) column.
+            // Gated on the run-level network: a per-test network override combined with
+            // `--gas-report` is unsupported (the report is built once for the whole run).
+            if config.networks.is_tron() { report.with_tron(&config.tron) } else { report }
         });
 
         let mut gas_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();

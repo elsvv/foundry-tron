@@ -39,7 +39,9 @@ use foundry_evm::{
     constants::DEFAULT_CREATE2_DEPLOYER,
     core::{
         FoundryBlock as _, FoundryTransaction as _,
-        evm::{EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TxEnvFor},
+        evm::{
+            EthEvmNetwork, FoundryEvmNetwork, SpecFor, TempoEvmNetwork, TronEvmNetwork, TxEnvFor,
+        },
     },
     executors::EvmError,
 };
@@ -181,6 +183,10 @@ impl VerifyBytecodeArgs {
             }
             NetworkVariant::Tempo => {
                 self.run_with_network_and_config::<TempoEvmNetwork>(config).await
+            }
+            NetworkVariant::Tron => {
+                // Tron executes on revm plus the TVM opcodes 0xD0-0xD4 emitted by tron-solc.
+                self.run_with_network_and_config::<TronEvmNetwork>(config).await
             }
         }
     }

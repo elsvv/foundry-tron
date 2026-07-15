@@ -144,6 +144,7 @@ impl FromStr for VerificationProviderType {
             "b" | "blockscout" => Ok(Self::Blockscout),
             "o" | "oklink" => Ok(Self::Oklink),
             "c" | "custom" => Ok(Self::Custom),
+            "t" | "tronscan" => Ok(Self::Tronscan),
             _ => Err(format!("Unknown provider: {s}")),
         }
     }
@@ -167,6 +168,9 @@ impl fmt::Display for VerificationProviderType {
             Self::Custom => {
                 write!(f, "custom")?;
             }
+            Self::Tronscan => {
+                write!(f, "tronscan")?;
+            }
         };
         Ok(())
     }
@@ -181,6 +185,11 @@ pub enum VerificationProviderType {
     Oklink,
     /// Custom verification provider, requires compatibility with the Etherscan API.
     Custom,
+    /// TronScan verification provider for Tron networks (`network = "tron"`).
+    ///
+    /// Selected automatically on the Tron path (see `VerifyArgs::run`); it cannot be used on
+    /// non-Tron chains because its host routing and compiler-string form are Tron-specific.
+    Tronscan,
 }
 
 impl VerificationProviderType {
@@ -197,6 +206,16 @@ impl VerificationProviderType {
         is_explicit: bool,
     ) -> Result<Box<dyn VerificationProvider>> {
         let has_key = key.is_some_and(|k| !k.is_empty());
+
+        // 0. TronScan is selected automatically on the Tron path (`VerifyArgs::run` branches on
+        //    `config.networks.is_tron()` before this factory is reached). Reaching here means the
+        //    user asked for `--verifier tronscan` on a non-Tron project, which is unsupported.
+        if matches!(self, Self::Tronscan) {
+            eyre::bail!(
+                "TronScan verification is selected automatically for Tron networks \
+                 (`network = \"tron\"` in foundry.toml); it cannot be used on non-Tron chains."
+            )
+        }
 
         // 1. Explicit `--verifier sourcify` always wins over ETHERSCAN_API_KEY.
         if is_explicit && self.is_sourcify() {

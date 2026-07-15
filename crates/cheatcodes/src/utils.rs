@@ -8,7 +8,10 @@ use alloy_rlp::{Decodable, Encodable};
 use alloy_sol_types::SolValue;
 use foundry_common::{TYPE_BINDING_PREFIX, fs};
 use foundry_config::fs_permissions::FsAccessKind;
-use foundry_evm_core::{constants::DEFAULT_CREATE2_DEPLOYER, evm::FoundryEvmNetwork};
+use foundry_evm_core::{
+    constants::DEFAULT_CREATE2_DEPLOYER,
+    evm::{FoundryEvmNetwork, tron_create2_address},
+};
 use foundry_evm_fuzz::strategies::BoundMutator;
 use proptest::prelude::Strategy;
 use rand::{Rng, RngCore, seq::SliceRandom};
@@ -51,6 +54,13 @@ impl Cheatcode for computeCreateAddressCall {
     fn apply<FEN: FoundryEvmNetwork>(&self, _state: &mut Cheatcodes<FEN>) -> Result {
         let Self { nonce, deployer } = self;
         ensure!(*nonce <= U256::from(u64::MAX), "nonce must be less than 2^64");
+        // NOTE: left on the EVM `rlp(sender, nonce)` scheme on every network,
+        // including Tron. Tron's internal CREATE derives the address from
+        // `keccak256(rootTxId ‖ global_op_nonce)`, where `rootTxId` is the
+        // on-chain top-level transaction id and the nonce is a global op-counter
+        // — neither is reproducible in a local (non-fork) simulation, so there is
+        // no faithful off-chain Tron CREATE address to return. The local CREATE
+        // scheme is a documented Tron delta (see `evm/tron/create.rs`).
         Ok(deployer.create(nonce.to()).abi_encode())
     }
 }
@@ -58,6 +68,11 @@ impl Cheatcode for computeCreateAddressCall {
 impl Cheatcode for computeCreate2Address_0Call {
     fn apply<FEN: FoundryEvmNetwork>(&self, _state: &mut Cheatcodes<FEN>) -> Result {
         let Self { salt, initCodeHash, deployer } = self;
+        // On Tron, CREATE2 uses `keccak256(0x41 ‖ deployer ‖ salt ‖ hash)[12..]`
+        // (no 0xff, 21-byte sender), matching the 0xF5 instruction override.
+        if FEN::IS_TRON {
+            return Ok(tron_create2_address(*deployer, *salt, *initCodeHash).abi_encode());
+        }
         Ok(deployer.create2(salt, initCodeHash).abi_encode())
     }
 }
@@ -65,6 +80,15 @@ impl Cheatcode for computeCreate2Address_0Call {
 impl Cheatcode for computeCreate2Address_1Call {
     fn apply<FEN: FoundryEvmNetwork>(&self, _state: &mut Cheatcodes<FEN>) -> Result {
         let Self { salt, initCodeHash } = self;
+        // Tron has no canonical deterministic-deployer contract at
+        // `DEFAULT_CREATE2_DEPLOYER`, but the deployer-less overload must still
+        // return a Tron-scheme address for that (EVM-conventional) deployer so a
+        // Tron user does not silently get an EVM 0xff address.
+        if FEN::IS_TRON {
+            return Ok(
+                tron_create2_address(DEFAULT_CREATE2_DEPLOYER, *salt, *initCodeHash).abi_encode()
+            );
+        }
         Ok(DEFAULT_CREATE2_DEPLOYER.create2(salt, initCodeHash).abi_encode())
     }
 }
