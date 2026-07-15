@@ -393,6 +393,8 @@ mod tests {
         let v27 = Version::new(0, 8, 27);
         let v26 = Version::new(0, 8, 26);
         let v25 = Version::new(0, 8, 25);
+        let v24 = Version::new(0, 8, 24);
+        let v23 = Version::new(0, 8, 23);
         assert_eq!(
             pinned_sha256(&v27, Platform::MacOs),
             Some("9e369b442b3a835320cf1450a21ce5e8acf0d319a50d10a10a2001aac7ce17aa")
@@ -404,6 +406,32 @@ mod tests {
         assert_eq!(
             pinned_sha256(&v26, Platform::WindowsAmd64),
             Some("bbb9e290265494e8ec9c31482b42e8bc4310d71bb37bb773bc97524b12d52d2a")
+        );
+        // 0.8.23 / 0.8.24 pins from list.json (fetched 2026-07-16); 0.8.23 is the
+        // exact pragma pinned by the W4 target project's contracts.
+        assert_eq!(
+            pinned_sha256(&v23, Platform::LinuxAmd64),
+            Some("40f5145ef352bc139acfcc0e257db67a80de1dcdc018d1762d584dff866faa6c")
+        );
+        assert_eq!(
+            pinned_sha256(&v23, Platform::MacOs),
+            Some("0397a9dfc52667a36f6020f5f99977114ebda4758bc49b246d622fd727a72058")
+        );
+        assert_eq!(
+            pinned_sha256(&v23, Platform::WindowsAmd64),
+            Some("8723f35f2e609bf488fd958300e30800f96e8ab8f43365ec00ca0367ea18cea9")
+        );
+        assert_eq!(
+            pinned_sha256(&v24, Platform::LinuxAmd64),
+            Some("82605d2d64d9bcc2ab0b7608d192463de009a8ece6032058d4cbdbefbde87e78")
+        );
+        assert_eq!(
+            pinned_sha256(&v24, Platform::MacOs),
+            Some("9bdddd9e9afd96eabada84cb9cafe7b6bf5d6bb101e08019ce1d103824a561ed")
+        );
+        assert_eq!(
+            pinned_sha256(&v24, Platform::WindowsAmd64),
+            Some("35957118ebcb217903138e65fa1ded0a8dceffe6994d2ba7554c92cee81dad0a")
         );
         // Unknown version and unsupported platform have no pin.
         assert_eq!(pinned_sha256(&Version::new(0, 8, 99), Platform::MacOs), None);
@@ -427,6 +455,16 @@ mod tests {
             tronscan_compiler_string(&Version::new(0, 8, 27)).as_deref(),
             Some("tron_v0.8.27+commit.19164bed")
         );
+        // 0.8.23 / 0.8.24 long versions from list.json (fetched 2026-07-16).
+        assert_eq!(
+            tronscan_compiler_string(&Version::new(0, 8, 23)).as_deref(),
+            Some("tron_v0.8.23+commit.8ed33446")
+        );
+        assert_eq!(
+            tronscan_compiler_string(&Version::new(0, 8, 24)).as_deref(),
+            Some("tron_v0.8.24+commit.7d902c66")
+        );
+        assert_eq!(tron_solc_long_version(&Version::new(0, 8, 23)), Some("0.8.23+commit.8ed33446"));
         // The long version alone (no tron_v prefix) is also exposed.
         assert_eq!(tron_solc_long_version(&Version::new(0, 8, 27)), Some("0.8.27+commit.19164bed"));
         // Unpinned versions have no compiler string.
