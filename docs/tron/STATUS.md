@@ -263,7 +263,13 @@ fork-safe); экшены пиненые теми же SHA, что и в репо
 
 - **Этап 2** (планы E/F/G) — ✅ ГОТОВ: energy/precompiles/CREATE2 (E), резолвер tron-solc (F), read-only fork через `/jsonrpc` (G). См. секции «План E/F/G» выше.
 - **Этап 3 / план H** — ✅ ГОТОВ: gas-report energy+bandwidth, fork-guard на исторический блок, TRONSCAN verify (`forge verify-contract` + embedded `forge create --verify`), USER_GUIDE/README/version-stamp, CI-workflow `tron-live`. См. секцию «План H» выше. Live acceptance-гейт verify E2E пройден на Nile.
-- **Осталось (DEFER, к OSS-релизу):** первый зелёный прогон CI форка под полной матрицей (0 runs до сих пор), вынос tron-крейтов за трейт-границу, публикация бинарных релизов / Docker / ребрендинг installer'а, `forge script --verify` через TronScan. Детали и обоснования — в блоке «DEFER» плана H.
+- **Дистрибуция тулчейна** — ✅ ОТГРУЖЕНА (влито в `master`, PR #6): multi-platform CI-сборка `foundry-tron-build.yml` (darwin arm64/amd64, linux arm64/amd64, win32 amd64; feature-surface зеркалит `release.yml`) публикует четыре `*-tron` бинарника (forge-tron, cast-tron, anvil-tron, chisel-tron) в rolling-prerelease с фиксированным тегом **`foundry-tron-latest`** (5 арх-архивов + `.sha256`-сайдкары). Keyless one-liner-инсталлятор `install-foundry-tron.sh` (+ `install-foundry-tron.ps1` для Windows) детектит OS/arch, качает и сверяет sha256, распаковывает в `~/.foundry-tron/bin`, PATH правит только по opt-in `--modify-path`, с фолбэком на `gh release download` когда asset-хост недоступен. Установка:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/elsvv/foundry-tron/master/install-foundry-tron.sh | bash
+  ```
+  Плюс пины tron-solc `0.8.23`/`0.8.24` (sha256 + longVersion, три платформы) для авто-резолва под этими pragma.
+- **Пилот tron-1inch** — В РАБОТЕ: тулчейн `*-tron` обкатывается на реальном TronBox-проекте `stonfi/tron-1inch` (1inch escrow/custody для Tron, ветка `feat/init-foundry-tron`) — миграция на foundry-tron как первый внешний потребитель дистрибуции.
+- **Осталось (DEFER, к OSS-релизу):** вынос tron-крейтов за трейт-границу, Docker-образ, `forge script --verify` через TronScan. Детали и обоснования — в блоке «DEFER» плана H. (Первый зелёный прогон CI-сборки под полной матрицей — ✅ ВЫПОЛНЕН через `foundry-tron-build`; публикация бинарных релизов — ✅ ВЫПОЛНЕНА, см. «Дистрибуция тулчейна».)
 
 ## Окружение (важно для любой машины)
 
