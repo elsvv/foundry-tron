@@ -38,7 +38,7 @@ err() {
 }
 
 usage() {
-  sed -n '3,26p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+  sed -n '3,21p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
   exit 0
 }
 
