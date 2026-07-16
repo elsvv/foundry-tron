@@ -85,7 +85,13 @@ jobs:
             target: aarch64-apple-darwin
             platform: darwin
             arch: arm64
-          - runner: macos-13
+          # darwin-amd64 is cross-compiled on the arm64 macos-14 runner rather
+          # than built natively on macos-13: GitHub's free Intel (macos-13) pool
+          # is being deprecated and queues indefinitely (observed >2h with no
+          # runner assigned), while macos-14 is healthy. The Apple toolchain is
+          # universal, so `--target x86_64-apple-darwin` still yields a genuine
+          # amd64 macOS binary.
+          - runner: macos-14
             target: x86_64-apple-darwin
             platform: darwin
             arch: amd64
