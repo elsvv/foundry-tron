@@ -390,8 +390,49 @@ Nile faucet: <https://nileex.io/join/getJoinPage>.
 
 ## Installing from the fork
 
+### Prebuilt binaries (one-line installer)
+
+The fastest path. It fetches the four Tron CLIs (`forge-tron`, `cast-tron`,
+`anvil-tron`, `chisel-tron`) for your OS/arch from the rolling
+`foundry-tron-latest` release, verifies the SHA-256 checksum, and unpacks them
+into `~/.foundry-tron/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/elsvv/foundry-tron/master/install-foundry-tron.sh | bash
+```
+
+On networks where `raw.githubusercontent.com` is blocked (some corporate or
+regional networks), pull the script from the jsDelivr mirror instead:
+
+```sh
+curl -fsSL https://cdn.jsdelivr.net/gh/elsvv/foundry-tron@master/install-foundry-tron.sh | bash
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/elsvv/foundry-tron/master/install-foundry-tron.ps1 | iex
+```
+
+The installer downloads with plain `curl` and transparently falls back to
+`gh release download` when the release asset host itself is blocked (the CDN
+above only serves the script). Flags:
+
+- `--modify-path` (`-ModifyPath` on Windows): append the bin directory to your
+  shell profile. By default the installer leaves `PATH` alone and just prints the
+  line to add.
+- `--dir <path>`: install somewhere other than `~/.foundry-tron`.
+- `--require-checksum`: fail instead of warning when a release has no checksum.
+
+Re-runs are idempotent, so the same command upgrades an existing install. The
+binaries carry the `-tron` suffix to coexist with a stock Foundry install; add
+`~/.foundry-tron/bin` to `PATH` and call `forge-tron`, `cast-tron`, etc.
+
+### With foundryup
+
 `foundryup` is parameterized by `FOUNDRYUP_REPO`, so the standard installer can
-target this fork:
+target this fork (this builds the stock `forge`/`cast` names, not the `-tron`
+suffixed ones):
 
 ```sh
 FOUNDRYUP_REPO=elsvv/foundry-tron foundryup
