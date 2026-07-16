@@ -1,0 +1,218 @@
+# Multi-platform build of the *-tron CLIs (forge-tron, cast-tron, anvil-tron,
+# chisel-tron). Each matrix job builds the four binaries in the `release`
+# profile, renames them with a `-tron` suffix, packages a per-platform archive
+# named `foundry-tron_<platform>_<arch>`, uploads it as an Actions artifact, and
+# publishes it to a single rolling prerelease (fixed tag `foundry-tron-latest`)
+# so a keyless bash installer can fetch stable, arch-encoded asset names.
+#
+# The build feature surface mirrors `.github/workflows/release.yml` (the shared
+# `RUST_FEATURES` set plus the per-OS `jemalloc` toggle); do not change this
+# without also updating release.yml/Makefile to keep the surfaces aligned.
+
+name: foundry-tron-build
+
+permissions: {}
+
+on:
+  push:
+    branches:
+      - tron-toolchain
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: foundry-tron-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Mirrors release.yml `RUST_FEATURES`. `jemalloc` is intentionally omitted here
+  # and re-added per-target in the build step (it is not supported on MSVC or
+  # aarch64 Linux), exactly as release.yml does.
+  RUST_FEATURES: aws-kms,gcp-kms,turnkey,cli,asm-keccak,js-tracer
+  # Fixed tag for the rolling prerelease that hosts the installer assets.
+  RELEASE_TAG: foundry-tron-latest
+
+jobs:
+  # Recreate the rolling prerelease once, before the matrix fans out, so its tag
+  # tracks the current build commit and stale assets never linger. Running this
+  # single-threaded means the build jobs below only ever `--clobber` onto an
+  # already-existing release, avoiding a create race across the five runners.
+  prepare:
+    name: Prepare rolling prerelease
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Ensure rolling prerelease exists at current commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Drop any prior release + tag, then recreate at this commit.
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag 2>/dev/null || true
+          notes="Rolling prerelease of the *-tron CLIs (forge-tron, cast-tron, anvil-tron, chisel-tron).
+
+          Auto-rebuilt from \`${GITHUB_REF_NAME}\` @ \`${GITHUB_SHA}\`.
+          Assets are named \`foundry-tron_<platform>_<arch>\` (platform in {darwin, linux, win32}, arch in {arm64, amd64})."
+          gh release create "$RELEASE_TAG" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "foundry-tron (rolling latest)" \
+            --notes "$notes"
+
+  build:
+    name: build ${{ matrix.platform }}-${{ matrix.arch }} (${{ matrix.runner }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `runner`: GHA runner label
+          # `target`: Rust build target triple (native to each runner)
+          # `platform` / `arch`: used in the archive + asset names
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin
+            arch: arm64
+          # darwin-amd64 is cross-compiled on the arm64 macos-14 runner rather
+          # than built natively on macos-13: GitHub's free Intel (macos-13) pool
+          # is being deprecated and queues indefinitely (observed >2h with no
+          # runner assigned), while macos-14 is healthy. The Apple toolchain is
+          # universal, so `--target x86_64-apple-darwin` still yields a genuine
+          # amd64 macOS binary.
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            platform: darwin
+            arch: amd64
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32
+            arch: amd64
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # mold is a Linux-only linker speedup; skip it elsewhere.
+      - uses: rui314/setup-mold@9c9c13bf4c3f1adef0cc596abc155580bcb04444 # v1
+        if: runner.os == 'Linux'
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Apple M1 setup
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          printf 'SDKROOT=%s\n' "$(xcrun -sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+          printf 'MACOSX_DEPLOYMENT_TARGET=%s\n' "$(xcrun -sdk macosx --show-sdk-platform-version)" >> "$GITHUB_ENV"
+
+      - name: Build tron CLIs
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -eo pipefail
+          OUT_DIR="target/${TARGET}/release"
+          # `cast` is spelled `cast@1.7.2` because the dependency graph also
+          # contains an unrelated `cast@0.3.0`, which makes a bare `-p cast`
+          # ambiguous.
+          flags=(--locked --target "$TARGET" --profile release
+            -p forge -p cast@1.7.2 -p anvil -p chisel
+            --no-default-features --features "$RUST_FEATURES")
+          # jemalloc is not fully supported on MSVC or aarch64 Linux (mirrors
+          # release.yml).
+          if [[ "$TARGET" != *msvc* && "$TARGET" != "aarch64-unknown-linux-gnu" ]]; then
+            flags+=(--features jemalloc)
+          fi
+          ext=""
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+
+          cargo build "${flags[@]}"
+
+          # Rename each binary with the `-tron` suffix.
+          for pair in forge:forge-tron cast:cast-tron anvil:anvil-tron chisel:chisel-tron; do
+            src="${pair%%:*}"
+            dst="${pair##*:}"
+            mv "$OUT_DIR/${src}${ext}" "$OUT_DIR/${dst}${ext}"
+            file "$OUT_DIR/${dst}${ext}" || true
+            "$OUT_DIR/${dst}${ext}" --version || true
+          done
+
+      - name: Package archive
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_DIR="target/${TARGET}/release"
+          ASSET_BASE="foundry-tron_${PLATFORM}_${ARCH}"
+          if [[ "$PLATFORM" == "linux" ]]; then
+            tar -czvf "${ASSET_BASE}.tar.gz" -C "$OUT_DIR" forge-tron cast-tron anvil-tron chisel-tron
+            asset_name="${ASSET_BASE}.tar.gz"
+          elif [[ "$PLATFORM" == "darwin" ]]; then
+            # gtar avoids the macOS bsdtar archive-corruption issue.
+            gtar -czvf "${ASSET_BASE}.tar.gz" -C "$OUT_DIR" forge-tron cast-tron anvil-tron chisel-tron
+            asset_name="${ASSET_BASE}.tar.gz"
+          else
+            ( cd "$OUT_DIR" && 7z a -tzip "${ASSET_BASE}.zip" forge-tron.exe cast-tron.exe anvil-tron.exe chisel-tron.exe )
+            mv "$OUT_DIR/${ASSET_BASE}.zip" .
+            asset_name="${ASSET_BASE}.zip"
+          fi
+          # Publish a SHA-256 sidecar so the keyless installer can verify the
+          # download without an API round-trip. Standard `sha256sum -c` format
+          # (`<hash>  <filename>`); macOS runners lack sha256sum but ship shasum.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset_name" > "${asset_name}.sha256"
+          else
+            shasum -a 256 "$asset_name" > "${asset_name}.sha256"
+          fi
+          cat "${asset_name}.sha256"
+          printf 'asset_name=%s\n' "$asset_name" >> "$GITHUB_OUTPUT"
+          printf 'checksum_name=%s\n' "${asset_name}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.asset_name }}
+          path: ${{ steps.package.outputs.asset_name }}
+          retention-days: 7
+
+      - name: Upload asset to rolling prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ASSET_NAME: ${{ steps.package.outputs.asset_name }}
+          CHECKSUM_NAME: ${{ steps.package.outputs.checksum_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" "$ASSET_NAME" "$CHECKSUM_NAME" --clobber

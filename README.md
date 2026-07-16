@@ -79,6 +79,32 @@ API. It also covers read-only mainnet forks, an energy + bandwidth gas report,
 and keyless TronScan verification (`forge verify-contract` / `forge create
 --verify`).
 
+### Install the prebuilt `*-tron` CLIs
+
+Install the four Tron-flavored binaries (`forge-tron`, `cast-tron`, `anvil-tron`,
+`chisel-tron`) into `~/.foundry-tron/bin` with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/elsvv/foundry-tron/master/install-foundry-tron.sh | bash
+```
+
+On networks where `raw.githubusercontent.com` is blocked, use the jsDelivr mirror:
+
+```sh
+curl -fsSL https://cdn.jsdelivr.net/gh/elsvv/foundry-tron@master/install-foundry-tron.sh | bash
+```
+
+On Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/elsvv/foundry-tron/master/install-foundry-tron.ps1 | iex
+```
+
+The installer downloads over plain `curl` and falls back to `gh release download`
+when the release asset host is blocked. It only touches your `PATH` when you pass
+`--modify-path` (`-ModifyPath` on Windows) or agree to the interactive prompt;
+otherwise it just prints the line to add.
+
 See the [Tron user guide](./docs/tron/USER_GUIDE.md) for the quickstart, the full
 command-coverage matrix, the `[tron]` config reference, and the VM/energy-model
 differences.
