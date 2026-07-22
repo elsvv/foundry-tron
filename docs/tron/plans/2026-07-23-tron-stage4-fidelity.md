@@ -1,6 +1,6 @@
 # План I — Этап 4 «fidelity»: TIP-491, precompile-кламп, transfer-баг, chain-params, base58, tron-solc 0.8.28+
 
-Дата: 2026-07-23. Статус: утверждён к исполнению (dynamic workflow: Opus-исполнители + Opus-верификация каждой задачи + Fable-ревью каждые 2 задачи; ветка `tron-stage4` от `master`).
+Дата: 2026-07-23. Статус: утверждён к исполнению (dynamic workflow: Opus-исполнители + Opus-верификация каждой задачи + Fable-ревью после каждой четвёрки задач, т.е. два ревью на этап; ветка `tron-stage4` от `master`).
 
 Закрывает подтверждённые находки fidelity-аудита 2026-07-23 (45 агентов, адверсариальная
 верификация; полный JSON находок — в session-scratchpad, ключевые факты продублированы ниже,
@@ -528,17 +528,50 @@ ecrecover-precompile) проходит на дефолтном chainid без р
 
 ---
 
+## Задача I9 — release prep: версия, STATUS, USER_GUIDE, релизная готовность
+
+**Файлы:** version-stamp тулчейна (найти шов: план H5 добавил tron-штамп в `--version` —
+grep по `tron` в коде версии/`--version`-выводе, вероятно рядом с `foundry-tron-latest`/
+`install-foundry-tron.sh`-конвенциями), `docs/tron/STATUS.md`, `docs/tron/USER_GUIDE.md`,
+корневой `Makefile` + `.github/workflows/foundry-tron-build.yml` (сверка feature-списков,
+см. репо-CLAUDE.md «Keep release feature lists aligned»).
+
+- [ ] **Шаг 1.** Поднять tron-версию тулчейна (штамп в `--version`) на минорную:
+  текущее значение найти по grep; новая = следующая минорная (например 0.1.x → 0.2.0);
+  зафиксировать выбор в отчёте. Никаких изменений upstream-версии Foundry.
+- [ ] **Шаг 2.** `docs/tron/STATUS.md`: строка «Этап 4 (план I)» в таблице этапов с
+  фактическим составом I1–I9 и live-подтверждениями; снапшот-константы (chain params
+  2026-07, tron-solc 0.8.28) и DEFER-список из плана.
+- [ ] **Шаг 3.** `docs/tron/USER_GUIDE.md`: разделы «Dynamic energy (TIP-491)»,
+  «cast estimate на tron + формула fee_limit», «base58 в трейсах», «версии tron-solc из
+  конфига (solc = "X.Y.Z", включая версии новее релиза тулчейна; solc = путь — оверрайд)».
+- [ ] **Шаг 4.** Сверить, что `foundry-tron-build.yml` собирает все четыре бинарника с
+  теми же фичами, что и корневой `Makefile`; расхождения — исправить (сам workflow-файл
+  менять минимально и только при реальном расхождении).
+- [ ] **Шаг 5.** `cargo build --workspace` + фокусные тесты затронутых крейтов зелёные;
+  `forge-tron --version` (локальная сборка) показывает новую версию.
+- [ ] **Шаг 6.** Коммиты: `chore(tron): bump toolchain version to <X.Y.Z>`,
+  `docs(tron): stage 4 status and user guide`.
+
+**Гейт:** локально собранный `forge --version` несёт новый штамп; STATUS/USER_GUIDE
+описывают фактически смерженное поведение (без обещаний из будущего). Публикация
+(push, PR, GitHub-релиз, обновление rolling `foundry-tron-latest`) — ВНЕ workflow,
+выполняется оркестратором после финального ревью.
+
+---
+
 ## Порядок, ветка, процесс
 
-Порядок исполнения: **I1 → I2 → I3 → I4 → I5 → I6 → I7 → I8** (I5 — фундамент для I6/I7;
-I1/I2/I3 независимы и могут идти параллельными worktree при желании).
+Порядок исполнения: **I1 → I2 → I3 → I4 → (Fable-ревью №1) → I5 → I6 → I7 → I8 → I9 →
+(финальное Fable-ревью)** (I5 — фундамент для I6/I7; I1/I2/I3 независимы и могут идти
+параллельными worktree при желании).
 
 - Ветка `tron-stage4` от `master`; PR → `master` (мейнлайн, см. STATUS).
 - Конвенции: sh_-макросы (никаких println), doc-комменты перед атрибутами, тесты с
   `fork` в имени для fork-тестов, live-гейты `TRON_LIVE=1` / `TRON_SOLC_DOWNLOAD=1`.
 - Каждая задача: тест-первым, отдельные коммиты, Opus-верификация с перепроверкой
   доменных фактов по первоисточникам (java-tron @develop, live mainnet/Nile), Fable-ревью
-  после каждых двух задач.
+  после каждой четвёрки задач (после I4 и финальное после I9).
 - По завершении: обновить `docs/tron/STATUS.md` (таблица этапов + snapshot-константы),
   USER_GUIDE (dynamic energy, cast estimate, base58, solc-версии), tron-live CI (I5-гейт).
 
