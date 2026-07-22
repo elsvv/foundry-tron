@@ -21,16 +21,31 @@
 //! - **`0x09`/`0x0a`** are BatchValidateSign (TIP-43) and ValidateMultiSign (TIP-60), which collide
 //!   with Ethereum's blake2f (`0x09`) and KZG point-eval (`0x0a`). We deliberately override both.
 //!
+//! The map is a **clamp**, not an extension of revm's set: [`tron_precompiles_map`]
+//! builds a fresh [`PrecompilesMap`] from an *empty* base and installs only
+//! [`tron_precompiles`], so the table is exactly the java-tron set and never
+//! revm's spec-derived map. This makes "no P256Verify (`0x100`)" and "no
+//! BLS12-381 (`0x0b`-`0x11`)" true *by construction* at any config `evm_version`,
+//! not merely by omission: those Ethereum-only precompiles do not exist here, so
+//! a call to one is an ordinary empty-account call (success, empty output), just
+//! as on java-tron where `getContractForAddress` returns null and the address is
+//! treated as a plain account.
+//!
 //! The `allowTvmOsaka` flag is inactive on mainnet and Nile (probed 2026-07-12),
 //! so we use the pre-Osaka semantics throughout: EIP-198 modexp pricing, Istanbul
-//! bn128 pricing, no P256Verify (`0x100`), no `isValidAbiEncoding` rejection for
-//! `0x09`/`0x0a`, and `allowTvmSelfdestructRestriction` active (arrays capped at
-//! 16/5). All cryptographic cores are reused from `revm-precompile`; nothing new
-//! is pulled in.
+//! bn128 pricing, no `isValidAbiEncoding` rejection for `0x09`/`0x0a`, and
+//! `allowTvmSelfdestructRestriction` active (arrays capped at 16/5). All
+//! cryptographic cores are reused from `revm-precompile`; nothing new is pulled
+//! in.
+//!
+//! TODO(osaka): when `allowTvmOsaka` activates on Nile/mainnet the table must be
+//! versioned (TIP-7883 ModExp reprice, P256Verify `0x100`, strict-ABI for
+//! `0x09`/`0x0a`). Until then task I4 warns when a node reports
+//! `getAllowTvmOsaka == 1`.
 
 use std::borrow::Cow;
 
-use alloy_evm::precompiles::{DynPrecompile, PrecompileInput};
+use alloy_evm::precompiles::{DynPrecompile, PrecompileInput, PrecompilesMap};
 use alloy_primitives::{Address, Bytes, U256};
 use foundry_evm_networks::tron::{
     AVAILABLE_UNFREEZE_V2_SIZE, BATCH_VALIDATE_SIGN, BLAKE2F, BN128_ADD, BN128_MUL, BN128_PAIRING,
@@ -43,7 +58,8 @@ use foundry_evm_networks::tron::{
 };
 use revm::precompile::{
     EthPrecompileOutput, EthPrecompileResult, PrecompileHalt, PrecompileId, PrecompileOutput,
-    PrecompileResult, bn254, calc_linear_cost, crypto, hash, identity, modexp, secp256k1,
+    PrecompileResult, Precompiles, bn254, calc_linear_cost, crypto, hash, identity, modexp,
+    secp256k1,
 };
 
 /// Number of energy units charged per verified signature in BatchValidateSign
@@ -57,17 +73,19 @@ const BATCH_MAX_SIZE: usize = 16;
 /// Length of a Tron signature (`VMConstant.SIG_LENGTH`), r ‖ s ‖ v.
 const SIG_LENGTH: usize = 65;
 
-/// Returns the full java-tron precompile set, ready for
-/// [`PrecompilesMap::extend_precompiles`]. Pure precompiles use
+/// Returns the full java-tron precompile set. [`tron_precompiles_map`] installs
+/// it into an otherwise-empty [`PrecompilesMap`]. Pure precompiles use
 /// [`DynPrecompile::new`] (cacheable); state-dependent ones and stubs use
 /// [`DynPrecompile::new_stateful`].
 ///
-/// Installed on both `create_evm` and `create_evm_with_inspector` from
-/// `inject_tron_extensions`, this both **overrides** revm's `0x03` (ripemd160),
-/// `0x05` (Berlin modexp), `0x09` (blake2f) and `0x0a` (KZG) and **adds** the
+/// Because the map is built from an empty base rather than a spec map, this set
+/// is the *entire* table: it supplies revm-faithful cores at `0x01`-`0x08`, the
+/// TIP-43/TIP-60 pair at `0x09`/`0x0a` (where Ethereum has blake2f/KZG), and the
 /// Tron-only addresses (`0x020003`, `0x020009`, and the shielded/vote/FreezeV2
-/// stub range). `0x100` P256Verify is intentionally absent (Osaka-gated, inactive
-/// on mainnet).
+/// stub range). Its `0x03` is java-tron's double-sha256 (not ripemd160) and its
+/// `0x05` is EIP-198 modexp (not Berlin). Ethereum-only precompiles — Osaka's
+/// BLS12-381 (`0x0b`-`0x11`) and P256Verify (`0x100`) — are absent by
+/// construction, since nothing seeds them.
 pub fn tron_precompiles() -> Vec<(Address, DynPrecompile)> {
     let mut set = vec![
         // Standard 0x01-0x08. Faithful cores reused from revm-precompile.
@@ -100,6 +118,21 @@ pub fn tron_precompiles() -> Vec<(Address, DynPrecompile)> {
     }
 
     set
+}
+
+/// Builds the java-tron precompile map as a **clamp**: it starts from an *empty*
+/// [`Precompiles`] and installs only [`tron_precompiles`], so the result is
+/// exactly the java-tron set. No Ethereum-only precompile (Osaka's BLS12-381
+/// `0x0b`-`0x11` or P256Verify `0x100`) can leak in for any config
+/// `evm_version`, because there is no spec-derived base to leak from.
+///
+/// `inject_tron_extensions` assigns this over revm's spec map wholesale, rather
+/// than extending it. Since the base is empty, `extend_precompiles` here only
+/// *inserts* the Tron set (it never sits on top of an Ethereum map).
+pub fn tron_precompiles_map() -> PrecompilesMap {
+    let mut map = PrecompilesMap::new(Cow::Owned(Precompiles::default()));
+    map.extend_precompiles(tron_precompiles());
+    map
 }
 
 /// Fixed-energy stub precompiles: `(address, trace name, energy)`. Energies are
@@ -717,8 +750,12 @@ mod tests {
     // TronEvmFactory. These exercise inject_tron_extensions, not just the cores.
     // ---------------------------------------------------------------------
 
+    fn spec_env(spec: SpecId) -> EvmEnv {
+        EvmEnv { cfg_env: CfgEnv::new_with_spec(spec), ..Default::default() }
+    }
+
     fn cancun_env() -> EvmEnv {
-        EvmEnv { cfg_env: CfgEnv::new_with_spec(SpecId::CANCUN), ..Default::default() }
+        spec_env(SpecId::CANCUN)
     }
 
     /// Creation bytecode that STATICCALLs precompile `address` with `input`
@@ -784,11 +821,30 @@ mod tests {
         out.result.output().unwrap().to_vec()
     }
 
+    /// STATICCALLs `address` at `spec` through the Tron factory and returns the
+    /// `(returndata, total gas used)` pair, so tests can compare a missing
+    /// precompile against a plain empty-account call.
+    fn tron_call(spec: SpecId, address: Address, input: &[u8]) -> (Vec<u8>, u64) {
+        let mut evm = TronEvmFactory.create_evm(CacheDB::<EmptyDB>::default(), spec_env(spec));
+        let out = evm.transact_raw(create_tx(staticcall_creation(address, input))).unwrap();
+        assert!(out.result.is_success(), "tron staticcall-creation must succeed: {:?}", out.result);
+        (out.result.output().unwrap().to_vec(), out.result.tx_gas_used())
+    }
+
+    /// The [`tron_call`] counterpart on the vanilla Ethereum factory.
+    fn eth_call(spec: SpecId, address: Address, input: &[u8]) -> (Vec<u8>, u64) {
+        let mut evm =
+            EthEvmFactory::default().create_evm(CacheDB::<EmptyDB>::default(), spec_env(spec));
+        let out = evm.transact_raw(create_tx(staticcall_creation(address, input))).unwrap();
+        assert!(out.result.is_success(), "eth staticcall-creation must succeed: {:?}", out.result);
+        (out.result.output().unwrap().to_vec(), out.result.tx_gas_used())
+    }
+
     #[test]
     fn e2e_0x03_override_takes_effect_in_tron_evm() {
         // Through the full TronEvmFactory, 0x03 is double-sha256; through vanilla
         // revm it is ripemd160. Same address, different result: proves the
-        // extend_precompiles injection overrides revm's default set.
+        // clamped map installs the Tron core in place of revm's default set.
         let data = b"abc";
         let tron = tron_precompile_output(RIPEMD160_BROKEN, data);
         assert_eq!(hex::encode(&tron), h_double_sha256_abc());
@@ -839,10 +895,102 @@ mod tests {
 
         // Ethereum's KZG point-eval requires exactly 192 input bytes, so it rejects
         // this 352-byte input: the STATICCALL fails and returndata is empty. A
-        // 32-byte word vs empty returndata proves the extend_precompiles injection
-        // overrides revm's KZG at 0x0a.
+        // 32-byte word vs empty returndata proves the clamped map installs
+        // ValidateMultiSign in place of revm's KZG at 0x0a.
         let eth = eth_precompile_output(VALIDATE_MULTISIGN, &input);
         assert!(eth.is_empty(), "eth KZG point-eval rejects the input -> empty returndata");
         assert_ne!(tron, eth, "TronEvmFactory 0x0a must override revm KZG point-eval");
+    }
+
+    // ---------------------------------------------------------------------
+    // Precompile clamp: the Tron map is exactly the java-tron set, so no
+    // Ethereum-only precompile leaks in for any config evm_version.
+    // ---------------------------------------------------------------------
+
+    /// Address `0x100` (256), P256Verify on Osaka Ethereum.
+    fn p256_address() -> Address {
+        Address::left_padding_from(&[0x01, 0x00])
+    }
+
+    #[test]
+    fn tron_precompiles_map_is_exactly_the_java_tron_set() {
+        use std::collections::BTreeSet;
+
+        let map = tron_precompiles_map();
+        let got: BTreeSet<Address> = map.addresses().copied().collect();
+
+        // Expected = every address tron_precompiles() installs (the 0x01-0x0a
+        // core, the allowTvmCompatibleEvm 0x020003/0x020009, and the 21 stubs).
+        let expected: BTreeSet<Address> =
+            tron_precompiles().iter().map(|(address, _)| *address).collect();
+        assert_eq!(got, expected, "clamped map must be exactly tron_precompiles()");
+
+        // It must also equal the trace label book (step 4): every label address
+        // is in the map and the map carries no address the labels lack.
+        let labels: BTreeSet<Address> = foundry_evm_networks::tron::TRON_PRECOMPILES
+            .iter()
+            .map(|(_, address)| *address)
+            .collect();
+        assert_eq!(got, labels, "map addresses must match the TRON_PRECOMPILES label set");
+        assert_eq!(got.len(), 33, "the java-tron set is 33 addresses");
+
+        // No Ethereum-only precompile may be present: Osaka's BLS12-381
+        // (0x0b-0x11) and P256Verify (0x100) must be absent by construction.
+        for id in 0x0bu8..=0x11 {
+            assert!(
+                !got.contains(&Address::with_last_byte(id)),
+                "BLS12-381 precompile 0x{id:02x} must be absent from the Tron map"
+            );
+        }
+        assert!(
+            !got.contains(&p256_address()),
+            "P256Verify 0x100 must be absent from the Tron map"
+        );
+    }
+
+    #[test]
+    fn tron_factory_omits_ethereum_only_precompiles() {
+        let bls_g1add = Address::with_last_byte(0x0b);
+        let p256 = p256_address();
+        // A definitely-non-precompile control address (an empty account on both
+        // factories at every spec).
+        let control = Address::with_last_byte(0x7f);
+
+        // Valid-for-Ethereum inputs: G1ADD wants 256 bytes (here the point at
+        // infinity added to itself), P256Verify wants 160.
+        let bls_input = [0u8; 256];
+        let p256_input = [0u8; 160];
+
+        // On the Tron factory these addresses are not precompiles at ANY spec:
+        // a STATICCALL behaves exactly like a call to an empty account -- same
+        // (empty) output and the same gas as the control. Osaka is the default
+        // spec, so its base map would carry BLS12-381 and P256Verify if the clamp
+        // were an extension rather than a replacement.
+        for spec in [SpecId::CANCUN, SpecId::OSAKA] {
+            let bls = tron_call(spec, bls_g1add, &bls_input);
+            let ctrl_bls = tron_call(spec, control, &bls_input);
+            assert!(bls.0.is_empty(), "tron 0x0b must return empty output at {spec:?}");
+            assert_eq!(bls, ctrl_bls, "tron 0x0b must match an empty-account call at {spec:?}");
+
+            let p = tron_call(spec, p256, &p256_input);
+            let ctrl_p = tron_call(spec, control, &p256_input);
+            assert!(p.0.is_empty(), "tron 0x100 must return empty output at {spec:?}");
+            assert_eq!(p, ctrl_p, "tron 0x100 must match an empty-account call at {spec:?}");
+        }
+
+        // Contrast on Ethereum-Osaka, where these ARE precompiles (the very leak
+        // the clamp prevents): 0x0b (BLS G1ADD) returns a 128-byte G1 point, and
+        // 0x100 (P256Verify) charges real precompile gas, diverging from the
+        // empty-account control. Without this contrast the Tron assertions above
+        // would pass even if the addresses were never precompiles anywhere.
+        let (eth_bls_out, _) = eth_call(SpecId::OSAKA, bls_g1add, &bls_input);
+        assert_eq!(eth_bls_out.len(), 128, "eth-osaka 0x0b (BLS G1ADD) returns a 128-byte point");
+
+        let (_, eth_p256_gas) = eth_call(SpecId::OSAKA, p256, &p256_input);
+        let (_, eth_ctrl_gas) = eth_call(SpecId::OSAKA, control, &p256_input);
+        assert_ne!(
+            eth_p256_gas, eth_ctrl_gas,
+            "eth-osaka 0x100 (P256Verify) is a real precompile, unlike an empty account"
+        );
     }
 }

@@ -95,8 +95,9 @@ impl EvmFactory for TronEvmFactory {
 /// 3. the Tron block/tx-op overrides (DIFFICULTY, GASLIMIT, BASEFEE, GASPRICE, BLOBHASH,
 ///    BLOBBASEFEE) whose semantics diverge from Ethereum;
 /// 4. the Tron CREATE2 (0xF5) address scheme ([`create`]), pinned via `CreateScheme::Custom`;
-/// 5. the java-tron precompile set ([`precompiles`]), which overrides revm's `0x03`/`0x05`/`0x09`/
-///    `0x0a` and adds the Tron-only precompile addresses.
+/// 5. the java-tron precompile set ([`precompiles`]), installed as a *replacement* of revm's
+///    spec-derived map (not an extension), so no Ethereum-only precompile (Osaka's BLS12-381
+///    `0x0b`-`0x11` or P256Verify `0x100`) leaks in for any config `evm_version`.
 fn inject_tron_extensions<DB: Database, I: Inspector<EthEvmContext<DB>>>(
     evm: EthEvm<DB, I, PrecompilesMap>,
     inspect: bool,
@@ -134,10 +135,15 @@ fn inject_tron_extensions<DB: Database, I: Inspector<EthEvmContext<DB>>>(
     // inside the instruction. See [`create`] for the two deltas from stock revm.
     table.insert_instruction(opcode::CREATE2, Instruction::new(create::op_create2), 0);
 
-    // 5. java-tron precompile set. `extend_precompiles` both overrides revm's
-    // 0x03/0x05/0x09/0x0a and adds the Tron-only addresses (0x020003, 0x020009,
-    // and the shielded/vote/FreezeV2 stub range). This runs on both create paths.
-    inner.precompiles.extend_precompiles(precompiles::tron_precompiles());
+    // 5. java-tron precompile set. This REPLACES revm's spec-derived precompile
+    // map wholesale rather than extending it: the map is rebuilt from an empty
+    // base and filled with only `tron_precompiles()`. So no Ethereum-only
+    // precompile can leak for any config `evm_version` -- Osaka's BLS12-381
+    // (0x0b-0x11) and P256Verify (0x100) simply do not exist on the Tron factory,
+    // matching java-tron, where a call to an unknown precompile address is an
+    // ordinary empty-account call (success, empty output). Runs on both create
+    // paths.
+    inner.precompiles = precompiles::tron_precompiles_map();
 
     EthEvm::new(inner, inspect)
 }
