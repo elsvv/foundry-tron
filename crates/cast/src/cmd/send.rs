@@ -215,8 +215,15 @@ impl SendTxArgs {
         let sig = self.data.as_deref().or(self.sig.as_deref());
         let (data, _func) = crate::tron::encode_calldata(sig, &self.args)?;
 
-        // Calldata present -> contract call; otherwise a native TRX transfer.
-        let raw = if data.is_empty() {
+        // Calldata present -> contract call. Empty calldata is a native TRX transfer
+        // ONLY when the destination is an ordinary account: a value-only send to a
+        // contract must go through a `TriggerSmartContract` with empty `data` so the
+        // contract's payable `receive()`/`fallback()` actually runs (a bare
+        // `TransferContract` only credits balance without executing code, and
+        // java-tron rejects it outright once `ForbidTransferToContract`/
+        // `AllowTvmCompatibleEvm` governance is active). `is_contract` is queried only
+        // on the value-only path — `&&` short-circuits when calldata is present.
+        let raw = if data.is_empty() && !provider.is_contract(dest).await? {
             build_transfer_raw(from, dest, value_sun, rb, now_ms, &opts)
         } else {
             build_trigger_raw(from, dest, value_sun, data, rb, now_ms, &opts)

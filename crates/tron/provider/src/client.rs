@@ -151,6 +151,28 @@ impl TronProvider {
         parse_account_balance(&v)
     }
 
+    /// Returns whether `address` is a deployed smart contract on-chain.
+    ///
+    /// Queries `/wallet/getcontract`: java-tron returns a `SmartContract` object
+    /// (carrying `contract_address` and `bytecode`) for a contract account, and an
+    /// empty `{}` body for an ordinary account (EOA) or an address it has never
+    /// seen — which reads as "not a contract".
+    ///
+    /// This decides the value-only send path. A value-only send to a contract must
+    /// use a `TriggerSmartContract` — an empty-`data` trigger invokes the contract's
+    /// payable `receive()`/`fallback()`, matching what `cast send <contract> --value`
+    /// does on Ethereum. A bare `TransferContract` would only credit the balance
+    /// without running the contract's code, and java-tron additionally rejects it
+    /// outright when governance activates it (`getForbidTransferToContract == 1`, or
+    /// `getAllowTvmCompatibleEvm == 1` for a version-1 contract). An ordinary account
+    /// takes the native `TransferContract`. Transient errors propagate so the caller
+    /// decides whether to fall back.
+    pub async fn is_contract(&self, address: Address) -> Result<bool, TronError> {
+        let body = serde_json::json!({ "value": to_hex41(address), "visible": false });
+        let v: serde_json::Value = self.post_json("/wallet/getcontract", body).await?;
+        Ok(parse_is_contract(&v))
+    }
+
     /// Returns transaction info once the transaction is in a block, or `None`
     /// while it is still pending (the node replies with an empty `{}` body).
     pub async fn get_transaction_info(&self, txid: B256) -> Result<Option<TxInfo>, TronError> {
@@ -513,6 +535,14 @@ pub(crate) fn parse_account_balance(v: &serde_json::Value) -> Result<u64, TronEr
     Ok(v.get("balance").and_then(|b| b.as_u64()).unwrap_or(0))
 }
 
+/// Parses a `/wallet/getcontract` response into "is this address a contract?".
+/// java-tron returns a `SmartContract` object carrying `contract_address` for a
+/// deployed contract and an empty `{}` body for an ordinary account, so the
+/// presence of a `contract_address` string is the discriminator.
+pub(crate) fn parse_is_contract(v: &serde_json::Value) -> bool {
+    v.get("contract_address").and_then(|c| c.as_str()).is_some()
+}
+
 /// Parses a `/wallet/gettransactioninfobyid` response. Returns `None` while the
 /// transaction is still pending (empty `{}` body).
 pub(crate) fn parse_tx_info(v: &serde_json::Value) -> Result<Option<TxInfo>, TronError> {
@@ -647,6 +677,57 @@ mod tests {
     #[test]
     fn empty_account_is_zero_balance() {
         assert_eq!(parse_account_balance(&serde_json::json!({})).unwrap(), 0);
+    }
+
+    /// A `/wallet/getcontract` reply for a deployed contract classifies as a
+    /// contract. Fixture: the real mainnet response for USDT
+    /// (`TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t`), captured 2026-07-23, with the 31KB
+    /// `bytecode` kept as its real leading prefix and the large `abi.entrys` array
+    /// dropped for size — `contract_address`, on which the decision keys, is
+    /// verbatim.
+    #[test]
+    fn getcontract_usdt_is_contract() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontract_usdt.json"))
+                .unwrap();
+        assert!(parse_is_contract(&v));
+        // The markers the discriminator relies on are present in a real contract reply.
+        assert!(v.get("contract_address").and_then(|c| c.as_str()).is_some());
+        assert!(v.get("bytecode").and_then(|b| b.as_str()).is_some_and(|b| !b.is_empty()));
+    }
+
+    /// A `/wallet/getcontract` reply for an ordinary account is an empty `{}`
+    /// body, which classifies as not-a-contract. Fixture: the real mainnet empty
+    /// reply for the EOA `TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb`
+    /// (`41e28b3cfd4e0e909077821478e9fcb86b84be786e`), captured 2026-07-23.
+    #[test]
+    fn getcontract_eoa_is_not_contract() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontract_eoa.json")).unwrap();
+        assert!(!parse_is_contract(&v));
+    }
+
+    #[test]
+    fn getcontract_empty_object_is_not_contract() {
+        assert!(!parse_is_contract(&serde_json::json!({})));
+    }
+
+    /// The node distinguishes a contract from an EOA via `/wallet/getcontract`.
+    /// Mainnet is read-only here (no transaction, no TRX): USDT is a contract, a
+    /// large USDT holder (`TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb`) is an EOA.
+    #[tokio::test]
+    async fn live_is_contract_distinguishes_usdt_and_eoa_on_mainnet() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live mainnet read-only tests");
+            return;
+        }
+        let p = TronProvider::new("https://api.trongrid.io").unwrap();
+        let usdt =
+            foundry_tron_primitives::address::parse("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+        let eoa =
+            foundry_tron_primitives::address::parse("TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb").unwrap();
+        assert!(p.is_contract(usdt).await.unwrap(), "USDT must be a contract");
+        assert!(!p.is_contract(eoa).await.unwrap(), "a plain holder must be an EOA");
     }
 
     #[test]
@@ -798,6 +879,36 @@ mod tests {
         assert_eq!(tc.contract_address[1..], contract.as_slice()[..]);
         assert_eq!(tc.call_value, 5);
         assert_eq!(tc.data, data);
+    }
+
+    /// `build_trigger_raw` accepts empty `data`: a value-only contract call
+    /// (payable fallback/receive) is a legal `TriggerSmartContract`. The builder
+    /// must not reject the empty vector — it is exactly what the transfer-bug fix
+    /// routes a value-only call to a contract through.
+    #[test]
+    fn builds_trigger_raw_with_empty_data_is_value_only_call() {
+        let owner =
+            foundry_tron_primitives::address::parse("TX7izXWcmofRYonzdcThrS78jifMtVWCuf").unwrap();
+        let contract =
+            foundry_tron_primitives::address::parse("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj").unwrap();
+        let rb = RefBlock { bytes: vec![0x3c, 0x6f], hash: vec![1, 2, 3, 4, 5, 6, 7, 8] };
+        let raw = build_trigger_raw(
+            owner,
+            contract,
+            1_000_000,
+            Vec::new(),
+            rb,
+            1_783_775_034_896,
+            &TxOptions::default(),
+        );
+        assert_eq!(raw.contract[0].r#type, ContractType::TriggerSmartContract as i32);
+        let tc = <proto::TriggerSmartContract as Message>::decode(
+            raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(tc.contract_address[1..], contract.as_slice()[..]);
+        assert_eq!(tc.call_value, 1_000_000);
+        assert!(tc.data.is_empty(), "value-only call carries empty calldata");
     }
 
     /// Rebuilds the real Nile Counter deploy from its own inputs and asserts the
@@ -977,6 +1088,76 @@ mod tests {
         eprintln!(
             "live E2E tx: https://nile.tronscan.org/#/transaction/{}",
             alloy_primitives::hex::encode(txid)
+        );
+    }
+
+    /// Live (Nile) proof of the value-only-to-contract fix (plan I2 gate). Deploys
+    /// a minimal payable sink (runtime `0x00` / STOP — a contract that accepts a
+    /// value-bearing call with empty calldata and keeps the TRX), then:
+    ///   1. the node classifies the sink as a contract and the funded EOA as not (the `is_contract`
+    ///      discriminator that drives the send-path choice);
+    ///   2. the fix — an empty-`data` `TriggerSmartContract` carrying `call_value` — is ACCEPTED
+    ///      (receipt SUCCESS) and the sink's balance grows by the value, which is exactly what
+    ///      `cast send`/`forge script` now build for a value-only send to a contract.
+    ///
+    /// The pre-fix path built a `TransferContract`, whose correctness bug is that it only credits
+    /// the contract's balance and never runs its `receive()`/`fallback()`, so `cast send <contract>
+    /// --value` would silently skip the payable entry point the user means to invoke (`cast send`'s
+    /// Ethereum semantics run it). java-tron *additionally* rejects a bare transfer to a contract,
+    /// but only under governance: `TransferActuator.validate()` throws iff
+    /// `getForbidTransferToContract == 1`, or `getAllowTvmCompatibleEvm == 1` and the target's
+    /// contract version is 1. Both flags are 0 on mainnet and Nile as of 2026-07 (their `value`
+    /// is omitted from `getchainparameters`, the protobuf default), so a live bare transfer is
+    /// currently accepted — which is why this gate proves the fix through the always-true
+    /// semantic path (the trigger runs contract code) rather than asserting a node rejection
+    /// that governance can toggle.
+    #[tokio::test]
+    async fn live_value_only_contract_call_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live value-only");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+        let owner = signer.address();
+
+        // Minimal payable sink: creation returns a single-byte STOP runtime, so a value-bearing
+        // call with empty calldata halts successfully and the TRX stays with the contract.
+        let creation = hex::decode("6001600c60003960016000f300").unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+        let (deploy_txid, sink, info) =
+            p.deploy_contract(&signer, creation, "PayableSink", &opts, poll).await.unwrap();
+        assert!(info.success, "sink deploy must succeed");
+        eprintln!(
+            "live payable sink tx {} -> {}",
+            hex::encode(deploy_txid),
+            foundry_tron_primitives::to_base58(sink),
+        );
+
+        // 1) The node distinguishes the contract from the funded EOA: this is the discriminator the
+        //    fix routes on.
+        assert!(p.is_contract(sink).await.unwrap(), "sink must classify as a contract");
+        assert!(!p.is_contract(owner).await.unwrap(), "the funded signer is an EOA");
+
+        // 2) The fix: an empty-data trigger with call_value runs the contract and credits the sink.
+        let value_sun = 1_000_000i64;
+        let before = p.get_balance(sink).await.unwrap();
+        let (call_txid, call_info) =
+            p.trigger_contract(&signer, sink, value_sun, Vec::new(), &opts, poll).await.unwrap();
+        assert!(call_info.success, "empty-data trigger with value must succeed");
+        let after = p.get_balance(sink).await.unwrap();
+        assert_eq!(
+            after - before,
+            value_sun as u64,
+            "the sink balance must grow by the transferred value",
+        );
+        eprintln!(
+            "live value-only fix: trigger tx https://nile.tronscan.org/#/transaction/{} credited {value_sun} SUN",
+            hex::encode(call_txid),
         );
     }
 
