@@ -12,8 +12,9 @@ Everything here is a fork addition. When `network = "tron"` is **not** set,
 - **Tron Nile testnet** chain id: `3448148188` (`0xcd8690dc`)
 
 > This build identifies itself in `forge --version` / `cast --version` with a
-> `tron` marker (e.g. `forge 1.7.2-dev (tron; <sha> <ts>)`), so you can tell a
-> Tron build apart from an upstream one.
+> `tron` marker carrying the Tron toolchain version (e.g.
+> `forge 1.7.2-dev (tron 0.2.0; <sha> <ts>)`), so you can tell a Tron build apart
+> from an upstream one and see which fidelity stage it carries.
 
 ---
 
@@ -25,11 +26,13 @@ Everything here is a fork addition. When `network = "tron"` is **not** set,
 4. [Address formats](#address-formats)
 5. [The tron-solc compiler](#the-tron-solc-compiler)
 6. [Gas report: energy and bandwidth](#gas-report-energy-and-bandwidth)
-7. [Fork mode (read-only, tip-only)](#fork-mode-read-only-tip-only)
-8. [Contract verification (TronScan)](#contract-verification-tronscan)
-9. [VM and energy-model differences](#vm-and-energy-model-differences)
-10. [Live-test environment gates](#live-test-environment-gates)
-11. [Installing from the fork](#installing-from-the-fork)
+7. [Dynamic energy (TIP-491)](#dynamic-energy-tip-491)
+8. [Estimating cost (`cast estimate`)](#estimating-cost-cast-estimate)
+9. [Fork mode (read-only, tip-only)](#fork-mode-read-only-tip-only)
+10. [Contract verification (TronScan)](#contract-verification-tronscan)
+11. [VM and energy-model differences](#vm-and-energy-model-differences)
+12. [Live-test environment gates](#live-test-environment-gates)
+13. [Installing from the fork](#installing-from-the-fork)
 
 ---
 
@@ -144,6 +147,7 @@ from `crates/config/src/tron.rs`.
 | `origin_energy_limit` | `10_000_000` | energy | `SmartContract` tag 8 — energy the contract owner contributes on deployment. |
 | `user_fee_percentage` | `100` | percent (0–100) | `SmartContract.consume_user_resource_percent` (tag 6) — share of energy paid by the caller. |
 | `expiration` | `60` | seconds | Added to the current time when building a transaction (converted to ms by the sender). |
+| `dynamic_energy` | `true` | bool | Whether `forge test --gas-report` models the TIP-491 dynamic-energy penalty on a Tron fork (see [Dynamic energy](#dynamic-energy-tip-491)). No effect off Tron or on a non-fork run. |
 
 `1 TRX = 1_000_000 SUN`.
 
@@ -155,6 +159,7 @@ fee_limit = 1000000000
 origin_energy_limit = 10000000
 user_fee_percentage = 100
 expiration = 60
+dynamic_energy = true
 ```
 
 ### Per-command overrides
@@ -183,6 +188,22 @@ When `network = "tron"`, addresses are **printed** in base58 (`T...`). Converter
 and address-taking arguments (including `forge verify-contract <address>` and
 `cast tron-address`) accept all three forms.
 
+### base58 in traces
+
+On a Tron run, `forge test -vvvvv`, `forge script`, `cast run`/`cast call --trace`
+and the chisel REPL render addresses in base58:
+
+- An **unlabeled contract** is identified in the trace tree by its base58 form, so
+  a node reads `TEsg…9Yb::setNumber(...)` instead of `0x…::setNumber`. An explicit
+  `vm.label` and known project contracts keep their name (they win over the base58
+  fallback).
+- Every **address value in decoded call arguments, returns and event logs** —
+  including addresses nested inside arrays, tuples and structs — prints base58.
+
+`console.log` output is formatted by the Solidity library, not the decoder, so it
+stays hex; use `cast tron-address <0x… | 41… | T…>` to convert any form to base58.
+Off Tron, traces are byte-for-byte unchanged.
+
 ---
 
 ## The tron-solc compiler
@@ -196,11 +217,19 @@ cannot fetch or checksum Tron binaries. This fork solves both:
   tron-solc from the `tronprotocol/solidity` GitHub releases into
   `~/.foundry-tron/solc/tron-solc-<version>`, verifying it against a pinned
   sha256 the first time (skipped when `offline`). The default version is
-  **0.8.27**; pinned versions are **0.8.25 / 0.8.26 / 0.8.27** for
-  linux-amd64 / macos (universal) / windows-amd64.
+  **0.8.28**; pinned versions are **0.8.23 – 0.8.28** for linux-amd64 /
+  macos (universal) / windows-amd64.
+- **Choosing a version:** set `solc = "X.Y.Z"` in `foundry.toml` to pin a
+  specific tron-solc. A pinned version resolves offline against its compiled-in
+  sha256. A version **newer than this toolchain release** (not in the pin table)
+  is resolved online from the official `tronprotocol.github.io/solc-bin` list and
+  verified against the `sha256` that list publishes — so you can move to a
+  freshly released tron-solc without waiting for a toolchain update. With
+  `offline = true` an unpinned version fails deterministically instead of
+  reaching the network.
 - On Apple Silicon the macOS binary is a universal build — no Rosetta.
-- An explicit `solc = "/abs/path"` still overrides the resolver so you can point
-  at a locally built compiler.
+- An explicit `solc = "/abs/path"` still overrides the resolver entirely so you
+  can point at a locally built compiler.
 - `tron-revm` then executes the resulting TVM bytecode, so `forge test` runs the
   real tron-solc output rather than a vanilla-solc stand-in.
 
@@ -243,6 +272,73 @@ EVM `--gas-report --json` output is byte-for-byte unchanged.
 
 `forge snapshot` is unaffected — it parses the `(gas: N)` value from result
 text, which on Tron already carries energy.
+
+---
+
+## Dynamic energy (TIP-491)
+
+Tron charges "hot" contracts extra energy. Under TIP-491 (Proposal #83, live since
+2023) a contract that keeps executing more than `getDynamicEnergyThreshold`
+(5,000,000,000) energy per maintenance cycle accrues a per-contract **energy
+factor**; each maintenance cycle (6h) moves the factor up or down, capped at
+`getDynamicEnergyMaxFactor` (34000, precision 10000 → 3.4x). The charged energy is:
+
+```
+charged = base × (1 + factor / 10000)
+```
+
+applied to the energy a contract executes **in its own context** (its own
+instructions, not its sub-calls). USDT (`TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t`) sits
+at the maximum, so a `transfer()` costs up to 4.4x its base energy.
+
+**Where this shows up in the toolchain:**
+
+- **`forge test --gas-report` on a Tron fork** models the penalty. For every
+  contract in the run it fetches the live energy factor from the fork node
+  (`/wallet/getcontractinfo`) and, when a factor is present, adds a **Penalty Avg**
+  column to the function table and a **Deployment Penalty** cell (JSON:
+  `energy_penalty`). The base **Energy** columns stay base energy; the penalty is
+  reported alongside. Toggle with `[tron] dynamic_energy` (default `true`); a
+  non-fork run (fresh, factor-less contracts) leaves the report base-energy only.
+- **`cast estimate`** reports the penalty portion of a call's energy (see below).
+
+**Limitation:** the penalty is computed after the fact from the trace, not inside
+the interpreter, so a contract's own `gasleft()` inside a hot frame reflects base
+energy, not the charged total. Estimates and the gas-report penalty column are
+correct; only in-contract `gasleft()` introspection is base-only.
+
+---
+
+## Estimating cost (`cast estimate`)
+
+`cast estimate <contract> "<sig>" [args…] --from <addr>` estimates a call's Tron
+cost. Energy comes from the node's `/wallet/estimateenergy` when it is enabled,
+otherwise from `/wallet/triggerconstantcontract` (whose `energy_used` already
+includes the TIP-491 penalty); bandwidth is estimated from the call's calldata,
+and the live economics come from `/wallet/getchainparameters`.
+
+Text output (stdout is the result; `--json` emits the same fields):
+
+```
+energy used:         64285
+energy penalty:      49635
+bandwidth (bytes):   345
+suggested fee_limit: 7714200 SUN
+est. cost:           7.71 TRX
+```
+
+The suggested `fee_limit` applies a safety buffer and is clamped to the node's
+ceiling (`getMaxFeeLimit`, 15,000 TRX):
+
+```
+suggested_fee_limit = min(energy × energy_price × (100 + buffer) / 100,
+                          getMaxFeeLimit)
+```
+
+with a 20% buffer by default and `energy_price = getEnergyFee` (100 SUN). The
+broadcast paths (`cast send`, `forge create`, `forge script`) reject a `fee_limit`
+above `getMaxFeeLimit` before sending, with a hint to lower `--tron.fee-limit`.
+`base energy = energy_used − energy_penalty`.
 
 ---
 
