@@ -8,8 +8,10 @@
 //! that the shim, the Tron network dispatch, and the Tron energy model all cooperate on a real
 //! mainnet fork.
 
+use foundry_config::SolcReq;
 use foundry_evm_networks::NetworkConfigs;
 use foundry_tron_solc::{binary_path, default_version};
+use semver::Version;
 
 /// True when the pinned native `tron-solc` binary is cached on this machine
 /// (`~/.foundry-tron/solc/tron-solc-<version>`), so an offline compile-and-run Tron test can build
@@ -56,7 +58,7 @@ forgetest_init!(
             config.networks = NetworkConfigs::with_tron();
             // The test template pins `solc = SOLC_VERSION` (currently 0.8.35), which the native
             // tron-solc resolver has no pinned build for. Clear it so the resolver falls back to
-            // its pinned default (0.8.27), matching the sandbox project.
+            // its pinned default (0.8.28), matching the sandbox project.
             config.solc = None;
         });
 
@@ -65,7 +67,7 @@ forgetest_init!(
             r#"
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Own pragma so the harness does not inject `=SOLC_VERSION` (0.8.35), for which no native
-// tron-solc build is pinned; the caret range is satisfied by the resolved tron-solc 0.8.27.
+// tron-solc build is pinned; the caret range is satisfied by the resolved tron-solc 0.8.28.
 pragma solidity ^0.8.0;
 
 import "forge-std/Test.sol";
@@ -240,7 +242,7 @@ forgetest_init!(
             r#"
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Own pragma so the harness does not inject `=SOLC_VERSION`, for which no native tron-solc build is
-// pinned; the caret range is satisfied by the resolved tron-solc 0.8.27.
+// pinned; the caret range is satisfied by the resolved tron-solc 0.8.28.
 pragma solidity ^0.8.0;
 
 import "forge-std/Test.sol";
@@ -296,7 +298,7 @@ forgetest_init!(
             config.networks = NetworkConfigs::with_tron();
             // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
             // back to its pinned default; the Counter's `^0.8.13` pragma is satisfied
-            // by tron-solc 0.8.27.
+            // by tron-solc 0.8.28.
             config.solc = None;
             config.gas_reports = vec!["*".to_string()];
             config.gas_reports_ignore = vec![];
@@ -438,7 +440,7 @@ forgetest_init!(
             // `--verifier-url`; setting it exercises the real host-routing path offline.
             config.chain = Some(3_448_148_188u64.into());
             // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
-            // back to its pinned default (0.8.27); the Counter's `^0.8.13` pragma is satisfied.
+            // back to its pinned default (0.8.28); the Counter's `^0.8.13` pragma is satisfied.
             config.solc = None;
         });
 
@@ -524,9 +526,12 @@ forgetest_init!(
             // Nile chain id routes verification to nileapi.tronscan.org (mirrors the sandbox's
             // `chain_id = 3448148188`).
             config.chain = Some(3_448_148_188u64.into());
-            // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
-            // back to its pinned default (0.8.27); the Counter's `^0.8.13` pragma is satisfied.
-            config.solc = None;
+            // Pin the exact tron-solc whose TronScan compiler string was live-confirmed
+            // (`tron_v0.8.27+commit.19164bed`, Nile contract TDKFWYmx4D4makUGMg6kuVvWCjuXnCTJHQ).
+            // Both deploy and verify must share this version, and the toolchain default has since
+            // moved to 0.8.28, so pin explicitly rather than relying on the default. The harness's
+            // `=SOLC_VERSION` (0.8.35) has no native tron build; the Counter's `^0.8.13` is met.
+            config.solc = Some(SolcReq::Version(Version::new(0, 8, 27)));
         });
 
         // Own the Counter source with its own `^0.8.13` pragma so the harness does not inject

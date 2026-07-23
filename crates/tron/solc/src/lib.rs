@@ -176,7 +176,7 @@ impl Platform {
 
 /// The default `tron-solc` version (latest pinned release).
 pub const fn default_version() -> Version {
-    Version::new(0, 8, 27)
+    Version::new(0, 8, 28)
 }
 
 /// Returns the cache directory for `tron-solc` binaries: `~/.foundry-tron/solc`.
@@ -526,8 +526,12 @@ mod tests {
     const WINDOWS_LIST_FIXTURE: &str = include_str!("../testdata/list-windows-amd64.json");
 
     #[test]
-    fn default_version_is_0_8_27() {
-        assert_eq!(default_version(), Version::new(0, 8, 27));
+    fn default_version_is_0_8_28() {
+        assert_eq!(default_version(), Version::new(0, 8, 28));
+        // The default must always be a pinned version so it resolves offline.
+        assert!(pinned_sha256(&default_version(), Platform::MacOs).is_some());
+        assert!(pinned_sha256(&default_version(), Platform::LinuxAmd64).is_some());
+        assert!(pinned_sha256(&default_version(), Platform::WindowsAmd64).is_some());
     }
 
     #[test]

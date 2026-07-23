@@ -5473,14 +5473,15 @@ mod tests {
     }
 
     // Tron + no explicit `solc` must auto-resolve the pinned default tron-solc
-    // (0.8.27) via `foundry-tron-solc`, not svm/AutoDetect. Driven with
-    // `offline = true` so it can only succeed off the machine cache — never the
-    // network — and it skips cleanly when the cached binary is absent (e.g. CI
-    // without tron-solc installed). `eprintln!` documents the skip.
+    // via `foundry-tron-solc`, not svm/AutoDetect. Driven with `offline = true`
+    // so it can only succeed off the machine cache — never the network — and it
+    // skips cleanly when the cached binary is absent (e.g. CI without tron-solc
+    // installed). Tracks `default_version()` so a default bump does not falsify
+    // it. `eprintln!` documents the skip.
     #[test]
     #[allow(clippy::disallowed_macros)]
     fn tron_ensure_solc_auto_resolves_default_from_cache() {
-        let version = Version::new(0, 8, 27);
+        let version = foundry_tron_solc::default_version();
         let Ok(cached) = foundry_tron_solc::binary_path(&version) else {
             eprintln!("skipping tron auto-resolve test: no home directory");
             return;
@@ -5488,7 +5489,7 @@ mod tests {
         if !cached.is_file() {
             eprintln!(
                 "skipping tron auto-resolve test: no cached tron-solc at {} \
-                 (install tron-solc 0.8.27 to exercise this path)",
+                 (install the default tron-solc {version} to exercise this path)",
                 cached.display()
             );
             return;
