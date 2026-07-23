@@ -13,7 +13,7 @@ use alloy_rpc_types::{BlockNumberOrTag, anvil::NodeInfo};
 use eyre::WrapErr;
 use foundry_common::{ALCHEMY_FREE_TIER_CUPS, NON_ARCHIVE_NODE_WARNING, provider::ProviderBuilder};
 use foundry_config::{Chain, Config, GasLimit};
-use foundry_evm_networks::NetworkConfigs;
+use foundry_evm_networks::{NetworkConfigs, tron::TRON_MAINNET_CHAIN_ID};
 use revm::{context::CfgEnv, primitives::hardfork::SpecId};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
@@ -275,7 +275,16 @@ impl EvmOpts {
     fn local_evm_env<SPEC: Into<SpecId> + Default + Clone, BLOCK: FoundryBlock + Default>(
         &self,
     ) -> EvmEnv<SPEC, BLOCK> {
-        let cfg_env = self.cfg_env(self.env.chain_id.unwrap_or(foundry_common::DEV_CHAIN_ID));
+        // On the Tron network a non-fork run defaults to Tron mainnet's chain id so
+        // `block.chainid` (and EIP-712 / permit domains) resolve without a manual
+        // `chain_id` in foundry.toml. An explicit `chain_id` in config (e.g. Nile
+        // 3448148188) still wins; forks take the node's id.
+        let default_chain_id = if self.networks.is_tron() {
+            TRON_MAINNET_CHAIN_ID
+        } else {
+            foundry_common::DEV_CHAIN_ID
+        };
+        let cfg_env = self.cfg_env(self.env.chain_id.unwrap_or(default_chain_id));
         let mut block_env = BLOCK::default();
         block_env.set_number(self.env.block_number);
         block_env.set_beneficiary(self.env.block_coinbase);
@@ -478,6 +487,30 @@ mod tests {
     use revm::context::{BlockEnv, TxEnv};
 
     use super::*;
+
+    #[test]
+    fn local_tron_env_defaults_chain_id_to_mainnet() {
+        let mut opts = EvmOpts::default();
+        opts.networks = NetworkConfigs::with_tron();
+        let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
+        assert_eq!(env.cfg_env.chain_id, TRON_MAINNET_CHAIN_ID);
+    }
+
+    #[test]
+    fn local_non_tron_env_keeps_dev_chain_id() {
+        let opts = EvmOpts::default();
+        let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
+        assert_eq!(env.cfg_env.chain_id, foundry_common::DEV_CHAIN_ID);
+    }
+
+    #[test]
+    fn local_tron_env_explicit_chain_id_wins() {
+        let mut opts = EvmOpts::default();
+        opts.networks = NetworkConfigs::with_tron();
+        opts.env.chain_id = Some(foundry_evm_networks::tron::TRON_NILE_CHAIN_ID);
+        let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
+        assert_eq!(env.cfg_env.chain_id, foundry_evm_networks::tron::TRON_NILE_CHAIN_ID);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn infer_network_default_anvil_selects_ethereum() {

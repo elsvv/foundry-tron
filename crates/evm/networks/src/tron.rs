@@ -16,6 +16,18 @@
 
 use alloy_primitives::Address;
 
+/// Tron mainnet chain id (`728126428`) — the value the `CHAINID` opcode returns on
+/// Tron mainnet. Used as the default local (non-fork) chain id for `network = "tron"`
+/// projects so EIP-712 / permit domains resolve without a manual `chain_id` in
+/// `foundry.toml`. An explicit `chain_id` in config still wins; a fork takes the
+/// node's id.
+pub const TRON_MAINNET_CHAIN_ID: u64 = 728_126_428;
+
+/// Tron Nile testnet chain id (`3448148188`). Broadcast artifacts land under this id
+/// (`broadcast/<script>/3448148188/`). Set `chain_id = 3448148188` in config to target
+/// Nile; the explicit value overrides the mainnet default above.
+pub const TRON_NILE_CHAIN_ID: u64 = 3_448_148_188;
+
 /// Builds a 20-byte precompile address whose low 8 bytes are `id`, matching
 /// java-tron's `new DataWord("0000..00<id>")` precompile address constants.
 const fn addr(id: u64) -> Address {
@@ -152,6 +164,14 @@ mod tests {
             format!("{TOTAL_ACQUIRED_RESOURCE:?}"),
             "0x0000000000000000000000000000000001000015"
         );
+    }
+
+    #[test]
+    fn chain_ids_match_tron_networks() {
+        // Cross-checked against `getChainId` on both networks (mainnet `api.trongrid.io`,
+        // Nile `api.nileex.io`) and the broadcast-artifact directory layout.
+        assert_eq!(TRON_MAINNET_CHAIN_ID, 728_126_428);
+        assert_eq!(TRON_NILE_CHAIN_ID, 3_448_148_188);
     }
 
     #[test]
