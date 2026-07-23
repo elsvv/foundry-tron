@@ -41,7 +41,7 @@ use foundry_config::{
     merge_impl_figment_convert,
 };
 use foundry_tron_primitives::{to_base58, to_hex41, units::format_sun_as_trx};
-use foundry_tron_provider::{TronProvider, TxOptions};
+use foundry_tron_provider::{TronProvider, TxOptions, check_fee_limit};
 use foundry_wallets::{
     BrowserWalletOpts, TempoAccessKeyConfig, WalletSigner, wallet_browser::signer::BrowserSigner,
 };
@@ -289,6 +289,14 @@ impl CreateArgs {
         let provider = tron_provider(&config)?;
         let poll = tron_poll_params(&tron_cfg);
 
+        // Reject a fee_limit the node would refuse (above getMaxFeeLimit) before
+        // broadcasting. Best-effort: fall back to the snapshot ceiling when the node
+        // cannot be reached for its live chain parameters.
+        let params = provider.get_chain_parameters().await.unwrap_or_default();
+        if let Err(msg) = check_fee_limit(opts.fee_limit, &params) {
+            eyre::bail!(msg);
+        }
+
         sh_status!("Deploying {} to Tron...", self.contract.name)?;
         let (txid, addr, info) =
             provider.deploy_contract(&signer, bytecode, "", &opts, poll).await?;
@@ -304,7 +312,16 @@ impl CreateArgs {
         } else {
             sh_status!("status:      {}", if info.success { "success" } else { "failed" })?;
             if info.energy_used > 0 {
-                sh_status!("energy used: {}", info.energy_used)?;
+                if info.energy_penalty_total > 0 {
+                    sh_status!(
+                        "energy used: {} (penalty {}, base {})",
+                        info.energy_used,
+                        info.energy_penalty_total,
+                        info.energy_used.saturating_sub(info.energy_penalty_total),
+                    )?;
+                } else {
+                    sh_status!("energy used: {}", info.energy_used)?;
+                }
             }
             sh_status!("fee:         {} TRX", format_sun_as_trx(info.fee_sun))?;
             sh_println!("Deployer: {}", to_base58(deployer))?;

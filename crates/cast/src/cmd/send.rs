@@ -164,6 +164,14 @@ impl SendTxArgs {
         let (attempts, interval) = crate::tron::poll_params(&tron_cfg);
         let wait = !self.send_tx.cast_async;
 
+        // Reject a fee_limit the node would refuse (above getMaxFeeLimit) before any
+        // signing/broadcast. Best-effort: fall back to the snapshot ceiling when the
+        // node cannot be reached for its live chain parameters.
+        let params = provider.get_chain_parameters().await.unwrap_or_default();
+        if let Err(msg) = foundry_tron_provider::check_fee_limit(opts.fee_limit, &params) {
+            eyre::bail!(msg);
+        }
+
         // On Tron `--value` is denominated in SUN.
         let value_sun = crate::tron::value_sun(self.tx.value)?;
 

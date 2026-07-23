@@ -36,7 +36,7 @@ use foundry_tron_primitives::{
 };
 use foundry_tron_provider::{
     TronError, TronProvider, TxInfo, TxOptions, build_create_raw, build_transfer_raw,
-    build_trigger_raw,
+    build_trigger_raw, check_fee_limit,
 };
 use foundry_wallets::WalletSigner;
 use std::{
@@ -123,6 +123,14 @@ impl BundledState<TronEvmNetwork> {
             let total = sequence.sequences()[i].transactions.len();
             if already >= total {
                 continue;
+            }
+
+            // Reject a fee_limit the node would refuse (above getMaxFeeLimit) before
+            // broadcasting anything on this chain. Best-effort: fall back to the
+            // snapshot ceiling when the node cannot be reached.
+            let params = provider.get_chain_parameters().await.unwrap_or_default();
+            if let Err(msg) = check_fee_limit(opts.fee_limit, &params) {
+                bail!(msg);
             }
 
             if !shell::is_json() {
@@ -607,13 +615,35 @@ const fn tron_receipt(
 }
 
 /// Prints Tron transaction progress (energy and TRX fee, not ETH/gas) to stderr.
+/// The TIP-491 penalty portion, the caller/origin energy split and bandwidth
+/// usage are shown only when non-zero, so a penalty-free transaction prints
+/// exactly as before.
 fn report_progress(sent: &SentTx) -> Result<()> {
-    sh_status!(
-        "tron: {} confirmed ({} TRX fee, {} energy)",
-        hex::encode(sent.txid),
-        format_sun_as_trx(sent.info.fee_sun),
-        sent.info.energy_used
-    )?;
+    let info = &sent.info;
+    if info.energy_penalty_total > 0 {
+        sh_status!(
+            "tron: {} confirmed ({} TRX fee, {} energy incl. {} penalty)",
+            hex::encode(sent.txid),
+            format_sun_as_trx(info.fee_sun),
+            info.energy_used,
+            info.energy_penalty_total,
+        )?;
+    } else {
+        sh_status!(
+            "tron: {} confirmed ({} TRX fee, {} energy)",
+            hex::encode(sent.txid),
+            format_sun_as_trx(info.fee_sun),
+            info.energy_used,
+        )?;
+    }
+    if info.energy_usage_caller > 0 || info.origin_energy_usage > 0 {
+        sh_status!(
+            "tron:   caller/origin energy {} / {}, net {} bytes",
+            info.energy_usage_caller,
+            info.origin_energy_usage,
+            info.net_usage,
+        )?;
+    }
     if let Some(addr) = sent.contract_address {
         sh_status!("tron: deployed to {} ({})", to_base58(addr), to_hex41(addr))?;
     }
