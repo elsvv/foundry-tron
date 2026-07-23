@@ -55,11 +55,26 @@ pub struct NowBlock {
     pub timestamp_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TxInfo {
     pub block_number: i64,
     pub fee_sun: u64,
+    /// `receipt.energy_usage_total`: total energy charged, TIP-491 dynamic-energy
+    /// penalty already included.
     pub energy_used: u64,
+    /// `receipt.energy_penalty_total`: the penalty portion of `energy_used`
+    /// (absent on pre-4.7.2 nodes ⇒ 0). Base energy = `energy_used − penalty`.
+    pub energy_penalty_total: u64,
+    /// `receipt.energy_usage`: energy paid from the caller's own staked energy.
+    pub energy_usage_caller: u64,
+    /// `receipt.origin_energy_usage`: energy paid by the contract owner's stake
+    /// (the `consume_user_resource_percent` share the deployer bankrolls).
+    pub origin_energy_usage: u64,
+    /// `receipt.net_usage`: bandwidth, in bytes, paid from free/staked bandwidth.
+    pub net_usage: u64,
+    /// `receipt.net_fee`: bandwidth burned to TRX, in SUN, when free/staked
+    /// bandwidth did not cover the transaction.
+    pub net_fee_sun: u64,
     pub success: bool,
     pub contract_address: Option<Address>,
 }
@@ -67,7 +82,12 @@ pub struct TxInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstantResult {
     pub result: Vec<u8>,
+    /// Total metered energy, TIP-491 penalty included (java-tron reports
+    /// `energy_used` with the dynamic-energy penalty already added in).
     pub energy_used: u64,
+    /// TIP-491 dynamic-energy penalty portion of `energy_used` (4.7.2+ nodes;
+    /// absent ⇒ 0). Base energy = `energy_used − energy_penalty`.
+    pub energy_penalty: u64,
     pub success: bool,
 }
 
@@ -263,6 +283,43 @@ impl TronProvider {
         let v: serde_json::Value =
             self.post_json("/wallet/getchainparameters", serde_json::json!({})).await?;
         Ok(parse_chain_parameters(&v))
+    }
+
+    /// Estimates the energy a `TriggerSmartContract` call from `owner` to
+    /// `contract` with the ABI-encoded `data` would consume, via
+    /// `/wallet/estimateenergy` (4.7.0.1+, gated on the node's `vm.estimateEnergy`
+    /// + `vm.supportConstant`).
+    ///
+    /// Returns `Some(energy_required)` on a supporting node. Returns `Ok(None)`
+    /// when the node has the endpoint disabled (the documented
+    /// "this node does not support estimate energy" validate error) — the signal
+    /// for the caller to fall back to [`trigger_constant`], whose `energy_used`
+    /// already includes the TIP-491 penalty. Any other node/decode error (a
+    /// revert, bad arguments) propagates.
+    pub async fn estimate_energy(
+        &self,
+        owner: Address,
+        contract: Address,
+        data: &[u8],
+    ) -> Result<Option<u64>, TronError> {
+        let body = serde_json::json!({
+            "owner_address": to_hex41(owner),
+            "contract_address": to_hex41(contract),
+            "data": hex::encode(data),
+            "visible": false,
+        });
+        let v: serde_json::Value = self.post_json("/wallet/estimateenergy", body).await?;
+        parse_estimate_energy(&v)
+    }
+
+    /// Returns `contract`'s current TIP-491 dynamic-energy factor (precision
+    /// 10000, i.e. 34000 = 3.4x, up to 4.4x total charged energy) from
+    /// `/wallet/getcontractinfo`'s `contract_state.energy_factor`. A fresh or cold
+    /// contract has accrued no factor and the field is absent ⇒ 0.
+    pub async fn get_contract_energy_factor(&self, contract: Address) -> Result<u32, TronError> {
+        let body = serde_json::json!({ "value": to_hex41(contract), "visible": false });
+        let v: serde_json::Value = self.post_json("/wallet/getcontractinfo", body).await?;
+        Ok(parse_energy_factor(&v))
     }
 
     /// Broadcasts a signed transaction via `/wallet/broadcasthex`. On rejection
@@ -578,6 +635,46 @@ pub fn estimate_create_bandwidth(
     signed_bandwidth(raw)
 }
 
+/// Default headroom, in percent, added to the raw energy cost when suggesting a
+/// `fee_limit`. Twenty percent absorbs the TIP-491 dynamic-energy factor moving up
+/// by up to one maintenance cycle (+20%) between the estimate and the broadcast.
+pub const DEFAULT_FEE_LIMIT_BUFFER_PCT: u64 = 20;
+
+/// Suggests a `fee_limit` in SUN for a transaction that consumes `energy_total`
+/// energy: the energy cost at the node's live price (`params.energy_fee_sun`)
+/// inflated by `buffer_pct` percent of headroom, then clamped to the node's
+/// `getMaxFeeLimit`. The clamp guarantees the node accepts the limit — a
+/// `fee_limit` above `getMaxFeeLimit` is rejected outright. Intermediate
+/// arithmetic is `u128` so a large energy estimate cannot overflow before the
+/// clamp.
+pub fn suggest_fee_limit_sun(energy_total: u64, params: &TronChainParams, buffer_pct: u64) -> u64 {
+    let raw = (energy_total as u128)
+        .saturating_mul(params.energy_fee_sun as u128)
+        .saturating_mul(100 + buffer_pct as u128)
+        / 100;
+    raw.min(params.max_fee_limit_sun as u128) as u64
+}
+
+/// Validates a `fee_limit` (SUN) against the node's `getMaxFeeLimit` ceiling and
+/// the positivity the protocol requires. Returns a human-readable reason when the
+/// limit is unusable so the CLI caller can surface it (a `fee_limit` above
+/// `getMaxFeeLimit`, or non-positive, is rejected by the node), `Ok(())`
+/// otherwise.
+pub fn check_fee_limit(fee_limit: i64, params: &TronChainParams) -> Result<(), String> {
+    if fee_limit <= 0 {
+        return Err(format!("tron fee_limit must be positive (got {fee_limit} SUN)"));
+    }
+    if fee_limit as u128 > params.max_fee_limit_sun as u128 {
+        return Err(format!(
+            "tron fee_limit {fee_limit} SUN exceeds the node's getMaxFeeLimit {} SUN ({} TRX); \
+             lower it with --tron.fee-limit or the [tron] fee_limit config",
+            params.max_fee_limit_sun,
+            params.max_fee_limit_sun / 1_000_000,
+        ));
+    }
+    Ok(())
+}
+
 /// Parses a raw `/wallet/getnowblock` JSON response.
 pub(crate) fn parse_now_block(v: &serde_json::Value) -> Result<NowBlock, TronError> {
     let missing = |f: &str| TronError::Decode(format!("getnowblock: missing {f}"));
@@ -627,10 +724,16 @@ pub(crate) fn parse_tx_info(v: &serde_json::Value) -> Result<Option<TxInfo>, Tro
         ),
         None => None,
     };
+    let ru64 = |field: &str| receipt.get(field).and_then(|e| e.as_u64()).unwrap_or(0);
     Ok(Some(TxInfo {
         block_number,
         fee_sun: v.get("fee").and_then(|f| f.as_u64()).unwrap_or(0),
-        energy_used: receipt.get("energy_usage_total").and_then(|e| e.as_u64()).unwrap_or(0),
+        energy_used: ru64("energy_usage_total"),
+        energy_penalty_total: ru64("energy_penalty_total"),
+        energy_usage_caller: ru64("energy_usage"),
+        origin_energy_usage: ru64("origin_energy_usage"),
+        net_usage: ru64("net_usage"),
+        net_fee_sun: ru64("net_fee"),
         success,
         contract_address,
     }))
@@ -647,6 +750,7 @@ pub(crate) fn parse_constant_result(v: &serde_json::Value) -> Result<ConstantRes
     Ok(ConstantResult {
         result,
         energy_used: v.get("energy_used").and_then(|e| e.as_u64()).unwrap_or(0),
+        energy_penalty: v.get("energy_penalty").and_then(|e| e.as_u64()).unwrap_or(0),
         success,
     })
 }
@@ -693,6 +797,40 @@ pub(crate) fn parse_chain_parameters(v: &serde_json::Value) -> TronChainParams {
     // present, non-zero value flips it on.
     params.allow_tvm_osaka = get("getAllowTvmOsaka").unwrap_or(0) != 0;
     params
+}
+
+/// Parses a `/wallet/estimateenergy` response. `Some(energy_required)` on a
+/// supporting node, `Ok(None)` when the node reports it does not support the
+/// endpoint (the fall-back signal), and `Err` for any other error.
+pub(crate) fn parse_estimate_energy(v: &serde_json::Value) -> Result<Option<u64>, TronError> {
+    // Supporting node: { "result": { "result": true }, "energy_required": N }.
+    if let Some(required) = v.get("energy_required").and_then(|e| e.as_u64()) {
+        return Ok(Some(required));
+    }
+    // Disabled endpoint: a CONTRACT_VALIDATE_ERROR whose (hex) message decodes to
+    // "... does not support estimate energy". That is the fall-back signal, not a
+    // hard error.
+    let code = v["result"].get("code").and_then(|c| c.as_str()).unwrap_or_default();
+    let raw_msg = v["result"].get("message").and_then(|m| m.as_str()).unwrap_or_default();
+    let message = hex::decode(raw_msg)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| raw_msg.to_string());
+    if message.contains("does not support estimate energy") {
+        return Ok(None);
+    }
+    // Any other failure (a revert, bad arguments, a different disablement) propagates.
+    Err(TronError::Api { code: code.to_string(), message })
+}
+
+/// Parses `contract_state.energy_factor` (TIP-491 dynamic-energy factor, precision
+/// 10000) from a `/wallet/getcontractinfo` response. Absent (fresh/cold contract,
+/// or non-contract `{}` body) ⇒ 0.
+pub(crate) fn parse_energy_factor(v: &serde_json::Value) -> u32 {
+    v.get("contract_state")
+        .and_then(|s| s.get("energy_factor"))
+        .and_then(|f| f.as_u64())
+        .unwrap_or(0) as u32
 }
 
 /// Parses a `/wallet/broadcasthex` response. `result == true` is success;
@@ -966,6 +1104,178 @@ mod tests {
         }
         assert!(live.energy_fee_sun > 0, "getEnergyFee must be positive");
         assert!(live.max_fee_limit_sun > 0, "getMaxFeeLimit must be positive");
+    }
+
+    /// The constant-call parser reads the TIP-491 `energy_penalty` alongside
+    /// `energy_used`. Fixture: the real mainnet `triggerconstantcontract` reply for
+    /// USDT `transfer(address,uint256)` (captured 2026-07-23), whose
+    /// `energy_used = 64285` already includes `energy_penalty = 49635`, so the base
+    /// energy the local model reproduces is `64285 − 49635 = 14650`.
+    #[test]
+    fn parses_constant_result_energy_penalty_mainnet_usdt() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_triggerconstant_usdt.json"))
+                .unwrap();
+        let cr = parse_constant_result(&v).unwrap();
+        assert!(cr.success);
+        assert_eq!(cr.energy_used, 64285, "energy_used includes the penalty");
+        assert_eq!(cr.energy_penalty, 49635, "TIP-491 penalty portion");
+        assert_eq!(cr.energy_used - cr.energy_penalty, 14650, "base = used − penalty");
+    }
+
+    /// A pre-4.7.2 reply without `energy_penalty` reads the penalty as 0 (the
+    /// existing Nile totalSupply fixture carries no penalty field).
+    #[test]
+    fn constant_result_penalty_defaults_to_zero() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/nile_triggerconstant.json")).unwrap();
+        assert_eq!(parse_constant_result(&v).unwrap().energy_penalty, 0);
+    }
+
+    /// The tx-info parser reads the extended receipt resource fields. Fixture: the
+    /// real mainnet receipt for a USDT `transfer` (captured 2026-07-23) whose
+    /// caller paid energy from stake and burned bandwidth to TRX.
+    #[test]
+    fn parses_tx_info_resource_fields_mainnet_usdt() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_txinfo_usdt.json")).unwrap();
+        let info = parse_tx_info(&v).unwrap().expect("mined tx is in a block");
+        assert!(info.success);
+        assert_eq!(info.block_number, 84_706_816);
+        assert_eq!(info.energy_used, 64285, "energy_usage_total");
+        assert_eq!(info.energy_penalty_total, 49635, "energy_penalty_total");
+        assert_eq!(info.energy_usage_caller, 64285, "receipt.energy_usage (caller stake)");
+        assert_eq!(info.net_fee_sun, 345000, "receipt.net_fee (bandwidth burned to SUN)");
+        // Not present in this receipt ⇒ default 0.
+        assert_eq!(info.origin_energy_usage, 0);
+        assert_eq!(info.net_usage, 0);
+        assert_eq!(info.energy_used - info.energy_penalty_total, 14650, "base = used − penalty");
+    }
+
+    /// A supporting node's `estimateenergy` reply yields `Some(energy_required)`.
+    /// The response shape follows java-tron's `EstimateEnergyMessage`
+    /// (`result` + `energy_required`); public TronGrid/Nile disable the endpoint,
+    /// so the supported shape is exercised against the documented schema while the
+    /// disabled shape below is a captured live fixture.
+    #[test]
+    fn estimate_energy_supported_returns_some() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/estimateenergy_supported.json"))
+                .unwrap();
+        assert_eq!(parse_estimate_energy(&v).unwrap(), Some(64285));
+    }
+
+    /// A node with the endpoint disabled returns a CONTRACT_VALIDATE_ERROR whose
+    /// message decodes to "this node does not support estimate energy"; the parser
+    /// maps it to `Ok(None)` (the fall-back signal). Fixture: the real mainnet
+    /// reply captured 2026-07-23.
+    #[test]
+    fn estimate_energy_unsupported_returns_none() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/mainnet_estimateenergy_unsupported.json"
+        ))
+        .unwrap();
+        assert_eq!(parse_estimate_energy(&v).unwrap(), None);
+    }
+
+    /// Any other estimateenergy failure (e.g. a revert) propagates as an error,
+    /// never silently as `None`.
+    #[test]
+    fn estimate_energy_other_error_propagates() {
+        let v = serde_json::json!({
+            "result": { "code": "CONTRACT_EXE_ERROR", "message": hex::encode("REVERT opcode executed") }
+        });
+        let err = parse_estimate_energy(&v).unwrap_err();
+        assert!(matches!(err, TronError::Api { .. }));
+    }
+
+    /// The energy-factor parser reads `contract_state.energy_factor`. Fixtures: the
+    /// real mainnet `getcontractinfo` for USDT (a hot contract pinned at the max
+    /// factor 34000) and for a cold contract whose `contract_state` omits the
+    /// field ⇒ 0; an empty `{}` (non-contract) is also 0.
+    #[test]
+    fn parses_energy_factor_mainnet_fixtures() {
+        let hot: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontractinfo_usdt.json"))
+                .unwrap();
+        assert_eq!(parse_energy_factor(&hot), 34000, "USDT is at the max energy factor");
+        let cold: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontractinfo_cold.json"))
+                .unwrap();
+        assert_eq!(parse_energy_factor(&cold), 0, "cold contract has no accrued factor");
+        assert_eq!(parse_energy_factor(&serde_json::json!({})), 0, "non-contract ⇒ 0");
+    }
+
+    /// Live (mainnet, read-only) USDT estimate loop: the constant call reports a
+    /// non-zero TIP-491 penalty, `getcontractinfo` reports a positive energy
+    /// factor, and `estimateenergy` on the public node signals it is unsupported
+    /// (⇒ the `trigger_constant` fallback). Spends no TRX.
+    #[tokio::test]
+    async fn live_usdt_estimate_loop_on_mainnet() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live mainnet read-only tests");
+            return;
+        }
+        let p = TronProvider::new("https://api.trongrid.io").unwrap();
+        let usdt =
+            foundry_tron_primitives::address::parse("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+        // A large USDT holder (real, funded), used only as the constant-call owner.
+        let holder =
+            foundry_tron_primitives::address::parse("TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb").unwrap();
+        // transfer(holder, 1): selector a9059cbb + address word + amount 1.
+        let mut data = hex::decode("a9059cbb").unwrap();
+        data.extend_from_slice(&{
+            let mut w = [0u8; 32];
+            w[12..].copy_from_slice(holder.as_slice());
+            w
+        });
+        data.extend_from_slice(&alloy_primitives::U256::from(1u64).to_be_bytes::<32>());
+
+        let cr = p.trigger_constant(holder, usdt, &data).await.unwrap();
+        assert!(cr.success, "constant transfer must succeed");
+        assert!(cr.energy_penalty > 0, "USDT carries a TIP-491 penalty");
+        assert!(cr.energy_used > cr.energy_penalty, "base = used − penalty must be positive");
+
+        let factor = p.get_contract_energy_factor(usdt).await.unwrap();
+        assert!(factor > 0, "USDT has a non-zero dynamic-energy factor");
+
+        // Public TronGrid disables estimateenergy ⇒ None (fall-back signal).
+        assert_eq!(
+            p.estimate_energy(holder, usdt, &data).await.unwrap(),
+            None,
+            "public node signals estimateenergy is unsupported",
+        );
+    }
+
+    #[test]
+    fn suggest_fee_limit_applies_buffer_and_clamp() {
+        let params = TronChainParams::default(); // energy 100 sun, max 15_000_000_000.
+        // A USDT-class transfer (~64285 energy) at 100 sun with the default 20%
+        // buffer: 64285 * 100 * 1.2 = 7_714_200 SUN (~7.7 TRX), well under the cap.
+        assert_eq!(suggest_fee_limit_sun(64_285, &params, DEFAULT_FEE_LIMIT_BUFFER_PCT), 7_714_200,);
+        // Zero buffer is the bare energy cost.
+        assert_eq!(suggest_fee_limit_sun(64_285, &params, 0), 6_428_500);
+        // A huge estimate clamps to getMaxFeeLimit (15_000 TRX): 200e6 * 100 * 1.2
+        // = 24e9 > 15e9 ⇒ clamped.
+        assert_eq!(
+            suggest_fee_limit_sun(200_000_000, &params, DEFAULT_FEE_LIMIT_BUFFER_PCT),
+            15_000_000_000,
+        );
+        // Zero energy ⇒ zero suggestion.
+        assert_eq!(suggest_fee_limit_sun(0, &params, DEFAULT_FEE_LIMIT_BUFFER_PCT), 0);
+    }
+
+    #[test]
+    fn check_fee_limit_rejects_over_max_and_non_positive() {
+        let params = TronChainParams::default();
+        assert!(check_fee_limit(1_000_000_000, &params).is_ok(), "1000 TRX is under the cap");
+        assert!(check_fee_limit(15_000_000_000, &params).is_ok(), "exactly getMaxFeeLimit is ok");
+        assert!(
+            check_fee_limit(15_000_000_001, &params).is_err(),
+            "one SUN over getMaxFeeLimit is rejected"
+        );
+        assert!(check_fee_limit(0, &params).is_err(), "zero fee_limit is rejected");
+        assert!(check_fee_limit(-1, &params).is_err(), "negative fee_limit is rejected");
     }
 
     #[test]

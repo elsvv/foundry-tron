@@ -835,6 +835,7 @@ mod tests {
             energy_used: 31_895,
             success: true,
             contract_address: Some(contract),
+            ..Default::default()
         };
         let r = tron_receipt(txid, from, &info, Some(contract), None, 0);
         assert_eq!(r.gas_used, 31_895);
@@ -868,6 +869,7 @@ mod tests {
             energy_used: 0,
             success: true,
             contract_address: Some(local),
+            ..Default::default()
         };
         assert!(verify_deploy_address(local, &ok).is_ok());
         let bad = TxInfo { contract_address: Some(other), ..ok };

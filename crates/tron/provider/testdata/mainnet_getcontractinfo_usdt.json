@@ -1,0 +1,10 @@
+{
+  "smart_contract": {
+    "contract_address": "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"
+  },
+  "contract_state": {
+    "update_cycle": 9828,
+    "energy_usage": 2406807705,
+    "energy_factor": 34000
+  }
+}
