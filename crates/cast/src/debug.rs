@@ -66,7 +66,11 @@ pub(crate) async fn handle_traces(
         .with_tempo_hardfork(
             tempo_hardfork
                 .or_else(|| chain.is_tempo().then(|| config.evm_spec_id::<TempoHardfork>())),
-        );
+        )
+        // On Tron, render unlabeled contracts and decoded address values as base58.
+        .with_tron_address_formatter(config.networks.is_tron().then_some(
+            foundry_tron_primitives::address::to_base58 as fn(alloy_primitives::Address) -> String,
+        ));
     let mut identifier = TraceIdentifiers::new().with_external(config, Some(chain))?;
     if let Some(contracts) = &known_contracts {
         builder = builder.with_known_contracts(contracts);

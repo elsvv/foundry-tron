@@ -11,8 +11,11 @@ use alloy_primitives::{
 };
 use alloy_sol_types::SolValue;
 use foundry_common::{
-    ContractsByArtifact, SELECTOR_LEN, abi::get_indexed_event, fmt::format_token,
-    get_contract_name, selectors::SelectorKind,
+    ContractsByArtifact, SELECTOR_LEN,
+    abi::get_indexed_event,
+    fmt::{format_token, format_token_with_address},
+    get_contract_name,
+    selectors::SelectorKind,
 };
 use foundry_evm_core::{
     abi::{Vm, console},
@@ -143,6 +146,18 @@ impl CallTraceDecoderBuilder {
         self
     }
 
+    /// Sets the Tron address renderer. Pass `Some(foundry_tron_primitives::address::to_base58)` on
+    /// a Tron run so unlabeled contracts and decoded address values print base58; `None` (the
+    /// default, off Tron) keeps hex rendering and EVM traces byte-identical.
+    #[inline]
+    pub const fn with_tron_address_formatter(
+        mut self,
+        formatter: Option<fn(Address) -> String>,
+    ) -> Self {
+        self.decoder.tron_address_formatter = formatter;
+        self
+    }
+
     /// Build the decoder.
     #[inline]
     pub fn build(self) -> CallTraceDecoder {
@@ -208,6 +223,13 @@ pub struct CallTraceDecoder {
 
     /// The Tempo hardfork, used to determine hardfork-specific precompiles.
     pub tempo_hardfork: Option<TempoHardfork>,
+
+    /// Optional Tron address renderer. When `Some` (a Tron run), an unlabeled contract is
+    /// identified in the trace tree by its base58 form and every address in decoded arguments,
+    /// returns and logs is printed base58. `None` keeps the default hex rendering, so EVM traces
+    /// stay byte-identical. The crate stays free of a Tron dependency by taking the formatter as a
+    /// function pointer supplied at the call site.
+    pub tron_address_formatter: Option<fn(Address) -> String>,
 }
 
 impl CallTraceDecoder {
@@ -342,6 +364,8 @@ impl CallTraceDecoder {
             opcodes: Vec::new(),
 
             tempo_hardfork: None,
+
+            tron_address_formatter: None,
         }
     }
 
@@ -619,8 +643,16 @@ impl CallTraceDecoder {
 
     /// Decodes a call trace.
     pub async fn decode_function(&self, trace: &CallTrace) -> DecodedCallTrace {
-        let label =
-            if self.disable_labels { None } else { self.labels.get(&trace.address).cloned() };
+        // On Tron, an address with no explicit label is identified in the trace tree by its base58
+        // form (a user `vm.label` and known contracts still win, since `labels` is checked first).
+        let label = if self.disable_labels {
+            None
+        } else {
+            self.labels
+                .get(&trace.address)
+                .cloned()
+                .or_else(|| self.tron_address_formatter.map(|to_base58| to_base58(trace.address)))
+        };
 
         if trace.kind.is_any_create() {
             return DecodedCallTrace {
@@ -1147,9 +1179,18 @@ impl CallTraceDecoder {
         if let DynSolValue::Address(addr) = value
             && let Some(label) = self.labels.get(addr)
         {
-            return format!("{label}: [{addr}]");
+            // A labeled address keeps its label; on Tron the bracketed address is base58.
+            let shown = self
+                .tron_address_formatter
+                .map(|to_base58| to_base58(*addr))
+                .unwrap_or_else(|| addr.to_string());
+            return format!("{label}: [{shown}]");
         }
-        format_token(value)
+        // On Tron, render addresses (including those nested in arrays/tuples/structs) as base58.
+        match self.tron_address_formatter {
+            Some(to_base58) => format_token_with_address(value, &|addr| to_base58(*addr)),
+            None => format_token(value),
+        }
     }
 
     fn format_param_value(
@@ -2564,5 +2605,68 @@ mod tests {
 
         // On Ethereum, Tempo precompile addresses are regular contracts — should NOT be filtered.
         assert_eq!(identifier.queried, vec![regular_addr, tempo_precompile]);
+    }
+
+    /// A synthetic Tron-style address renderer. The traces crate carries no Tron dependency (the
+    /// real renderer is `foundry_tron_primitives::address::to_base58`, supplied at the call site),
+    /// so the test uses a distinct, deterministic tag to prove only that the formatter is applied.
+    fn fake_base58(addr: Address) -> String {
+        format!("T{}", hex::encode(&addr.as_slice()[..3]))
+    }
+
+    /// With a Tron address formatter, decoded address values render through it — top-level and
+    /// nested — while a user label still wins (its bracketed address is base58). Off Tron the
+    /// default hex rendering is unchanged.
+    #[test]
+    fn tron_address_formatter_renders_decoded_addresses() {
+        let a = Address::from([0xAB; 20]);
+
+        // Off Tron: default EIP-55 checksummed hex, byte-identical to before.
+        let evm = CallTraceDecoderBuilder::new().build();
+        assert_eq!(
+            evm.format_value(&DynSolValue::Address(a)),
+            "0xABaBaBaBABabABabAbAbABAbABabababaBaBABaB"
+        );
+
+        // On Tron: unlabeled address is base58, top-level and nested in an array.
+        let tron =
+            CallTraceDecoderBuilder::new().with_tron_address_formatter(Some(fake_base58)).build();
+        assert_eq!(tron.format_value(&DynSolValue::Address(a)), "Tababab");
+        assert_eq!(
+            tron.format_value(&DynSolValue::Array(vec![DynSolValue::Address(a)])),
+            "[Tababab]"
+        );
+        assert!(!tron.format_value(&DynSolValue::Address(a)).contains("0xab"));
+
+        // A user label keeps its name; the bracketed address is base58.
+        let labeled = CallTraceDecoderBuilder::new()
+            .with_tron_address_formatter(Some(fake_base58))
+            .with_labels([(a, "MyToken".to_string())])
+            .build();
+        assert_eq!(labeled.format_value(&DynSolValue::Address(a)), "MyToken: [Tababab]");
+    }
+
+    /// An unlabeled contract is identified in the trace tree by its base58 form on Tron, so
+    /// `TraceWriter` renders `T…::fn(...)` instead of `0x…`; a user label still wins.
+    #[tokio::test]
+    async fn tron_label_fallback_identifies_unlabeled_contract_by_base58() {
+        let a = Address::from([0xCD; 20]);
+        let trace = CallTrace { address: a, ..Default::default() };
+
+        // Off Tron: no synthesized label for an unknown address.
+        let evm = CallTraceDecoderBuilder::new().build();
+        assert_eq!(evm.decode_function(&trace).await.label, None);
+
+        // On Tron: the base58 form becomes the node's label.
+        let tron =
+            CallTraceDecoderBuilder::new().with_tron_address_formatter(Some(fake_base58)).build();
+        assert_eq!(tron.decode_function(&trace).await.label.as_deref(), Some("Tcdcdcd"));
+
+        // A user label wins over the base58 fallback.
+        let labeled = CallTraceDecoderBuilder::new()
+            .with_tron_address_formatter(Some(fake_base58))
+            .with_labels([(a, "MyToken".to_string())])
+            .build();
+        assert_eq!(labeled.decode_function(&trace).await.label.as_deref(), Some("MyToken"));
     }
 }

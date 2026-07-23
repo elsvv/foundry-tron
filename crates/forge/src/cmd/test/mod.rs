@@ -2789,7 +2789,12 @@ impl TestArgs {
             .with_tempo_hardfork(
                 (is_tempo_network || remote_chain.is_some_and(|chain| chain.is_tempo()))
                     .then(|| config.evm_spec_id::<TempoHardfork>()),
-            );
+            )
+            // On Tron, render unlabeled contracts and decoded address values as base58.
+            .with_tron_address_formatter(config.networks.is_tron().then_some(
+                foundry_tron_primitives::address::to_base58
+                    as fn(alloy_primitives::Address) -> String,
+            ));
         // Signatures are of no value for gas reports.
         if !self.gas_report {
             builder =

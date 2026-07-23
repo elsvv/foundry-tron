@@ -3016,6 +3016,7 @@ dependencies = [
  "foundry-config",
  "foundry-evm",
  "foundry-test-utils",
+ "foundry-tron-primitives",
  "itertools 0.15.0",
  "reqwest 0.13.4",
  "rexpect",

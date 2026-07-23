@@ -7,8 +7,8 @@ pub use console::{ConsoleFmt, FormatSpec, console_format, console_table_format};
 
 mod dynamic;
 pub use dynamic::{
-    StructDefinitions, TypeDefMap, format_token, format_token_raw, format_tokens,
-    format_tokens_raw, parse_tokens, serialize_value_as_json,
+    StructDefinitions, TypeDefMap, format_token, format_token_raw, format_token_with_address,
+    format_tokens, format_tokens_raw, parse_tokens, serialize_value_as_json,
 };
 
 mod exp;

@@ -518,6 +518,82 @@ contract TronUsdtEnergyForkTest is Test {
     }
 );
 
+// Offline: `forge test -vvvvv` on the Tron path renders addresses in decoded call arguments and
+// event logs as base58 (0x41-prefixed base58check), not hex. A `Sink.poke(address(0))` call at
+// full verbosity must show `poke(T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb)` — the base58 form of the zero
+// address (the "black hole" address, a pinned vector in foundry-tron-primitives) — and never the
+// hex `poke(0x...)` form. Known contracts keep their name label (the Sink node is still `Sink::`),
+// so this asserts the argument/log rendering seam. Compiling the contract needs the native
+// `tron-solc`, so this is gated on the cached compiler and skips cleanly when absent (no network,
+// no TRX). Passing tests only render traces at verbosity 5, hence `-vvvvv`.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_traces_render_addresses_as_base58,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_traces_render_addresses_as_base58: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            config.solc = None;
+        });
+
+        prj.add_test(
+            "Base58Trace.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import {Test} from "forge-std/Test.sol";
+
+contract Sink {
+    event Seen(address who);
+    function poke(address who) external {
+        emit Seen(who);
+    }
+}
+
+contract Base58TraceTest is Test {
+    Sink internal sink;
+
+    function setUp() public {
+        sink = new Sink();
+    }
+
+    function test_trace_base58() public {
+        // The zero address encodes to the pinned base58 "black hole" address.
+        sink.poke(address(0));
+    }
+}
+"#,
+        );
+
+        cmd.forge_fuse().args(["build"]).assert_success();
+
+        cmd.forge_fuse().args(["test", "--mt", "test_trace_base58", "-vvvvv"]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tron base58 trace test failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The decoded `poke` argument (and the `Seen` log) render base58, not hex.
+        assert!(
+            stdout.contains("T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb"),
+            "expected the zero address as base58 in the trace\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("poke(0x"),
+            "the poke argument must not render as hex on tron\nstdout: {stdout}"
+        );
+    }
+);
+
 // Offline: network identity on the local (non-fork) Tron path — chain id, BASEFEE and the
 // honest no-op cheatcode warnings. A `network = "tron"` project with NO `chain_id` must default
 // `block.chainid` to Tron mainnet (728126428) so EIP-712 / permit domains resolve without pinning
