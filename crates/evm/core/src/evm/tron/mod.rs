@@ -49,7 +49,7 @@ mod create;
 mod energy;
 mod precompiles;
 pub use create::tron_create2_address;
-pub use energy::TRON_ENERGY_FEE_SUN;
+pub use energy::{TRON_ENERGY_FEE_SUN, dynamic_energy_penalty, subtree_energy_penalty};
 
 /// EVM factory that extends vanilla revm with the TVM opcodes 0xD0-0xD4.
 #[derive(Clone, Copy, Debug, Default)]

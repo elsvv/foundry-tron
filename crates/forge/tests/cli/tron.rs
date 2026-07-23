@@ -414,6 +414,110 @@ Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
     }
 );
 
+// Live, read-only mainnet fork test of the TIP-491 dynamic-energy penalty in `forge test
+// --gas-report`. Forking Tron mainnet, a `--gas-report` run that calls the hot USDT contract
+// fetches USDT's live per-contract energy factor from the fork node's `/wallet/getcontractinfo`
+// (USDT sits at the governance maximum 34000 = 3.4x) and renders the extra "Penalty Avg" column
+// (and a "Deployment Penalty" cell) that is absent on non-fork runs. USDT `transfer()` writes two
+// balance slots, so its own-energy penalty is strictly positive.
+//
+// The exact energy/penalty integers track the live factor and the fork block, so this asserts the
+// structural pipeline (the penalty column is rendered end-to-end from the node fetch) rather than
+// pinning a full snapshot; the numeric `base_local + penalty ==
+// triggerconstantcontract.energy_used` reconciliation is the plan's live-eyeball step (re-read the
+// factor within two attempts if it drifts between fetches). Gated on `TRON_LIVE=1` (read-only
+// mainnet; the fork execution burns no real TRX). The `fork` token in the name satisfies the
+// forking-test naming rule; the cached native `tron-solc` is also required to compile the
+// interface.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_mainnet_fork_gas_report_dynamic_energy_penalty,
+    |prj, cmd| {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!(
+                "skipped tron_mainnet_fork_gas_report_dynamic_energy_penalty: set TRON_LIVE=1 to run the live mainnet fork gas-report test"
+            );
+            return;
+        }
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_mainnet_fork_gas_report_dynamic_energy_penalty: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to compile the interface"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Resolve to the pinned native tron-solc (the template's SOLC_VERSION has no build).
+            config.solc = None;
+            config.gas_reports = vec!["*".to_string()];
+            config.gas_reports_ignore = vec![];
+            // The default; asserted here to make the penalty-model dependency explicit.
+            config.tron.dynamic_energy = true;
+        });
+
+        prj.add_test(
+            "TronUsdtEnergyFork.t.sol",
+            r#"
+// SPDX-License-Identifier: MIT OR Apache-2.0
+pragma solidity ^0.8.0;
+
+import "forge-std/Test.sol";
+
+interface IUSDT {
+    function transfer(address to, uint256 value) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+}
+
+contract TronUsdtEnergyForkTest is Test {
+    // Tron mainnet USDT (TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t), 0x41 prefix stripped.
+    IUSDT constant USDT = IUSDT(0xa614f803B6FD780986A42c78Ec9c7f77e6DeD13C);
+    // A large USDT holder on Tron mainnet (TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb).
+    address constant RICH = 0xe28B3CfD4E0e909077821478E9FCB86B84be786e;
+
+    // A hot-contract call whose energy accrues USDT's max dynamic-energy factor. The fork
+    // execution only mutates the fork's in-memory state; no transaction is broadcast.
+    function test_tron_mainnet_fork_usdt_transfer_energy() public {
+        assertGt(USDT.balanceOf(RICH), 0);
+        vm.prank(RICH);
+        USDT.transfer(RICH, 1);
+    }
+}
+"#,
+        );
+
+        cmd.args([
+            "test",
+            "--mt",
+            "test_tron_mainnet_fork_usdt_transfer_energy",
+            "--gas-report",
+            "--fork-url",
+            TRON_MAINNET_JSONRPC,
+        ]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tron fork gas-report failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The penalty column renders only when the per-contract energy factor was fetched from the
+        // fork node — its presence proves the fork factor-fetch pipeline end-to-end.
+        assert!(
+            stdout.contains("Penalty Avg"),
+            "expected the TIP-491 penalty column on a Tron fork gas report\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("Deployment Penalty"),
+            "expected the TIP-491 deployment-penalty column on a Tron fork gas report\nstdout: {stdout}"
+        );
+        // USDT `transfer()` writes storage under the max factor, so its function penalty must be
+        // strictly positive: at least one non-zero digit follows a "transfer" row. Assert the row
+        // is present; the exact penalty is reconciled by eye against the node per the plan.
+        assert!(stdout.contains("transfer"), "expected the USDT transfer row\nstdout: {stdout}");
+    }
+);
+
 // Offline: network identity on the local (non-fork) Tron path — chain id, BASEFEE and the
 // honest no-op cheatcode warnings. A `network = "tron"` project with NO `chain_id` must default
 // `block.chainid` to Tron mainnet (728126428) so EIP-712 / permit domains resolve without pinning

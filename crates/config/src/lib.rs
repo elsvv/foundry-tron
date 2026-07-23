@@ -5420,6 +5420,7 @@ mod tests {
         assert_eq!(tron.origin_energy_limit, 10_000_000);
         assert_eq!(tron.user_fee_percentage, 100);
         assert_eq!(tron.expiration, 60);
+        assert!(tron.dynamic_energy);
         // The section is present with defaults on a fresh `Config`.
         assert_eq!(Config::default().tron, tron);
     }
@@ -5447,6 +5448,7 @@ mod tests {
             // Omitted fields fall back to their per-field serde defaults.
             assert_eq!(config.tron.origin_energy_limit, 10_000_000);
             assert_eq!(config.tron.user_fee_percentage, 100);
+            assert!(config.tron.dynamic_energy);
 
             Ok(())
         });

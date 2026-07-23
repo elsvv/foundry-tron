@@ -4,13 +4,16 @@ use crate::{
     constants::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS},
     traces::{CallTraceArena, CallTraceDecoder, CallTraceNode, DecodedCallData},
 };
-use alloy_primitives::map::HashSet;
+use alloy_primitives::{
+    Address,
+    map::{HashMap, HashSet},
+};
 use comfy_table::{
     Cell, CellAlignment, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::ASCII_MARKDOWN,
 };
 use foundry_common::{TestFunctionExt, calc, shell};
 use foundry_config::TronConfig;
-use foundry_evm::traces::CallKind;
+use foundry_evm::{core::evm::tron::subtree_energy_penalty, traces::CallKind};
 use foundry_tron_provider::{TxOptions, estimate_call_bandwidth, estimate_create_bandwidth};
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +43,7 @@ pub struct GasReport {
 
 /// Tron parameters, derived from `[tron]` config, needed to estimate the bandwidth a broadcast
 /// transaction would consume. Present only when the run targets the Tron network.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct TronReport {
     /// Transaction-level `fee_limit`/`expiration` knobs (`fee_limit` drives the raw's varint
     /// width).
@@ -49,6 +52,17 @@ struct TronReport {
     origin_energy_limit: i64,
     /// `SmartContract.consume_user_resource_percent` (tag 6), stamped into deploy transactions.
     consume_user_resource_percent: i64,
+    /// Whether the TIP-491 dynamic-energy penalty model is enabled (`[tron] dynamic_energy`).
+    dynamic_energy: bool,
+    /// `/wallet` base URL of the fork node, derived from the fork's `/jsonrpc` endpoint. `Some`
+    /// only on a fork run with `dynamic_energy` on; drives the per-contract energy-factor fetch.
+    wallet_base: Option<String>,
+    /// `TRON-PRO-API-KEY` for the wallet base, if configured.
+    api_key: Option<String>,
+    /// Per-contract TIP-491 dynamic-energy factor (precision 10000), fetched from the fork node
+    /// and cached across suites. Non-empty ⇒ the report renders a penalty column; empty (non-fork
+    /// or `dynamic_energy` off) ⇒ the report is base-energy only and byte-identical to before.
+    factors: HashMap<Address, u32>,
 }
 
 impl GasReport {
@@ -67,7 +81,7 @@ impl GasReport {
     /// is relabeled to energy (on Tron `trace.gas_used` is TVM energy) and a bandwidth (bytes)
     /// column is estimated per frame from the broadcast transaction size.
     #[must_use]
-    pub const fn with_tron(mut self, tron: &TronConfig) -> Self {
+    pub fn with_tron(mut self, tron: &TronConfig) -> Self {
         self.tron = Some(TronReport {
             opts: TxOptions {
                 fee_limit: tron.fee_limit,
@@ -75,8 +89,70 @@ impl GasReport {
             },
             origin_energy_limit: tron.origin_energy_limit,
             consume_user_resource_percent: tron.user_fee_percentage,
+            dynamic_energy: tron.dynamic_energy,
+            wallet_base: None,
+            api_key: None,
+            factors: HashMap::default(),
         });
         self
+    }
+
+    /// Points the report's TIP-491 dynamic-energy penalty model at a Tron fork node. The wallet
+    /// base is the fork's `/jsonrpc` read URL with that suffix swapped for the `/wallet` broadcast
+    /// host (which serves `getcontractinfo`). A URL without the suffix, or the `dynamic_energy`
+    /// knob being off, leaves the report base-energy only. Must be called after
+    /// [`Self::with_tron`].
+    #[must_use]
+    pub fn with_tron_fork(mut self, fork_url: &str, api_key: Option<String>) -> Self {
+        if let Some(tron) = &mut self.tron
+            && tron.dynamic_energy
+            && let Some(base) = fork_url.trim_end_matches('/').strip_suffix("/jsonrpc")
+        {
+            tron.wallet_base = Some(base.to_string());
+            tron.api_key = api_key;
+        }
+        self
+    }
+
+    /// Fetches the TIP-491 dynamic-energy factor for every contract address that appears in
+    /// `arenas`, caching results on the report so an address is queried once across suites.
+    /// No-op unless a fork wallet base was configured ([`Self::with_tron_fork`]). A network error
+    /// caches the address at factor 0 (with a warning) so the run never fails on this diagnostic
+    /// and the address is not re-queried.
+    pub async fn collect_tron_factors<'a>(
+        &mut self,
+        arenas: impl IntoIterator<Item = &'a CallTraceArena>,
+    ) {
+        let Some(tron) = &mut self.tron else { return };
+        let Some(base) = tron.wallet_base.clone() else { return };
+        let Ok(mut provider) = foundry_tron_provider::TronProvider::new(&base) else { return };
+        if let Some(key) = &tron.api_key {
+            provider = provider.with_api_key(key.clone());
+        }
+        for arena in arenas {
+            for node in arena.nodes() {
+                let addr = node.trace.address;
+                if addr == CHEATCODE_ADDRESS
+                    || addr == HARDHAT_CONSOLE_ADDRESS
+                    || tron.factors.contains_key(&addr)
+                {
+                    continue;
+                }
+                match provider.get_contract_energy_factor(addr).await {
+                    Ok(factor) => {
+                        tron.factors.insert(addr, factor);
+                    }
+                    Err(_) => {
+                        // Cache at 0 so the address is not re-queried and warn once.
+                        tron.factors.insert(addr, 0);
+                        let _ = sh_warn!(
+                            "tron gas report: could not fetch the energy factor for {addr}; \
+                             its dynamic-energy penalty is reported as 0"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Whether the given contract should be reported.
@@ -105,12 +181,20 @@ impl GasReport {
         arenas: impl IntoIterator<Item = &CallTraceArena>,
         decoder: &CallTraceDecoder,
     ) {
-        for node in arenas.into_iter().flat_map(|arena| arena.nodes()) {
-            self.analyze_node(node, decoder).await;
+        for arena in arenas {
+            let nodes = arena.nodes();
+            for node in nodes {
+                self.analyze_node(node, nodes, decoder).await;
+            }
         }
     }
 
-    async fn analyze_node(&mut self, node: &CallTraceNode, decoder: &CallTraceDecoder) {
+    async fn analyze_node(
+        &mut self,
+        node: &CallTraceNode,
+        nodes: &[CallTraceNode],
+        decoder: &CallTraceDecoder,
+    ) {
         let trace = &node.trace;
 
         if trace.address == CHEATCODE_ADDRESS || trace.address == HARDHAT_CONSOLE_ADDRESS {
@@ -148,6 +232,12 @@ impl GasReport {
                 // guard (see `gas_report_size_for_nested_create` / issue #9300, which pins
                 // depth>1 EVM creates to 0); Tron-gating this write keeps EVM reports identical.
                 contract_info.gas = trace.gas_used;
+                // TIP-491 dynamic-energy deployment penalty over the create subtree, only once a
+                // factor map is present (fork run); a non-fork run leaves it `None`.
+                if !tron.factors.is_empty() {
+                    contract_info.deployment_penalty =
+                        Some(subtree_energy_penalty(nodes, node.idx, &tron.factors));
+                }
             }
         }
 
@@ -184,6 +274,15 @@ impl GasReport {
                         0,
                         &tron.opts,
                     ));
+                    // TIP-491 dynamic-energy penalty over this call's subtree; fork-only (factor
+                    // map non-empty). Fuzzed calldata yields min/avg/median/max like bandwidth.
+                    if !tron.factors.is_empty() {
+                        gas_info.penalty_frames.push(subtree_energy_penalty(
+                            nodes,
+                            node.idx,
+                            &tron.factors,
+                        ));
+                    }
                 }
             }
         }
@@ -211,6 +310,19 @@ impl GasReport {
                             max: func.bandwidth_frames.last().copied().unwrap_or_default(),
                             mean: calc::mean(&func.bandwidth_frames),
                             median: calc::median_sorted(&func.bandwidth_frames),
+                        });
+                    }
+
+                    // Tron TIP-491: same statistics over the per-frame dynamic-energy penalties.
+                    // Only populated on a fork run, so a non-fork report keeps `energy_penalty`
+                    // `None` and its output byte-identical.
+                    if !func.penalty_frames.is_empty() {
+                        func.penalty_frames.sort_unstable();
+                        func.energy_penalty = Some(PenaltyStats {
+                            min: func.penalty_frames.first().copied().unwrap_or_default(),
+                            max: func.penalty_frames.last().copied().unwrap_or_default(),
+                            mean: calc::mean(&func.penalty_frames),
+                            median: calc::median_sorted(&func.penalty_frames),
                         });
                     }
                 }
@@ -273,6 +385,11 @@ impl GasReport {
                     if let Some(bandwidth) = contract.deployment_bandwidth {
                         deployment["bandwidth"] = json!(bandwidth);
                     }
+                    // Tron TIP-491 deployment penalty, present only on a fork run so the EVM and
+                    // non-fork-Tron JSON stays byte-identical (`skip_serializing_if` analog).
+                    if let Some(penalty) = contract.deployment_penalty {
+                        deployment["energy_penalty"] = json!(penalty);
+                    }
 
                     Some(json!({
                         "contract": name,
@@ -300,6 +417,10 @@ impl GasReport {
         // columns (not a second row block) keep every function on one line and
         // machine-diffable in snapshots.
         let is_tron = self.tron.is_some();
+        // The TIP-491 dynamic-energy penalty columns appear only when a factor map was fetched (a
+        // fork run with `dynamic_energy` on); a non-fork run has an empty map and the table stays
+        // byte-identical to the base energy/bandwidth layout.
+        let has_penalty = self.tron.as_ref().is_some_and(|tron| !tron.factors.is_empty());
 
         table.set_header(vec![Cell::new(format!("{name} Contract")).fg(Color::Magenta)]);
 
@@ -316,6 +437,13 @@ impl GasReport {
             deployment_header.push(Cell::new("Deployment Bandwidth").fg(Color::Cyan));
             deployment_row.push(
                 Cell::new(contract.deployment_bandwidth.unwrap_or_default().to_string())
+                    .set_alignment(CellAlignment::Right),
+            );
+        }
+        if has_penalty {
+            deployment_header.push(Cell::new("Deployment Penalty").fg(Color::Cyan));
+            deployment_row.push(
+                Cell::new(contract.deployment_penalty.unwrap_or_default().to_string())
                     .set_alignment(CellAlignment::Right),
             );
         }
@@ -340,6 +468,9 @@ impl GasReport {
                 Cell::new("Bandwidth Median").fg(Color::Yellow),
                 Cell::new("Bandwidth Max").fg(Color::Red),
             ]);
+        }
+        if has_penalty {
+            function_header.push(Cell::new("Penalty Avg").fg(Color::Yellow));
         }
         table.add_row(function_header);
 
@@ -382,6 +513,14 @@ impl GasReport {
                             .set_alignment(CellAlignment::Right),
                     ]);
                 }
+                if has_penalty {
+                    let penalty = gas_info.energy_penalty.clone().unwrap_or_default();
+                    row.push(
+                        Cell::new(penalty.mean.to_string())
+                            .fg(Color::Yellow)
+                            .set_alignment(CellAlignment::Right),
+                    );
+                }
                 table.add_row(row);
             }
         }
@@ -397,6 +536,10 @@ pub struct ContractInfo {
     /// Estimated Tron deployment bandwidth in bytes. `Some` only on the Tron path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_bandwidth: Option<u64>,
+    /// TIP-491 dynamic-energy deployment penalty. `Some` only on a Tron fork run with a fetched
+    /// factor map; `None` on EVM and non-fork-Tron runs (keeps their output byte-identical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_penalty: Option<u64>,
     /// Function name -> Function signature -> GasInfo
     pub functions: BTreeMap<String, BTreeMap<String, GasInfo>>,
 }
@@ -418,11 +561,29 @@ pub struct GasInfo {
 
     #[serde(skip)]
     pub bandwidth_frames: Vec<u64>,
+
+    /// TIP-491 dynamic-energy penalty statistics. `Some` only on a Tron fork run with a fetched
+    /// factor map; `None` on EVM and non-fork-Tron runs (keeps their output byte-identical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub energy_penalty: Option<PenaltyStats>,
+
+    #[serde(skip)]
+    pub penalty_frames: Vec<u64>,
 }
 
 /// Tron bandwidth (bytes) statistics for a function, mirroring the energy min/avg/median/max.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BandwidthStats {
+    pub min: u64,
+    pub mean: u64,
+    pub median: u64,
+    pub max: u64,
+}
+
+/// Tron TIP-491 dynamic-energy penalty statistics for a function, mirroring the energy
+/// min/avg/median/max. The table renders only the average; JSON carries the full set.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PenaltyStats {
     pub min: u64,
     pub mean: u64,
     pub median: u64,

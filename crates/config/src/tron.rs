@@ -15,6 +15,9 @@ const DEFAULT_USER_FEE_PERCENTAGE: i64 = 100;
 /// Default transaction `expiration` in seconds.
 const DEFAULT_EXPIRATION: u64 = 60;
 
+/// Default for the TIP-491 dynamic-energy penalty model in `forge test --gas-report`.
+const DEFAULT_DYNAMIC_ENERGY: bool = true;
+
 /// Configuration for the Tron network, mirroring the `[tron]` section of `foundry.toml`.
 ///
 /// These values map onto protobuf fields of the Tron transaction (`fee_limit` on
@@ -42,6 +45,13 @@ pub struct TronConfig {
     /// transaction. Conversion to milliseconds is performed by the consumer.
     #[serde(default = "default_expiration")]
     pub expiration: u64,
+
+    /// Whether `forge test --gas-report` models the TIP-491 dynamic-energy penalty on a Tron
+    /// fork. When on (the default), the report fetches each contract's live energy factor from
+    /// the fork node and adds a penalty column; when off, or on a non-fork run, the report stays
+    /// base-energy only. Has no effect off the Tron network.
+    #[serde(default = "default_dynamic_energy")]
+    pub dynamic_energy: bool,
 }
 
 impl Default for TronConfig {
@@ -51,6 +61,7 @@ impl Default for TronConfig {
             origin_energy_limit: DEFAULT_ORIGIN_ENERGY_LIMIT,
             user_fee_percentage: DEFAULT_USER_FEE_PERCENTAGE,
             expiration: DEFAULT_EXPIRATION,
+            dynamic_energy: DEFAULT_DYNAMIC_ENERGY,
         }
     }
 }
@@ -69,4 +80,8 @@ const fn default_user_fee_percentage() -> i64 {
 
 const fn default_expiration() -> u64 {
     DEFAULT_EXPIRATION
+}
+
+const fn default_dynamic_energy() -> bool {
+    DEFAULT_DYNAMIC_ENERGY
 }
