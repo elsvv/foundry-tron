@@ -2010,6 +2010,9 @@ casttest!(tron_estimate_create_rejected, |prj, cmd| {
         config.networks = foundry_evm_networks::NetworkConfigs::with_tron();
     });
     cmd.cast_fuse()
+        // `cast_fuse` resets to a bare `cast` command that does not inherit the project root
+        // (unlike `forge_fuse`), so point it at the project so its tron config is loaded.
+        .current_dir(prj.root())
         .args(["estimate", "--create", "0x600160010160005260206000f3"])
         .assert_failure()
         .stderr_eq(str![[r#"
@@ -2028,6 +2031,9 @@ casttest!(tron_send_fee_limit_over_max_rejected, async |prj, cmd| {
     });
     // 20_000 TRX (20_000_000_000 SUN) is above getMaxFeeLimit (15_000_000_000 SUN).
     cmd.cast_fuse()
+        // `cast_fuse` resets to a bare `cast` command that does not inherit the project root
+        // (unlike `forge_fuse`), so point it at the project so its tron config is loaded.
+        .current_dir(prj.root())
         .args([
             "send",
             "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
@@ -2065,6 +2071,9 @@ casttest!(
         });
         let out = cmd
             .cast_fuse()
+            // `cast_fuse` resets to a bare `cast` command that does not inherit the project root
+            // (unlike `forge_fuse`), so point it at the project so its tron config is loaded.
+            .current_dir(prj.root())
             .args([
                 "estimate",
                 "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
