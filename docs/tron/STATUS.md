@@ -254,8 +254,11 @@ fork-safe); экшены пиненые теми же SHA, что и в репо
    адреса = пустой аккаунт (java-tron).
 2. **I2 — value-only вызов контракта.** `cast send <контракт> --value N` без сигнатуры и
    broadcast-петля script'а строят `TriggerSmartContract` (легальный payable
-   fallback/receive), а не `TransferContract` (нода отвергает его на контракт-адрес). Новый
-   `TronProvider::is_contract` (`/wallet/getcontract`).
+   fallback/receive), а не `TransferContract` (его нода отвергает на контракт-адрес только
+   при включённых governance-флагах `getForbidTransferToContract` /
+   `getAllowTvmCompatibleEvm` — сейчас оба выключены, но Trigger — единственный семантически
+   верный путь вызова payable receive). Новый `TronProvider::is_contract`
+   (`/wallet/getcontract`).
 3. **I3 — tron-solc 0.8.28 + динамический резолв.** Пины расширены до 0.8.23–0.8.28,
    `default_version()` = **0.8.28**. Версия вне пинов при `!offline` резолвится из
    `tronprotocol.github.io/solc-bin/{list_key}/list.json` с проверкой опубликованной sha256;
