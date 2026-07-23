@@ -301,6 +301,7 @@ fee_limit = 1000000000
 origin_energy_limit = 10000000
 user_fee_percentage = 100
 expiration = 60
+dynamic_energy = true
 
 "#;
 
@@ -1727,7 +1728,8 @@ forgetest_init!(test_default_config, |prj, cmd| {
     "fee_limit": 1000000000,
     "origin_energy_limit": 10000000,
     "user_fee_percentage": 100,
-    "expiration": 60
+    "expiration": 60,
+    "dynamic_energy": true
   },
   "transaction_timeout": 120,
   "additional_compiler_profiles": [],

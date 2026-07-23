@@ -550,6 +550,9 @@ impl Cheatcode for prevrandao_0Call {
              see EIP-4399: https://eips.ethereum.org/EIPS/eip-4399"
         );
         ccx.ecx.block_mut().set_prevrandao(Some(*newPrevrandao));
+        // On Tron the PREVRANDAO/DIFFICULTY opcode is hardwired to 0 by the TVM, so
+        // this override has no observable effect; warn once instead of lying silently.
+        ccx.state.warn_tron_noop("vm.prevrandao", "PREVRANDAO");
         Ok(Default::default())
     }
 }
@@ -563,6 +566,8 @@ impl Cheatcode for prevrandao_1Call {
              see EIP-4399: https://eips.ethereum.org/EIPS/eip-4399"
         );
         ccx.ecx.block_mut().set_prevrandao(Some((*newPrevrandao).into()));
+        // See `prevrandao_0Call`: hardwired to 0 on Tron, so warn once about the no-op.
+        ccx.state.warn_tron_noop("vm.prevrandao", "PREVRANDAO");
         Ok(Default::default())
     }
 }
@@ -652,6 +657,9 @@ impl Cheatcode for txGasPriceCall {
         if !ccx.state.in_isolation_context {
             ccx.ecx.tx_mut().set_gas_price(gas_price);
         }
+        // On Tron the GASPRICE opcode is hardwired to 0 by the TVM (allowTvmCompatibleEvm
+        // is off on mainnet and Nile), so this override has no observable effect; warn once.
+        ccx.state.warn_tron_noop("vm.txGasPrice", "GASPRICE");
         Ok(Default::default())
     }
 }

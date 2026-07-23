@@ -4,7 +4,10 @@ out = "out"
 test = "test"
 libs = []
 network = "tron"
-chain_id = 728126428
+# No `chain_id`: on `network = "tron"` a local (non-fork) run defaults to Tron
+# mainnet's chain id (728126428), so `block.chainid` resolves without pinning it
+# here. `testTronChainId` asserts that default. Set `chain_id = 3448148188` to
+# target Nile instead.
 evm_version = "cancun"
 # No `solc` key: on `network = "tron"` forge auto-resolves the native tron-solc
 # (github.com/tronprotocol/solidity, tag tv_0.8.27, sha256-pinned) into

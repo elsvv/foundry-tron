@@ -49,7 +49,7 @@ mod create;
 mod energy;
 mod precompiles;
 pub use create::tron_create2_address;
-pub use energy::TRON_ENERGY_FEE_SUN;
+pub use energy::{TRON_ENERGY_FEE_SUN, dynamic_energy_penalty, subtree_energy_penalty};
 
 /// EVM factory that extends vanilla revm with the TVM opcodes 0xD0-0xD4.
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,11 +92,14 @@ impl EvmFactory for TronEvmFactory {
 ///    ([`energy::apply_tron_energy`]) — a wholesale gas-table replacement, hence it runs *before*
 ///    the instruction inserts below so it does not wipe them;
 /// 2. the TVM opcodes 0xD0-0xD4 that tron-solc emits;
-/// 3. the Tron block/tx-op overrides (DIFFICULTY, GASLIMIT, BASEFEE, GASPRICE, BLOBHASH,
-///    BLOBBASEFEE) whose semantics diverge from Ethereum;
+/// 3. the Tron block/tx-op overrides (DIFFICULTY, GASLIMIT, GASPRICE, BLOBHASH, BLOBBASEFEE) whose
+///    semantics diverge from Ethereum. BASEFEE is intentionally left as stock revm (reads
+///    `block.basefee`); the faithful Tron value (`getEnergyFee()`) is seeded into the block env
+///    instead, so `vm.fee` can override it;
 /// 4. the Tron CREATE2 (0xF5) address scheme ([`create`]), pinned via `CreateScheme::Custom`;
-/// 5. the java-tron precompile set ([`precompiles`]), which overrides revm's `0x03`/`0x05`/`0x09`/
-///    `0x0a` and adds the Tron-only precompile addresses.
+/// 5. the java-tron precompile set ([`precompiles`]), installed as a *replacement* of revm's
+///    spec-derived map (not an extension), so no Ethereum-only precompile (Osaka's BLS12-381
+///    `0x0b`-`0x11` or P256Verify `0x100`) leaks in for any config `evm_version`.
 fn inject_tron_extensions<DB: Database, I: Inspector<EthEvmContext<DB>>>(
     evm: EthEvm<DB, I, PrecompilesMap>,
     inspect: bool,
@@ -120,9 +123,16 @@ fn inject_tron_extensions<DB: Database, I: Inspector<EthEvmContext<DB>>>(
     // returns fixed values (`OperationActions.java` @develop). Static energy
     // tiers match java-tron `OperationRegistry.java`: BASE=2 for all except
     // BLOBHASH, which is VERY_LOW=3.
+    //
+    // BASEFEE (0x48) is deliberately NOT overridden here: on Tron it returns
+    // `getEnergyFee()` in SUN, which is the *block* base fee, so the faithful
+    // value is supplied through the block env instead of a constant opcode (see
+    // `EvmOpts::local_evm_env` / `fork_evm_env`, which seed `block.basefee` with
+    // `TRON_ENERGY_FEE_SUN`). Leaving the stock revm `basefee` instruction in
+    // place lets `vm.fee` override BASEFEE like on every other network; its
+    // static energy tier stays 2, re-asserted in `apply_tron_energy`.
     table.insert_instruction(opcode::DIFFICULTY, Instruction::new(op_difficulty), 2);
     table.insert_instruction(opcode::GASLIMIT, Instruction::new(op_gaslimit), 2);
-    table.insert_instruction(opcode::BASEFEE, Instruction::new(op_basefee), 2);
     table.insert_instruction(opcode::GASPRICE, Instruction::new(op_gasprice), 2);
     table.insert_instruction(opcode::BLOBHASH, Instruction::new(op_blobhash), 3);
     table.insert_instruction(opcode::BLOBBASEFEE, Instruction::new(op_blobbasefee), 2);
@@ -134,10 +144,15 @@ fn inject_tron_extensions<DB: Database, I: Inspector<EthEvmContext<DB>>>(
     // inside the instruction. See [`create`] for the two deltas from stock revm.
     table.insert_instruction(opcode::CREATE2, Instruction::new(create::op_create2), 0);
 
-    // 5. java-tron precompile set. `extend_precompiles` both overrides revm's
-    // 0x03/0x05/0x09/0x0a and adds the Tron-only addresses (0x020003, 0x020009,
-    // and the shielded/vote/FreezeV2 stub range). This runs on both create paths.
-    inner.precompiles.extend_precompiles(precompiles::tron_precompiles());
+    // 5. java-tron precompile set. This REPLACES revm's spec-derived precompile
+    // map wholesale rather than extending it: the map is rebuilt from an empty
+    // base and filled with only `tron_precompiles()`. So no Ethereum-only
+    // precompile can leak for any config `evm_version` -- Osaka's BLS12-381
+    // (0x0b-0x11) and P256Verify (0x100) simply do not exist on the Tron factory,
+    // matching java-tron, where a call to an unknown precompile address is an
+    // ordinary empty-account call (success, empty output). Runs on both create
+    // paths.
+    inner.precompiles = precompiles::tron_precompiles_map();
 
     EthEvm::new(inner, inspect)
 }
@@ -182,15 +197,6 @@ fn op_gaslimit<W: InterpreterTypes, H: Host + ?Sized>(
     ctx: InstructionContext<'_, H, W>,
 ) -> Result<(), InstructionResult> {
     push_zero(ctx, 0)
-}
-
-/// 0x48 BASEFEE: Tron returns `getEnergyFee()` in SUN (`OperationActions.java:550`
-/// `baseFeeAction`), which is [`TRON_ENERGY_FEE_SUN`] (100 on both mainnet and
-/// Nile, probed 2026-07-12), not the block base fee.
-fn op_basefee<W: InterpreterTypes, H: Host + ?Sized>(
-    ctx: InstructionContext<'_, H, W>,
-) -> Result<(), InstructionResult> {
-    push_value(ctx, 0, U256::from(TRON_ENERGY_FEE_SUN))
 }
 
 /// 0x3a GASPRICE: `allowTvmCompatibleEvm` is off on mainnet and Nile, so Tron

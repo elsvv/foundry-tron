@@ -55,11 +55,26 @@ pub struct NowBlock {
     pub timestamp_ms: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TxInfo {
     pub block_number: i64,
     pub fee_sun: u64,
+    /// `receipt.energy_usage_total`: total energy charged, TIP-491 dynamic-energy
+    /// penalty already included.
     pub energy_used: u64,
+    /// `receipt.energy_penalty_total`: the penalty portion of `energy_used`
+    /// (absent on pre-4.7.2 nodes ⇒ 0). Base energy = `energy_used − penalty`.
+    pub energy_penalty_total: u64,
+    /// `receipt.energy_usage`: energy paid from the caller's own staked energy.
+    pub energy_usage_caller: u64,
+    /// `receipt.origin_energy_usage`: energy paid by the contract owner's stake
+    /// (the `consume_user_resource_percent` share the deployer bankrolls).
+    pub origin_energy_usage: u64,
+    /// `receipt.net_usage`: bandwidth, in bytes, paid from free/staked bandwidth.
+    pub net_usage: u64,
+    /// `receipt.net_fee`: bandwidth burned to TRX, in SUN, when free/staked
+    /// bandwidth did not cover the transaction.
+    pub net_fee_sun: u64,
     pub success: bool,
     pub contract_address: Option<Address>,
 }
@@ -67,8 +82,68 @@ pub struct TxInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstantResult {
     pub result: Vec<u8>,
+    /// Total metered energy, TIP-491 penalty included (java-tron reports
+    /// `energy_used` with the dynamic-energy penalty already added in).
     pub energy_used: u64,
+    /// TIP-491 dynamic-energy penalty portion of `energy_used` (4.7.2+ nodes;
+    /// absent ⇒ 0). Base energy = `energy_used − energy_penalty`.
+    pub energy_penalty: u64,
     pub success: bool,
+}
+
+/// Governance chain parameters read from `/wallet/getchainparameters`. These are
+/// the live economics — energy price, fee-limit ceiling, bandwidth price, memo
+/// fee — and the TIP-491 dynamic-energy knobs the estimate loop (`cast estimate`,
+/// fee-limit validation, the gas-report penalty model) depends on. The node
+/// returns a `chainParameter` array of `{key, value}` entries; a parameter left
+/// at its protobuf default is *omitted* from the array, so a missing key reads as
+/// the field's [`Default`] value (which is that live default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TronChainParams {
+    /// `getEnergyFee`: SUN burned per energy unit. This is what BASEFEE returns on
+    /// Tron and the price used to convert an energy estimate to burned TRX.
+    pub energy_fee_sun: u64,
+    /// `getMaxFeeLimit`: the ceiling the node accepts for a transaction's
+    /// `fee_limit`; a higher `fee_limit` is rejected outright.
+    pub max_fee_limit_sun: u64,
+    /// `getTransactionFee`: bandwidth price in SUN per byte.
+    pub transaction_fee_sun: u64,
+    /// `getMemoFee`: SUN charged for a transaction that carries a memo.
+    pub memo_fee_sun: u64,
+    /// `getDynamicEnergyThreshold`: TIP-491 per-contract energy threshold above
+    /// which a maintenance cycle raises the contract's energy factor.
+    pub dynamic_threshold: u64,
+    /// `getDynamicEnergyIncreaseFactor`: TIP-491 per-cycle increase factor
+    /// (precision 10000, i.e. 2000 = +20%).
+    pub dynamic_increase_factor: u32,
+    /// `getDynamicEnergyMaxFactor`: TIP-491 maximum energy factor (precision
+    /// 10000, i.e. 34000 = 3.4, so up to 4.4x total charged energy).
+    pub dynamic_max_factor: u32,
+    /// `getAllowTvmOsaka`: whether the node runs the Osaka TVM upgrade (0/1). The
+    /// local energy/precompile model is pre-Osaka, so a `true` here means the
+    /// local simulation may diverge from the node.
+    pub allow_tvm_osaka: bool,
+}
+
+impl Default for TronChainParams {
+    /// Live mainnet values, probed 2026-07-23 via `api.trongrid.io`
+    /// `/wallet/getchainparameters`. These are the offline defaults used when the
+    /// node cannot be reached (best-effort fetch) and the compile-time baseline
+    /// the estimate loop falls back to. Governance can move any of them; the live
+    /// staleness sensor (`I5` live-gated test / tron-live CI) prints a diff when
+    /// the node no longer matches.
+    fn default() -> Self {
+        Self {
+            energy_fee_sun: 100,
+            max_fee_limit_sun: 15_000_000_000,
+            transaction_fee_sun: 1_000,
+            memo_fee_sun: 1_000_000,
+            dynamic_threshold: 5_000_000_000,
+            dynamic_increase_factor: 2_000,
+            dynamic_max_factor: 34_000,
+            allow_tvm_osaka: false,
+        }
+    }
 }
 
 pub struct TronProvider {
@@ -151,6 +226,28 @@ impl TronProvider {
         parse_account_balance(&v)
     }
 
+    /// Returns whether `address` is a deployed smart contract on-chain.
+    ///
+    /// Queries `/wallet/getcontract`: java-tron returns a `SmartContract` object
+    /// (carrying `contract_address` and `bytecode`) for a contract account, and an
+    /// empty `{}` body for an ordinary account (EOA) or an address it has never
+    /// seen — which reads as "not a contract".
+    ///
+    /// This decides the value-only send path. A value-only send to a contract must
+    /// use a `TriggerSmartContract` — an empty-`data` trigger invokes the contract's
+    /// payable `receive()`/`fallback()`, matching what `cast send <contract> --value`
+    /// does on Ethereum. A bare `TransferContract` would only credit the balance
+    /// without running the contract's code, and java-tron additionally rejects it
+    /// outright when governance activates it (`getForbidTransferToContract == 1`, or
+    /// `getAllowTvmCompatibleEvm == 1` for a version-1 contract). An ordinary account
+    /// takes the native `TransferContract`. Transient errors propagate so the caller
+    /// decides whether to fall back.
+    pub async fn is_contract(&self, address: Address) -> Result<bool, TronError> {
+        let body = serde_json::json!({ "value": to_hex41(address), "visible": false });
+        let v: serde_json::Value = self.post_json("/wallet/getcontract", body).await?;
+        Ok(parse_is_contract(&v))
+    }
+
     /// Returns transaction info once the transaction is in a block, or `None`
     /// while it is still pending (the node replies with an empty `{}` body).
     pub async fn get_transaction_info(&self, txid: B256) -> Result<Option<TxInfo>, TronError> {
@@ -176,6 +273,53 @@ impl TronProvider {
         });
         let v: serde_json::Value = self.post_json("/wallet/triggerconstantcontract", body).await?;
         parse_constant_result(&v)
+    }
+
+    /// Fetches the node's governance chain parameters (`/wallet/getchainparameters`).
+    /// Any parameter the node left at its protobuf default is omitted from the
+    /// response and reads as the corresponding [`TronChainParams`] default, so the
+    /// returned struct always carries a usable value for every field.
+    pub async fn get_chain_parameters(&self) -> Result<TronChainParams, TronError> {
+        let v: serde_json::Value =
+            self.post_json("/wallet/getchainparameters", serde_json::json!({})).await?;
+        Ok(parse_chain_parameters(&v))
+    }
+
+    /// Estimates the energy a `TriggerSmartContract` call from `owner` to
+    /// `contract` with the ABI-encoded `data` would consume, via
+    /// `/wallet/estimateenergy` (4.7.0.1+, gated on the node's `vm.estimateEnergy`
+    /// + `vm.supportConstant`).
+    ///
+    /// Returns `Some(energy_required)` on a supporting node. Returns `Ok(None)`
+    /// when the node has the endpoint disabled (the documented
+    /// "this node does not support estimate energy" validate error) — the signal
+    /// for the caller to fall back to [`trigger_constant`], whose `energy_used`
+    /// already includes the TIP-491 penalty. Any other node/decode error (a
+    /// revert, bad arguments) propagates.
+    pub async fn estimate_energy(
+        &self,
+        owner: Address,
+        contract: Address,
+        data: &[u8],
+    ) -> Result<Option<u64>, TronError> {
+        let body = serde_json::json!({
+            "owner_address": to_hex41(owner),
+            "contract_address": to_hex41(contract),
+            "data": hex::encode(data),
+            "visible": false,
+        });
+        let v: serde_json::Value = self.post_json("/wallet/estimateenergy", body).await?;
+        parse_estimate_energy(&v)
+    }
+
+    /// Returns `contract`'s current TIP-491 dynamic-energy factor (precision
+    /// 10000, i.e. 34000 = 3.4x, up to 4.4x total charged energy) from
+    /// `/wallet/getcontractinfo`'s `contract_state.energy_factor`. A fresh or cold
+    /// contract has accrued no factor and the field is absent ⇒ 0.
+    pub async fn get_contract_energy_factor(&self, contract: Address) -> Result<u32, TronError> {
+        let body = serde_json::json!({ "value": to_hex41(contract), "visible": false });
+        let v: serde_json::Value = self.post_json("/wallet/getcontractinfo", body).await?;
+        Ok(parse_energy_factor(&v))
     }
 
     /// Broadcasts a signed transaction via `/wallet/broadcasthex`. On rejection
@@ -491,6 +635,46 @@ pub fn estimate_create_bandwidth(
     signed_bandwidth(raw)
 }
 
+/// Default headroom, in percent, added to the raw energy cost when suggesting a
+/// `fee_limit`. Twenty percent absorbs the TIP-491 dynamic-energy factor moving up
+/// by up to one maintenance cycle (+20%) between the estimate and the broadcast.
+pub const DEFAULT_FEE_LIMIT_BUFFER_PCT: u64 = 20;
+
+/// Suggests a `fee_limit` in SUN for a transaction that consumes `energy_total`
+/// energy: the energy cost at the node's live price (`params.energy_fee_sun`)
+/// inflated by `buffer_pct` percent of headroom, then clamped to the node's
+/// `getMaxFeeLimit`. The clamp guarantees the node accepts the limit — a
+/// `fee_limit` above `getMaxFeeLimit` is rejected outright. Intermediate
+/// arithmetic is `u128` so a large energy estimate cannot overflow before the
+/// clamp.
+pub fn suggest_fee_limit_sun(energy_total: u64, params: &TronChainParams, buffer_pct: u64) -> u64 {
+    let raw = (energy_total as u128)
+        .saturating_mul(params.energy_fee_sun as u128)
+        .saturating_mul(100 + buffer_pct as u128)
+        / 100;
+    raw.min(params.max_fee_limit_sun as u128) as u64
+}
+
+/// Validates a `fee_limit` (SUN) against the node's `getMaxFeeLimit` ceiling and
+/// the positivity the protocol requires. Returns a human-readable reason when the
+/// limit is unusable so the CLI caller can surface it (a `fee_limit` above
+/// `getMaxFeeLimit`, or non-positive, is rejected by the node), `Ok(())`
+/// otherwise.
+pub fn check_fee_limit(fee_limit: i64, params: &TronChainParams) -> Result<(), String> {
+    if fee_limit <= 0 {
+        return Err(format!("tron fee_limit must be positive (got {fee_limit} SUN)"));
+    }
+    if fee_limit as u128 > params.max_fee_limit_sun as u128 {
+        return Err(format!(
+            "tron fee_limit {fee_limit} SUN exceeds the node's getMaxFeeLimit {} SUN ({} TRX); \
+             lower it with --tron.fee-limit or the [tron] fee_limit config",
+            params.max_fee_limit_sun,
+            params.max_fee_limit_sun / 1_000_000,
+        ));
+    }
+    Ok(())
+}
+
 /// Parses a raw `/wallet/getnowblock` JSON response.
 pub(crate) fn parse_now_block(v: &serde_json::Value) -> Result<NowBlock, TronError> {
     let missing = |f: &str| TronError::Decode(format!("getnowblock: missing {f}"));
@@ -513,6 +697,14 @@ pub(crate) fn parse_account_balance(v: &serde_json::Value) -> Result<u64, TronEr
     Ok(v.get("balance").and_then(|b| b.as_u64()).unwrap_or(0))
 }
 
+/// Parses a `/wallet/getcontract` response into "is this address a contract?".
+/// java-tron returns a `SmartContract` object carrying `contract_address` for a
+/// deployed contract and an empty `{}` body for an ordinary account, so the
+/// presence of a `contract_address` string is the discriminator.
+pub(crate) fn parse_is_contract(v: &serde_json::Value) -> bool {
+    v.get("contract_address").and_then(|c| c.as_str()).is_some()
+}
+
 /// Parses a `/wallet/gettransactioninfobyid` response. Returns `None` while the
 /// transaction is still pending (empty `{}` body).
 pub(crate) fn parse_tx_info(v: &serde_json::Value) -> Result<Option<TxInfo>, TronError> {
@@ -532,10 +724,16 @@ pub(crate) fn parse_tx_info(v: &serde_json::Value) -> Result<Option<TxInfo>, Tro
         ),
         None => None,
     };
+    let ru64 = |field: &str| receipt.get(field).and_then(|e| e.as_u64()).unwrap_or(0);
     Ok(Some(TxInfo {
         block_number,
         fee_sun: v.get("fee").and_then(|f| f.as_u64()).unwrap_or(0),
-        energy_used: receipt.get("energy_usage_total").and_then(|e| e.as_u64()).unwrap_or(0),
+        energy_used: ru64("energy_usage_total"),
+        energy_penalty_total: ru64("energy_penalty_total"),
+        energy_usage_caller: ru64("energy_usage"),
+        origin_energy_usage: ru64("origin_energy_usage"),
+        net_usage: ru64("net_usage"),
+        net_fee_sun: ru64("net_fee"),
         success,
         contract_address,
     }))
@@ -552,8 +750,87 @@ pub(crate) fn parse_constant_result(v: &serde_json::Value) -> Result<ConstantRes
     Ok(ConstantResult {
         result,
         energy_used: v.get("energy_used").and_then(|e| e.as_u64()).unwrap_or(0),
+        energy_penalty: v.get("energy_penalty").and_then(|e| e.as_u64()).unwrap_or(0),
         success,
     })
+}
+
+/// Parses a `/wallet/getchainparameters` response into [`TronChainParams`],
+/// starting from the live defaults and overriding each field whose `key` is
+/// present in the `chainParameter` array. A key the node omits (its value equals
+/// the protobuf default) leaves the field at its default, which is that same live
+/// value.
+pub(crate) fn parse_chain_parameters(v: &serde_json::Value) -> TronChainParams {
+    let mut params = TronChainParams::default();
+    let Some(entries) = v.get("chainParameter").and_then(|c| c.as_array()) else {
+        return params;
+    };
+    let get = |key: &str| -> Option<i64> {
+        entries
+            .iter()
+            .find(|e| e.get("key").and_then(|k| k.as_str()) == Some(key))
+            .and_then(|e| e.get("value"))
+            .and_then(|val| val.as_i64())
+    };
+    if let Some(x) = get("getEnergyFee") {
+        params.energy_fee_sun = x as u64;
+    }
+    if let Some(x) = get("getMaxFeeLimit") {
+        params.max_fee_limit_sun = x as u64;
+    }
+    if let Some(x) = get("getTransactionFee") {
+        params.transaction_fee_sun = x as u64;
+    }
+    if let Some(x) = get("getMemoFee") {
+        params.memo_fee_sun = x as u64;
+    }
+    if let Some(x) = get("getDynamicEnergyThreshold") {
+        params.dynamic_threshold = x as u64;
+    }
+    if let Some(x) = get("getDynamicEnergyIncreaseFactor") {
+        params.dynamic_increase_factor = x as u32;
+    }
+    if let Some(x) = get("getDynamicEnergyMaxFactor") {
+        params.dynamic_max_factor = x as u32;
+    }
+    // Osaka is omitted (protobuf default 0) until governance activates it; a
+    // present, non-zero value flips it on.
+    params.allow_tvm_osaka = get("getAllowTvmOsaka").unwrap_or(0) != 0;
+    params
+}
+
+/// Parses a `/wallet/estimateenergy` response. `Some(energy_required)` on a
+/// supporting node, `Ok(None)` when the node reports it does not support the
+/// endpoint (the fall-back signal), and `Err` for any other error.
+pub(crate) fn parse_estimate_energy(v: &serde_json::Value) -> Result<Option<u64>, TronError> {
+    // Supporting node: { "result": { "result": true }, "energy_required": N }.
+    if let Some(required) = v.get("energy_required").and_then(|e| e.as_u64()) {
+        return Ok(Some(required));
+    }
+    // Disabled endpoint: a CONTRACT_VALIDATE_ERROR whose (hex) message decodes to
+    // "... does not support estimate energy". That is the fall-back signal, not a
+    // hard error.
+    let code = v["result"].get("code").and_then(|c| c.as_str()).unwrap_or_default();
+    let raw_msg = v["result"].get("message").and_then(|m| m.as_str()).unwrap_or_default();
+    let message = hex::decode(raw_msg)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .unwrap_or_else(|| raw_msg.to_string());
+    if message.contains("does not support estimate energy") {
+        return Ok(None);
+    }
+    // Any other failure (a revert, bad arguments, a different disablement) propagates.
+    Err(TronError::Api { code: code.to_string(), message })
+}
+
+/// Parses `contract_state.energy_factor` (TIP-491 dynamic-energy factor, precision
+/// 10000) from a `/wallet/getcontractinfo` response. Absent (fresh/cold contract,
+/// or non-contract `{}` body) ⇒ 0.
+pub(crate) fn parse_energy_factor(v: &serde_json::Value) -> u32 {
+    v.get("contract_state")
+        .and_then(|s| s.get("energy_factor"))
+        .and_then(|f| f.as_u64())
+        .unwrap_or(0) as u32
 }
 
 /// Parses a `/wallet/broadcasthex` response. `result == true` is success;
@@ -649,6 +926,57 @@ mod tests {
         assert_eq!(parse_account_balance(&serde_json::json!({})).unwrap(), 0);
     }
 
+    /// A `/wallet/getcontract` reply for a deployed contract classifies as a
+    /// contract. Fixture: the real mainnet response for USDT
+    /// (`TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t`), captured 2026-07-23, with the 31KB
+    /// `bytecode` kept as its real leading prefix and the large `abi.entrys` array
+    /// dropped for size — `contract_address`, on which the decision keys, is
+    /// verbatim.
+    #[test]
+    fn getcontract_usdt_is_contract() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontract_usdt.json"))
+                .unwrap();
+        assert!(parse_is_contract(&v));
+        // The markers the discriminator relies on are present in a real contract reply.
+        assert!(v.get("contract_address").and_then(|c| c.as_str()).is_some());
+        assert!(v.get("bytecode").and_then(|b| b.as_str()).is_some_and(|b| !b.is_empty()));
+    }
+
+    /// A `/wallet/getcontract` reply for an ordinary account is an empty `{}`
+    /// body, which classifies as not-a-contract. Fixture: the real mainnet empty
+    /// reply for the EOA `TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb`
+    /// (`41e28b3cfd4e0e909077821478e9fcb86b84be786e`), captured 2026-07-23.
+    #[test]
+    fn getcontract_eoa_is_not_contract() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontract_eoa.json")).unwrap();
+        assert!(!parse_is_contract(&v));
+    }
+
+    #[test]
+    fn getcontract_empty_object_is_not_contract() {
+        assert!(!parse_is_contract(&serde_json::json!({})));
+    }
+
+    /// The node distinguishes a contract from an EOA via `/wallet/getcontract`.
+    /// Mainnet is read-only here (no transaction, no TRX): USDT is a contract, a
+    /// large USDT holder (`TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb`) is an EOA.
+    #[tokio::test]
+    async fn live_is_contract_distinguishes_usdt_and_eoa_on_mainnet() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live mainnet read-only tests");
+            return;
+        }
+        let p = TronProvider::new("https://api.trongrid.io").unwrap();
+        let usdt =
+            foundry_tron_primitives::address::parse("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+        let eoa =
+            foundry_tron_primitives::address::parse("TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb").unwrap();
+        assert!(p.is_contract(usdt).await.unwrap(), "USDT must be a contract");
+        assert!(!p.is_contract(eoa).await.unwrap(), "a plain holder must be an EOA");
+    }
+
     #[test]
     fn parses_tx_info_fixture() {
         let v: serde_json::Value =
@@ -709,6 +1037,245 @@ mod tests {
         assert!(cr.success);
         assert_eq!(cr.result.len(), 32);
         assert!(alloy_primitives::U256::from_be_slice(&cr.result) > alloy_primitives::U256::ZERO);
+    }
+
+    /// The chain-parameters parser maps the real mainnet `getchainparameters`
+    /// response onto every `TronChainParams` field. Fixture: the verbatim mainnet
+    /// reply captured 2026-07-23 (all ~75 governance keys), so the parser is
+    /// proven to find its keys among the full set the node returns.
+    #[test]
+    fn parses_chain_parameters_mainnet_fixture() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getchainparameters.json"))
+                .unwrap();
+        let p = parse_chain_parameters(&v);
+        assert_eq!(p.energy_fee_sun, 100, "getEnergyFee");
+        assert_eq!(p.max_fee_limit_sun, 15_000_000_000, "getMaxFeeLimit");
+        assert_eq!(p.transaction_fee_sun, 1_000, "getTransactionFee (bandwidth sun/byte)");
+        assert_eq!(p.memo_fee_sun, 1_000_000, "getMemoFee");
+        assert_eq!(p.dynamic_threshold, 5_000_000_000, "getDynamicEnergyThreshold");
+        assert_eq!(p.dynamic_increase_factor, 2_000, "getDynamicEnergyIncreaseFactor");
+        assert_eq!(p.dynamic_max_factor, 34_000, "getDynamicEnergyMaxFactor");
+        // getAllowTvmOsaka is absent from the mainnet response (protobuf default),
+        // so it reads as pre-Osaka.
+        assert!(!p.allow_tvm_osaka, "getAllowTvmOsaka is absent => pre-Osaka");
+    }
+
+    /// A missing key keeps the field at its live default; the whole parser falls
+    /// back to defaults when the `chainParameter` array is absent.
+    #[test]
+    fn chain_parameters_default_on_missing_keys() {
+        // Empty body => every field is the offline default.
+        assert_eq!(parse_chain_parameters(&serde_json::json!({})), TronChainParams::default());
+        // Only getEnergyFee present (governance moved it to 210) and Osaka on: the
+        // named keys change, all others stay at the default.
+        let v = serde_json::json!({
+            "chainParameter": [
+                { "key": "getEnergyFee", "value": 210 },
+                { "key": "getAllowTvmOsaka", "value": 1 },
+            ]
+        });
+        let p = parse_chain_parameters(&v);
+        assert_eq!(p.energy_fee_sun, 210, "present key overrides the default");
+        assert!(p.allow_tvm_osaka, "present, non-zero Osaka flips it on");
+        assert_eq!(p.max_fee_limit_sun, 15_000_000_000, "absent key keeps the default");
+        assert_eq!(p.dynamic_max_factor, 34_000, "absent key keeps the default");
+    }
+
+    /// Live (mainnet, read-only) staleness sensor for the chain-parameter
+    /// constants: the fetched values are compared against the plan's 2026-07
+    /// snapshot (`TronChainParams::default()`) and the diff is PRINTED, not
+    /// asserted equal, so the tron-live CI surfaces a governance drift without a
+    /// hard failure. `getEnergyFee` is additionally asserted `> 0` (a sanity floor
+    /// the estimate loop relies on).
+    #[tokio::test]
+    async fn live_chain_parameters_match_snapshot_on_mainnet() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live mainnet read-only tests");
+            return;
+        }
+        let p = TronProvider::new("https://api.trongrid.io").unwrap();
+        let live = p.get_chain_parameters().await.unwrap();
+        let snap = TronChainParams::default();
+        if live != snap {
+            eprintln!(
+                "chain-parameter drift vs 2026-07 snapshot:\n live: {live:?}\n snap: {snap:?}"
+            );
+        }
+        assert!(live.energy_fee_sun > 0, "getEnergyFee must be positive");
+        assert!(live.max_fee_limit_sun > 0, "getMaxFeeLimit must be positive");
+    }
+
+    /// The constant-call parser reads the TIP-491 `energy_penalty` alongside
+    /// `energy_used`. Fixture: the real mainnet `triggerconstantcontract` reply for
+    /// USDT `transfer(address,uint256)` (captured 2026-07-23), whose
+    /// `energy_used = 64285` already includes `energy_penalty = 49635`, so the base
+    /// energy the local model reproduces is `64285 − 49635 = 14650`.
+    #[test]
+    fn parses_constant_result_energy_penalty_mainnet_usdt() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_triggerconstant_usdt.json"))
+                .unwrap();
+        let cr = parse_constant_result(&v).unwrap();
+        assert!(cr.success);
+        assert_eq!(cr.energy_used, 64285, "energy_used includes the penalty");
+        assert_eq!(cr.energy_penalty, 49635, "TIP-491 penalty portion");
+        assert_eq!(cr.energy_used - cr.energy_penalty, 14650, "base = used − penalty");
+    }
+
+    /// A pre-4.7.2 reply without `energy_penalty` reads the penalty as 0 (the
+    /// existing Nile totalSupply fixture carries no penalty field).
+    #[test]
+    fn constant_result_penalty_defaults_to_zero() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/nile_triggerconstant.json")).unwrap();
+        assert_eq!(parse_constant_result(&v).unwrap().energy_penalty, 0);
+    }
+
+    /// The tx-info parser reads the extended receipt resource fields. Fixture: the
+    /// real mainnet receipt for a USDT `transfer` (captured 2026-07-23) whose
+    /// caller paid energy from stake and burned bandwidth to TRX.
+    #[test]
+    fn parses_tx_info_resource_fields_mainnet_usdt() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_txinfo_usdt.json")).unwrap();
+        let info = parse_tx_info(&v).unwrap().expect("mined tx is in a block");
+        assert!(info.success);
+        assert_eq!(info.block_number, 84_706_816);
+        assert_eq!(info.energy_used, 64285, "energy_usage_total");
+        assert_eq!(info.energy_penalty_total, 49635, "energy_penalty_total");
+        assert_eq!(info.energy_usage_caller, 64285, "receipt.energy_usage (caller stake)");
+        assert_eq!(info.net_fee_sun, 345000, "receipt.net_fee (bandwidth burned to SUN)");
+        // Not present in this receipt ⇒ default 0.
+        assert_eq!(info.origin_energy_usage, 0);
+        assert_eq!(info.net_usage, 0);
+        assert_eq!(info.energy_used - info.energy_penalty_total, 14650, "base = used − penalty");
+    }
+
+    /// A supporting node's `estimateenergy` reply yields `Some(energy_required)`.
+    /// The response shape follows java-tron's `EstimateEnergyMessage`
+    /// (`result` + `energy_required`); public TronGrid/Nile disable the endpoint,
+    /// so the supported shape is exercised against the documented schema while the
+    /// disabled shape below is a captured live fixture.
+    #[test]
+    fn estimate_energy_supported_returns_some() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/estimateenergy_supported.json"))
+                .unwrap();
+        assert_eq!(parse_estimate_energy(&v).unwrap(), Some(64285));
+    }
+
+    /// A node with the endpoint disabled returns a CONTRACT_VALIDATE_ERROR whose
+    /// message decodes to "this node does not support estimate energy"; the parser
+    /// maps it to `Ok(None)` (the fall-back signal). Fixture: the real mainnet
+    /// reply captured 2026-07-23.
+    #[test]
+    fn estimate_energy_unsupported_returns_none() {
+        let v: serde_json::Value = serde_json::from_str(include_str!(
+            "../testdata/mainnet_estimateenergy_unsupported.json"
+        ))
+        .unwrap();
+        assert_eq!(parse_estimate_energy(&v).unwrap(), None);
+    }
+
+    /// Any other estimateenergy failure (e.g. a revert) propagates as an error,
+    /// never silently as `None`.
+    #[test]
+    fn estimate_energy_other_error_propagates() {
+        let v = serde_json::json!({
+            "result": { "code": "CONTRACT_EXE_ERROR", "message": hex::encode("REVERT opcode executed") }
+        });
+        let err = parse_estimate_energy(&v).unwrap_err();
+        assert!(matches!(err, TronError::Api { .. }));
+    }
+
+    /// The energy-factor parser reads `contract_state.energy_factor`. Fixtures: the
+    /// real mainnet `getcontractinfo` for USDT (a hot contract pinned at the max
+    /// factor 34000) and for a cold contract whose `contract_state` omits the
+    /// field ⇒ 0; an empty `{}` (non-contract) is also 0.
+    #[test]
+    fn parses_energy_factor_mainnet_fixtures() {
+        let hot: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontractinfo_usdt.json"))
+                .unwrap();
+        assert_eq!(parse_energy_factor(&hot), 34000, "USDT is at the max energy factor");
+        let cold: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getcontractinfo_cold.json"))
+                .unwrap();
+        assert_eq!(parse_energy_factor(&cold), 0, "cold contract has no accrued factor");
+        assert_eq!(parse_energy_factor(&serde_json::json!({})), 0, "non-contract ⇒ 0");
+    }
+
+    /// Live (mainnet, read-only) USDT estimate loop: the constant call reports a
+    /// non-zero TIP-491 penalty, `getcontractinfo` reports a positive energy
+    /// factor, and `estimateenergy` on the public node signals it is unsupported
+    /// (⇒ the `trigger_constant` fallback). Spends no TRX.
+    #[tokio::test]
+    async fn live_usdt_estimate_loop_on_mainnet() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live mainnet read-only tests");
+            return;
+        }
+        let p = TronProvider::new("https://api.trongrid.io").unwrap();
+        let usdt =
+            foundry_tron_primitives::address::parse("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t").unwrap();
+        // A large USDT holder (real, funded), used only as the constant-call owner.
+        let holder =
+            foundry_tron_primitives::address::parse("TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb").unwrap();
+        // transfer(holder, 1): selector a9059cbb + address word + amount 1.
+        let mut data = hex::decode("a9059cbb").unwrap();
+        data.extend_from_slice(&{
+            let mut w = [0u8; 32];
+            w[12..].copy_from_slice(holder.as_slice());
+            w
+        });
+        data.extend_from_slice(&alloy_primitives::U256::from(1u64).to_be_bytes::<32>());
+
+        let cr = p.trigger_constant(holder, usdt, &data).await.unwrap();
+        assert!(cr.success, "constant transfer must succeed");
+        assert!(cr.energy_penalty > 0, "USDT carries a TIP-491 penalty");
+        assert!(cr.energy_used > cr.energy_penalty, "base = used − penalty must be positive");
+
+        let factor = p.get_contract_energy_factor(usdt).await.unwrap();
+        assert!(factor > 0, "USDT has a non-zero dynamic-energy factor");
+
+        // Public TronGrid disables estimateenergy ⇒ None (fall-back signal).
+        assert_eq!(
+            p.estimate_energy(holder, usdt, &data).await.unwrap(),
+            None,
+            "public node signals estimateenergy is unsupported",
+        );
+    }
+
+    #[test]
+    fn suggest_fee_limit_applies_buffer_and_clamp() {
+        let params = TronChainParams::default(); // energy 100 sun, max 15_000_000_000.
+        // A USDT-class transfer (~64285 energy) at 100 sun with the default 20%
+        // buffer: 64285 * 100 * 1.2 = 7_714_200 SUN (~7.7 TRX), well under the cap.
+        assert_eq!(suggest_fee_limit_sun(64_285, &params, DEFAULT_FEE_LIMIT_BUFFER_PCT), 7_714_200,);
+        // Zero buffer is the bare energy cost.
+        assert_eq!(suggest_fee_limit_sun(64_285, &params, 0), 6_428_500);
+        // A huge estimate clamps to getMaxFeeLimit (15_000 TRX): 200e6 * 100 * 1.2
+        // = 24e9 > 15e9 ⇒ clamped.
+        assert_eq!(
+            suggest_fee_limit_sun(200_000_000, &params, DEFAULT_FEE_LIMIT_BUFFER_PCT),
+            15_000_000_000,
+        );
+        // Zero energy ⇒ zero suggestion.
+        assert_eq!(suggest_fee_limit_sun(0, &params, DEFAULT_FEE_LIMIT_BUFFER_PCT), 0);
+    }
+
+    #[test]
+    fn check_fee_limit_rejects_over_max_and_non_positive() {
+        let params = TronChainParams::default();
+        assert!(check_fee_limit(1_000_000_000, &params).is_ok(), "1000 TRX is under the cap");
+        assert!(check_fee_limit(15_000_000_000, &params).is_ok(), "exactly getMaxFeeLimit is ok");
+        assert!(
+            check_fee_limit(15_000_000_001, &params).is_err(),
+            "one SUN over getMaxFeeLimit is rejected"
+        );
+        assert!(check_fee_limit(0, &params).is_err(), "zero fee_limit is rejected");
+        assert!(check_fee_limit(-1, &params).is_err(), "negative fee_limit is rejected");
     }
 
     #[test]
@@ -798,6 +1365,36 @@ mod tests {
         assert_eq!(tc.contract_address[1..], contract.as_slice()[..]);
         assert_eq!(tc.call_value, 5);
         assert_eq!(tc.data, data);
+    }
+
+    /// `build_trigger_raw` accepts empty `data`: a value-only contract call
+    /// (payable fallback/receive) is a legal `TriggerSmartContract`. The builder
+    /// must not reject the empty vector — it is exactly what the transfer-bug fix
+    /// routes a value-only call to a contract through.
+    #[test]
+    fn builds_trigger_raw_with_empty_data_is_value_only_call() {
+        let owner =
+            foundry_tron_primitives::address::parse("TX7izXWcmofRYonzdcThrS78jifMtVWCuf").unwrap();
+        let contract =
+            foundry_tron_primitives::address::parse("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj").unwrap();
+        let rb = RefBlock { bytes: vec![0x3c, 0x6f], hash: vec![1, 2, 3, 4, 5, 6, 7, 8] };
+        let raw = build_trigger_raw(
+            owner,
+            contract,
+            1_000_000,
+            Vec::new(),
+            rb,
+            1_783_775_034_896,
+            &TxOptions::default(),
+        );
+        assert_eq!(raw.contract[0].r#type, ContractType::TriggerSmartContract as i32);
+        let tc = <proto::TriggerSmartContract as Message>::decode(
+            raw.contract[0].parameter.as_ref().unwrap().value.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(tc.contract_address[1..], contract.as_slice()[..]);
+        assert_eq!(tc.call_value, 1_000_000);
+        assert!(tc.data.is_empty(), "value-only call carries empty calldata");
     }
 
     /// Rebuilds the real Nile Counter deploy from its own inputs and asserts the
@@ -977,6 +1574,76 @@ mod tests {
         eprintln!(
             "live E2E tx: https://nile.tronscan.org/#/transaction/{}",
             alloy_primitives::hex::encode(txid)
+        );
+    }
+
+    /// Live (Nile) proof of the value-only-to-contract fix (plan I2 gate). Deploys
+    /// a minimal payable sink (runtime `0x00` / STOP — a contract that accepts a
+    /// value-bearing call with empty calldata and keeps the TRX), then:
+    ///   1. the node classifies the sink as a contract and the funded EOA as not (the `is_contract`
+    ///      discriminator that drives the send-path choice);
+    ///   2. the fix — an empty-`data` `TriggerSmartContract` carrying `call_value` — is ACCEPTED
+    ///      (receipt SUCCESS) and the sink's balance grows by the value, which is exactly what
+    ///      `cast send`/`forge script` now build for a value-only send to a contract.
+    ///
+    /// The pre-fix path built a `TransferContract`, whose correctness bug is that it only credits
+    /// the contract's balance and never runs its `receive()`/`fallback()`, so `cast send <contract>
+    /// --value` would silently skip the payable entry point the user means to invoke (`cast send`'s
+    /// Ethereum semantics run it). java-tron *additionally* rejects a bare transfer to a contract,
+    /// but only under governance: `TransferActuator.validate()` throws iff
+    /// `getForbidTransferToContract == 1`, or `getAllowTvmCompatibleEvm == 1` and the target's
+    /// contract version is 1. Both flags are 0 on mainnet and Nile as of 2026-07 (their `value`
+    /// is omitted from `getchainparameters`, the protobuf default), so a live bare transfer is
+    /// currently accepted — which is why this gate proves the fix through the always-true
+    /// semantic path (the trigger runs contract code) rather than asserting a node rejection
+    /// that governance can toggle.
+    #[tokio::test]
+    async fn live_value_only_contract_call_on_nile() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live Nile tests");
+            return;
+        }
+        use std::str::FromStr;
+        let key = std::env::var("TRON_PRIVATE_KEY").expect("TRON_PRIVATE_KEY for live value-only");
+        let signer = alloy_signer_local::PrivateKeySigner::from_str(&key).unwrap();
+        // nileex.io: nile.trongrid.io is unreachable from this host.
+        let p = TronProvider::new("https://api.nileex.io").unwrap();
+        let owner = signer.address();
+
+        // Minimal payable sink: creation returns a single-byte STOP runtime, so a value-bearing
+        // call with empty calldata halts successfully and the TRX stays with the contract.
+        let creation = hex::decode("6001600c60003960016000f300").unwrap();
+        let opts = TxOptions { fee_limit: 400_000_000, expiration_ms: 60_000 };
+        let poll = (30u32, Duration::from_secs(3));
+        let (deploy_txid, sink, info) =
+            p.deploy_contract(&signer, creation, "PayableSink", &opts, poll).await.unwrap();
+        assert!(info.success, "sink deploy must succeed");
+        eprintln!(
+            "live payable sink tx {} -> {}",
+            hex::encode(deploy_txid),
+            foundry_tron_primitives::to_base58(sink),
+        );
+
+        // 1) The node distinguishes the contract from the funded EOA: this is the discriminator the
+        //    fix routes on.
+        assert!(p.is_contract(sink).await.unwrap(), "sink must classify as a contract");
+        assert!(!p.is_contract(owner).await.unwrap(), "the funded signer is an EOA");
+
+        // 2) The fix: an empty-data trigger with call_value runs the contract and credits the sink.
+        let value_sun = 1_000_000i64;
+        let before = p.get_balance(sink).await.unwrap();
+        let (call_txid, call_info) =
+            p.trigger_contract(&signer, sink, value_sun, Vec::new(), &opts, poll).await.unwrap();
+        assert!(call_info.success, "empty-data trigger with value must succeed");
+        let after = p.get_balance(sink).await.unwrap();
+        assert_eq!(
+            after - before,
+            value_sun as u64,
+            "the sink balance must grow by the transferred value",
+        );
+        eprintln!(
+            "live value-only fix: trigger tx https://nile.tronscan.org/#/transaction/{} credited {value_sun} SUN",
+            hex::encode(call_txid),
         );
     }
 

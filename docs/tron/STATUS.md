@@ -4,7 +4,7 @@
 
 Локальный путь на этой машине: `/Users/andrey/vibe_projects/foundry-tron` — это САМ репозиторий (плоская структура: `crates/`, `docs/tron/`, `sandbox/` прямо в корне). Никакой обёрточной папки/вложенного `foundry/` больше нет — если видите путь вида `.../foundry-tron/foundry/...`, это устаревшее упоминание из старой сессии.
 
-Обновлено: 2026-07-14. Этап 3 (план H) — в ветке **`tron-stage3`** (от `tron-dev`).
+Обновлено: 2026-07-23. Этап 4 (план I, «fidelity») — в ветке **`tron-stage4`** (от `master`).
 
 ## Документы
 
@@ -24,6 +24,7 @@
 | F | Резолвер tron-solc (крейт `foundry-tron-solc`, GitHub-релизы + чексуммы, шов `Config::ensure_solc`) | ✅ Готов. Крейт с pinned sha256 (0.8.25/26/27 × linux/macos/windows), автовыбор в `ensure_solc` при `network=tron`, sandbox без абсолютного пути. Оффлайн-тесты зелёные, download-гейт `TRON_SOLC_DOWNLOAD=1` |
 | G | Fork-режим (`forge test --fork-url` через `/jsonrpc`) с постоянным shim `eth_getTransactionCount → 0x0` (java-tron отдаёт `-32601`) + tip-only state-читка (`/jsonrpc` берёт state только на `latest`) | ✅ Готов. Nonce-shim (G1) + unpin state-блока для tron (G2). Live read-only mainnet fork на USDT зелёный (см. «План G» ниже) |
 | H | Этап 3 «полировка/OSS» (ветка `tron-stage3`): gas-report energy+bandwidth (H2), fork-guard на явный исторический блок (H1), TRONSCAN verify — `forge verify-contract` + embedded `forge create --verify` (H3/H4), USER_GUIDE/README/version-stamp (H5), tron-live CI workflow (H6) | ✅ Готов. H1–H6 (см. «План H» ниже). Live acceptance-гейт verify E2E пройден на Nile |
+| I | Этап 4 «fidelity» (ветка `tron-stage4`): precompile-кламп = ровно java-tron (I1), value-only вызов контракта через TriggerSmartContract (I2), tron-solc 0.8.28 + динамический резолв из solc-bin (I3), chainid-дефолт/BASEFEE-env/no-op-warn (I4), getchainparameters (I5), energy_penalty/estimateenergy/`cast estimate`/fee_limit-валидация (I6), TIP-491 penalty в gas-report + фикс Deployment Energy (I7), base58 в трейсах (I8), release prep (I9) | ✅ Готов. Оффлайн-юниты зелёные; live-гейты `TRON_LIVE=1` (mainnet read-only / Nile spend) и `TRON_SOLC_DOWNLOAD=1` — см. «План I» ниже. Тулчейн-версия штампа `--version` → `0.2.0` |
 
 ## План D — что работает (сквозной цикл Этапа 1 на Nile)
 
@@ -125,8 +126,9 @@ energy (`trace.gas_used` = TVM energy на tron) и добавляет bandwidth
 Точно для нашего broadcast-пути (билдер НЕ ставит `ref_block_num`; чужие кошельки
 могут отличаться на пару байт). EVM-вывод gas-report — БАЙТ-В-БАЙТ без изменений
 (гейт is_tron; JSON-поля — `Option` + `#[serde(default, skip_serializing_if)]`).
-Deployment energy = 0 локально (create-frame `gas_used` currently 0), deployment
-bandwidth точен из initcode. Тесты: оффлайн-юниты оценщика против committed-фикстур —
+Deployment energy = метеринг create-фрейма (Counter в `setUp` — depth>1 create —
+даёт **101191**; I7-фикс пишет `contract_info.gas` до depth-guard'а, раньше guard ронял
+его в 0), deployment bandwidth точен из initcode. Тесты: оффлайн-юниты оценщика против committed-фикстур —
 mainnet trigger → **345**, Nile create → **853** (точные значения, без допусков);
 CLI `tron_gas_report_energy_and_bandwidth` (гейт: tron-solc в кэше) —
 детерминированные bandwidth-константы `increment()` → 280, `setNumber(uint256)` → 314;
@@ -239,6 +241,77 @@ fork-safe); экшены пиненые теми же SHA, что и в репо
 - Скраб русских внутренних `docs/tron/*` — USER_GUIDE их суперсидит для пользователей.
 - Первый зелёный прогон CI форка под полной матрицей (0 runs до сих пор) — событие после
   пуша, латентные красноты чинятся follow-up'ом.
+
+## План I — Этап 4 «fidelity» (ветка `tron-stage4`)
+
+Закрытие находок fidelity-аудита 2026-07-23. Всё, что делает mainnet-оценки энергии/
+стоимости доверяемыми для «горячих» контрактов, а деплой/send-пути — не отдающими ноде
+отвергаемые транзакции. Порядок исполнения I1→I9 (I5 — фундамент для I6/I7).
+
+1. **I1 — precompile-кламп.** Карта precompile'ов tron-EVM строится ТОЛЬКО из
+   `tron_precompiles()` (без эфирной базы спека конфига). Эфирные BLS12-381 (0x0b–0x11) и
+   P256Verify (0x100) больше не протекают ни при каком `evm_version`. Вызов отсутствующего
+   адреса = пустой аккаунт (java-tron).
+2. **I2 — value-only вызов контракта.** `cast send <контракт> --value N` без сигнатуры и
+   broadcast-петля script'а строят `TriggerSmartContract` (легальный payable
+   fallback/receive), а не `TransferContract` (его нода отвергает на контракт-адрес только
+   при включённых governance-флагах `getForbidTransferToContract` /
+   `getAllowTvmCompatibleEvm` — сейчас оба выключены, но Trigger — единственный семантически
+   верный путь вызова payable receive). Новый `TronProvider::is_contract`
+   (`/wallet/getcontract`).
+3. **I3 — tron-solc 0.8.28 + динамический резолв.** Пины расширены до 0.8.23–0.8.28,
+   `default_version()` = **0.8.28**. Версия вне пинов при `!offline` резолвится из
+   `tronprotocol.github.io/solc-bin/{list_key}/list.json` с проверкой опубликованной sha256;
+   `offline` по-прежнему детерминированно падает `NoPin`.
+4. **I4 — идентичность сети.** Локальный дефолт `block.chainid` = mainnet **728126428** (был
+   31337 — ломал EIP-712/permit); `block.basefee` = `getEnergyFee` (100 sun) и переопределяем
+   `vm.fee`; `vm.prevrandao`/`vm.txGasPrice` на tron один раз варнят (TVM жёстко 0 — no-op, не
+   ошибка).
+5. **I5 — chain-параметры.** `TronChainParams` + `get_chain_parameters()`
+   (`/wallet/getchainparameters`). Fork best-effort warn при устаревшей цене энергии / Osaka.
+   Оффлайн-дефолты = live-снапшот 2026-07-23 (см. ниже).
+6. **I6 — петля оценки.** `ConstantResult.energy_penalty`, расширенный `TxInfo`
+   (energy_penalty_total/usage/origin/net), `estimate_energy`, `get_contract_energy_factor`,
+   `suggest_fee_limit_sun` (буфер 20%, кламп 15 000 TRX), `cast estimate` на tron (text+json),
+   валидация `fee_limit > getMaxFeeLimit` перед broadcast.
+7. **I7 — TIP-491 в симуляции.** Penalty считается ПОСТ-ФАКТУМ из trace-арены (собственная
+   энергия узла × factor(address)/10000), факторы тянутся с fork-ноды
+   (`get_contract_energy_factor`) и кэшируются на прогон. `forge test --gas-report` на форке
+   рисует колонку **Penalty Avg** + ячейку **Deployment Penalty** (JSON `energy_penalty`,
+   `skip_serializing_if`); non-fork — пустая карта, репорт base-only и байт-в-байт неизменен.
+   Knob `[tron] dynamic_energy` (default true). Отдельный фикс: **Deployment Energy для
+   вложенных create** (tron-gated запись `contract_info.gas` до depth-guard'а — EVM
+   `gas_report_size_for_nested_create`/#9300 остаётся 0, байт-в-байт). Ограничение:
+   `gasleft()` внутри горячего фрейма — base-only (penalty не в интерпретаторе).
+8. **I8 — base58 в трейсах.** Два шва декодера: незалейбленный контракт идентифицируется
+   base58-формой (`vm.label`/known-контракты приоритетны); address-значения в
+   args/returns/logs (в т.ч. вложенные) — base58. `TraceWriter` — внешний крейт без хука;
+   `foundry-common-fmt` получил `format_token_with_address`, декодер держит форматтер как
+   `fn(Address)->String` из вызова (traces без tron-dep). Off-tron — байт-в-байт.
+9. **I9 — release prep.** Тулчейн-версия штампа `--version` → **0.2.0** (`(tron 0.2.0; …)`,
+   `Version: … (tron fork 0.2.0)`); STATUS/USER_GUIDE обновлены; feature-списки Makefile ↔
+   `foundry-tron-build.yml` сверены.
+
+**Снапшот-константы (live-проба 2026-07-23, mainnet `api.trongrid.io`) — оффлайн-дефолты
+`TronChainParams`:** `getEnergyFee` 100 sun, `getMaxFeeLimit` 15 000 000 000 sun (15 000 TRX),
+`getTransactionFee` 1000 sun/байт, `getMemoFee` 1 000 000 sun, `getDynamicEnergyThreshold`
+5 000 000 000, `getDynamicEnergyIncreaseFactor` 2000 (+20%), `getDynamicEnergyMaxFactor` 34000
+(3.4 → до 4.4× total), `getAllowTvmOsaka` 0. USDT стоит на максимуме `energy_factor` = 34000.
+**tron-solc 0.8.28** — `0.8.28+commit.9c4253d2`, sha256 (macosx/linux/windows) запинены в
+`pins.rs` (сняты raw curl'ом 2026-07-23).
+
+**Live-гейты (не в оффлайн-прогоне):** `TRON_LIVE=1` — I5 staleness-датчик (mainnet
+`getchainparameters` == дефолты, печатает диф), I6 USDT-оценка (`energy_penalty>0`,
+`energy_used≈base×4.4`), I7 fork gas-report penalty (mainnet fork, `Penalty Avg` рисуется из
+node-fetch'а); I2 live-деплой `PayableSink` + value-only send — **Nile** (spend). Nile
+активирует апгрейды РАНЬШЕ mainnet — параметры двух сетей могут расходиться.
+
+**DEFER (вне скоупа Этапа 4, зафиксировано):** Osaka-вариант precompile/энергомодели (ждём
+активации на Nile; сторожок — warn из I5); anvil-tron / chisel-tron как настоящие
+TVM-окружения (бинарники — vanilla-EVM); in-loop метеринг penalty (`gasleft()` в горячих
+контрактах); TRC-10 семантика (0xD0–0xD3 — стабы); stake/gov-опкоды 0xd5–0xdf;
+multisig/permission_id/memo в билдере; глубина вызовов 64 (revm `CALL_STACK_LIMIT`); учёт
+1.1 TRX activation-burn; читкод `vm.tronSetEnergyFactor` для локального моделирования penalty.
 
 ## Ключевые находки (не потерять)
 

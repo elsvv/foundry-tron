@@ -2002,6 +2002,100 @@ Hex(41): 41a614f803b6fd780986a42c78ec9c7f77e6ded13c
     cmd.cast_fuse().args(["tron-address", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6u"]).assert_failure();
 });
 
+// Offline: `cast estimate --create` is not yet wired for Tron energy estimation (deploy energy
+// is not a constant call), so the Tron branch rejects it up front with an actionable message. No
+// network is touched — the `--create` guard runs before any provider is built.
+casttest!(tron_estimate_create_rejected, |prj, cmd| {
+    prj.update_config(|config| {
+        config.networks = foundry_evm_networks::NetworkConfigs::with_tron();
+    });
+    cmd.cast_fuse()
+        // `cast_fuse` resets to a bare `cast` command that does not inherit the project root
+        // (unlike `forge_fuse`), so point it at the project so its tron config is loaded.
+        .current_dir(prj.root())
+        .args(["estimate", "--create", "0x600160010160005260206000f3"])
+        .assert_failure()
+        .stderr_eq(str![[r#"
+Error: cast estimate --create is not supported on tron yet; use `forge create` to deploy
+
+"#]]);
+});
+
+// Offline: a `--tron.fee-limit` above the node's `getMaxFeeLimit` (15_000 TRX) is rejected before
+// any signing or broadcast. The provider points at an unroutable local port so the best-effort
+// chain-parameter fetch fails fast and the validator falls back to the 2026-07 snapshot ceiling;
+// the over-cap limit then fails the `check_fee_limit` guard. No TRX, no live node.
+casttest!(tron_send_fee_limit_over_max_rejected, async |prj, cmd| {
+    prj.update_config(|config| {
+        config.networks = foundry_evm_networks::NetworkConfigs::with_tron();
+    });
+    // 20_000 TRX (20_000_000_000 SUN) is above getMaxFeeLimit (15_000_000_000 SUN).
+    cmd.cast_fuse()
+        // `cast_fuse` resets to a bare `cast` command that does not inherit the project root
+        // (unlike `forge_fuse`), so point it at the project so its tron config is loaded.
+        .current_dir(prj.root())
+        .args([
+            "send",
+            "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+            "--value",
+            "1",
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--tron.fee-limit",
+            "20000000000",
+            "--rpc-url",
+            "http://127.0.0.1:1",
+        ])
+        .assert_failure()
+        .stderr_eq(str![[r#"
+Error: tron fee_limit 20000000000 SUN exceeds the node's getMaxFeeLimit 15000000000 SUN (15000 TRX); lower it with --tron.fee-limit or the [tron] fee_limit config
+
+"#]]);
+});
+
+// Live (mainnet, read-only): `cast estimate` for a USDT `transfer` reports the energy (TIP-491
+// penalty included), the on-chain bandwidth, a suggested fee_limit clamped to getMaxFeeLimit and
+// the burned-cost estimate. Gated on `TRON_LIVE=1`; spends no TRX (estimate only).
+casttest!(
+    #[expect(clippy::disallowed_macros)]
+    tron_estimate_usdt_transfer_mainnet,
+    async |prj, cmd| {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!(
+                "skipped tron_estimate_usdt_transfer_mainnet: set TRON_LIVE=1 to run the live mainnet read-only estimate"
+            );
+            return;
+        }
+        prj.update_config(|config| {
+            config.networks = foundry_evm_networks::NetworkConfigs::with_tron();
+        });
+        let out = cmd
+            .cast_fuse()
+            // `cast_fuse` resets to a bare `cast` command that does not inherit the project root
+            // (unlike `forge_fuse`), so point it at the project so its tron config is loaded.
+            .current_dir(prj.root())
+            .args([
+                "estimate",
+                "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+                "transfer(address,uint256)",
+                "TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb",
+                "1",
+                // A real large USDT holder as the constant-call owner. `--from` is parsed as an
+                // eth-form Address (WalletOpts), so it is the 0x form of TWd4WrZ9…ns5jwb.
+                "--from",
+                "0xe28b3cfd4e0e909077821478e9fcb86b84be786e",
+                "--rpc-url",
+                "https://api.trongrid.io",
+            ])
+            .assert_success()
+            .get_output()
+            .stdout_lossy();
+        assert!(out.contains("energy used:"), "estimate must report energy\n{out}");
+        assert!(out.contains("suggested fee_limit:"), "estimate must suggest a fee_limit\n{out}");
+        assert!(out.contains("est. cost:"), "estimate must report a burned-cost estimate\n{out}");
+    }
+);
+
 // tests that revert reason is only present if transaction has reverted.
 
 casttest!(receipt_revert_reason, |_prj, cmd| {

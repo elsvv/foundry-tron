@@ -3,6 +3,10 @@
 /// The SemVer compatible version information for Foundry.
 pub const SEMVER_VERSION: &str = env!("FOUNDRY_SEMVER_VERSION");
 
+/// The Tron toolchain version layered on top of this upstream Foundry build (stamped into the
+/// `tron` marker of `--version`, bumped per fidelity stage).
+pub const TRON_TOOLCHAIN_VERSION: &str = env!("FOUNDRY_TRON_TOOLCHAIN_VERSION");
+
 /// The short version message information for the Foundry CLI.
 pub const SHORT_VERSION: &str = env!("FOUNDRY_SHORT_VERSION");
 

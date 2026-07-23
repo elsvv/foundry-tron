@@ -3,6 +3,13 @@
 use chrono::DateTime;
 use std::{error::Error, path::PathBuf};
 
+/// Version of the Tron toolchain layered on top of this upstream Foundry checkout. Bumped per
+/// fidelity stage (stage 4 = plan I: TIP-491 dynamic energy, precompile clamp, value-only contract
+/// calls, base58 traces, tron-solc 0.8.28). It is stamped into `--version` next to the `tron`
+/// marker so a user can tell which Tron fidelity level a binary carries, independent of the
+/// upstream Foundry version.
+const TRON_TOOLCHAIN_VERSION: &str = "0.2.0";
+
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -43,14 +50,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     // - The latest version from Cargo.toml
     // - A `tron;` marker identifying this as the Tron fork of Foundry.
     // - The short SHA of the latest commit.
-    // The `tron;` marker sits inside the existing parenthetical so the version keeps the
-    // upstream `<version> (<...>)` shape and stays parseable by the version snapshot tests.
+    // The `tron <toolchain>;` marker sits inside the existing parenthetical so the version keeps
+    // the upstream `<version> (<...>)` shape and stays parseable by the version snapshot tests.
     // The SemVer string above is deliberately left untouched so `strip_semver_metadata`
     // (the `foundryVersionCmp`/`foundryVersionAtLeast` cheatcodes) still parses cleanly.
-    // Example: 0.3.0-dev (tron; 3cb96bde9b 2025-01-16T15:04:03.522021223Z)
+    // Example: 0.3.0-dev (tron 0.2.0; 3cb96bde9b 2025-01-16T15:04:03.522021223Z)
     println!(
-        "cargo:rustc-env=FOUNDRY_SHORT_VERSION={version} (tron; {sha_short} {build_timestamp})"
+        "cargo:rustc-env=FOUNDRY_SHORT_VERSION={version} (tron {TRON_TOOLCHAIN_VERSION}; {sha_short} {build_timestamp})"
     );
+
+    // The Tron toolchain version on its own, so `foundry_common::version` can surface it.
+    println!("cargo:rustc-env=FOUNDRY_TRON_TOOLCHAIN_VERSION={TRON_TOOLCHAIN_VERSION}");
 
     // The long version information for the Foundry CLI.
     // - The latest version from Cargo.toml.
@@ -62,17 +72,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     //
     // ```text
     // <BIN>
-    // Version: 0.3.0-dev (tron fork)
+    // Version: 0.3.0-dev (tron fork 0.2.0)
     // Commit SHA: 5186142d3bb4d1be7bb4ade548b77c8e2270717e
     // Build Timestamp: 2025-01-16T15:04:03.522021223Z (1737039843)
     // Build Profile: debug
     // ```
     //
-    // The `(tron fork)` marker on the `Version:` line identifies this build as the Tron fork
-    // without adding a line (the assert below pins the line count) or disturbing the SemVer string.
+    // The `(tron fork <toolchain>)` marker on the `Version:` line identifies this build as the
+    // Tron fork and its fidelity stage without adding a line (the assert below pins the line
+    // count) or disturbing the SemVer string.
     let long_version = format!(
         "\
-Version: {version} (tron fork)
+Version: {version} (tron fork {TRON_TOOLCHAIN_VERSION})
 Commit SHA: {sha}
 Build Timestamp: {build_timestamp} ({build_timestamp_unix})
 Build Profile: {profile}"

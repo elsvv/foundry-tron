@@ -20,6 +20,7 @@
 //! `chainbase/src/main/java/org/tron/common/runtime/ProgramResult.java`.
 
 use alloy_evm::{Database, eth::EthEvmContext, precompiles::PrecompilesMap};
+use alloy_primitives::{Address, map::HashMap};
 use revm::{
     bytecode::opcode,
     context::Evm as RevmEvm,
@@ -28,6 +29,7 @@ use revm::{
     interpreter::{gas_table, interpreter::EthInterpreter},
     primitives::hardfork::SpecId,
 };
+use revm_inspectors::tracing::{CallTraceArena, types::CallTraceNode};
 
 /// Tron `getEnergyFee()` in SUN per energy unit. Probed live on both mainnet
 /// (`api.trongrid.io`) and Nile (`api.nileex.io`) on 2026-07-12; identical on
@@ -139,6 +141,11 @@ pub(super) fn apply_tron_energy<DB: Database, I>(
     instructions.insert_gas(opcode::MLOAD, TRON_MEMORY_OP_ENERGY);
     instructions.insert_gas(opcode::MSTORE, TRON_MEMORY_OP_ENERGY);
     instructions.insert_gas(opcode::MSTORE8, TRON_MEMORY_OP_ENERGY);
+    // BASEFEE keeps the stock revm instruction (reads `block.basefee`) rather than
+    // a Tron-specific opcode override, so its static tier is no longer set by
+    // `insert_instruction`. The FRONTIER `gas_table` already carries BASE=2 for it;
+    // re-assert here so the tier is pinned regardless of any future table drift.
+    instructions.insert_gas(opcode::BASEFEE, 2);
 
     // 2. Dynamic gas: FRONTIER GasParams + the Tron-specific overrides.
     inner.ctx.cfg.set_gas_params(tron_gas_params());
@@ -201,17 +208,80 @@ pub(super) fn tron_gas_params() -> GasParams {
     gas_params
 }
 
+/// TIP-491 dynamic-energy factor precision. A stored factor of 10000 is 1.0x (no
+/// penalty); 34000 (USDT's live maximum) is a +3.4x penalty on top of base, i.e.
+/// 4.4x total charged energy. Factors are read from `getcontractinfo`'s
+/// `contract_state.energy_factor`.
+const DYNAMIC_ENERGY_FACTOR_PRECISION: u64 = 10_000;
+
+/// The TIP-491 dynamic-energy penalty a single trace node contributes: its *own*
+/// executed energy — this frame's `gas_used` minus the cumulative `gas_used` of
+/// its direct children, since revm reports `gas_used` for the whole subtree —
+/// scaled by the node contract's live energy factor. A contract with no accrued
+/// factor (fresh, cold, or absent from `factors`) contributes nothing.
+///
+/// This mirrors java-tron: the penalty is charged on the energy executed "in the
+/// contract's own context" (its own instructions, not its sub-calls), so each
+/// contract's factor is applied only to the energy that contract itself burned.
+fn node_own_penalty(
+    nodes: &[CallTraceNode],
+    node: &CallTraceNode,
+    factors: &HashMap<Address, u32>,
+) -> u64 {
+    let children_energy: u64 = node.children.iter().map(|&c| nodes[c].trace.gas_used).sum();
+    let own_energy = node.trace.gas_used.saturating_sub(children_energy);
+    let factor = factors.get(&node.trace.address).copied().unwrap_or(0) as u64;
+    own_energy.saturating_mul(factor) / DYNAMIC_ENERGY_FACTOR_PRECISION
+}
+
+/// Total TIP-491 dynamic-energy penalty over an entire trace arena: the sum of
+/// every node's own-energy penalty (see [`node_own_penalty`]). `factors` maps a
+/// contract address to its live energy factor (precision 10000); an empty map
+/// yields 0. Penalty is computed post-facto from the trace arena rather than in
+/// the interpreter, so a contract's `gasleft()` inside a hot frame is unchanged —
+/// a documented limitation of the local model.
+pub fn dynamic_energy_penalty(arena: &CallTraceArena, factors: &HashMap<Address, u32>) -> u64 {
+    let nodes = arena.nodes();
+    nodes.iter().map(|node| node_own_penalty(nodes, node, factors)).sum()
+}
+
+/// TIP-491 dynamic-energy penalty for the subtree rooted at `root_idx` — the
+/// per-frame counterpart of [`dynamic_energy_penalty`], summing the own-energy
+/// penalty of the root and every descendant. Used to attribute a top-level call
+/// or create's penalty in the gas report, since each isolated frame's reported
+/// energy already covers its whole subtree.
+pub fn subtree_energy_penalty(
+    nodes: &[CallTraceNode],
+    root_idx: usize,
+    factors: &HashMap<Address, u32>,
+) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root_idx];
+    while let Some(idx) = stack.pop() {
+        let node = &nodes[idx];
+        total = total.saturating_add(node_own_penalty(nodes, node, factors));
+        stack.extend(node.children.iter().copied());
+    }
+    total
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TRON_ENERGY_FEE_SUN, tron_gas_params};
+    use super::{
+        TRON_ENERGY_FEE_SUN, dynamic_energy_penalty, subtree_energy_penalty, tron_gas_params,
+    };
     use crate::evm::tron::TronEvmFactory;
     use alloy_evm::{EthEvmFactory, Evm, EvmEnv, EvmFactory};
-    use alloy_primitives::{B256, TxKind, U256, hex};
+    use alloy_primitives::{Address, B256, TxKind, U256, hex, map::HashMap};
     use revm::{
         context::{CfgEnv, TxEnv},
         context_interface::cfg::GasParams,
         database::{CacheDB, EmptyDB},
         primitives::hardfork::SpecId,
+    };
+    use revm_inspectors::tracing::{
+        CallTraceArena,
+        types::{CallTrace, CallTraceNode},
     };
 
     /// A CANCUN environment mirroring the tron sandbox (`evm_version = "cancun"`).
@@ -266,6 +336,21 @@ mod tests {
             EthEvmFactory::default().create_evm(CacheDB::<EmptyDB>::default(), cancun_env());
         let out = evm.transact_raw(create_tx(code.to_vec())).unwrap();
         assert!(out.result.is_success(), "eth exec must succeed: {:?}", out.result);
+        U256::from_be_slice(out.result.output().unwrap())
+    }
+
+    /// Runs `code` as a creation tx on the Tron factory in an explicit env and
+    /// returns the deployed runtime bytes as a big-endian word. Used to prove the
+    /// block-op reads come from the block env (not a hardcoded constant). Disables
+    /// the base-fee check because these snippets run a zero-gas-price creation tx
+    /// against a non-zero `block.basefee`; the real forge path passes validation
+    /// with a zeroed env and only restores the true base fee inside
+    /// `initialize_interp` (see `EnvOverrides` / `Executor::build_test_env`).
+    fn tron_returned_word_in(code: &[u8], mut env: EvmEnv) -> U256 {
+        env.cfg_env.disable_base_fee = true;
+        let mut evm = TronEvmFactory.create_evm(CacheDB::<EmptyDB>::default(), env);
+        let out = evm.transact_raw(create_tx(code.to_vec())).unwrap();
+        assert!(out.result.is_success(), "tron exec must succeed: {:?}", out.result);
         U256::from_be_slice(out.result.output().unwrap())
     }
 
@@ -434,16 +519,40 @@ mod tests {
     fn basefee_returns_tron_energy_fee() {
         // 48 BASEFEE | 5f 52 MSTORE | 60 20 5f f3 RETURN 32 bytes
         let basefee = hex::decode("485f5260205ff3").unwrap();
+
+        // Tron's BASEFEE now reads `block.basefee` (stock revm), so the faithful
+        // `getEnergyFee()`=100 default is supplied by the block env, exactly as
+        // `EvmOpts::local_evm_env` seeds it for a real local Tron run. With that
+        // env, BASEFEE returns 100.
+        let mut tron_env = cancun_env();
+        tron_env.block_env.basefee = TRON_ENERGY_FEE_SUN;
         assert_eq!(
-            tron_returned_word(&basefee),
+            tron_returned_word_in(&basefee, tron_env),
             U256::from(TRON_ENERGY_FEE_SUN),
-            "Tron BASEFEE is getEnergyFee()=100"
+            "Tron BASEFEE reads the seeded getEnergyFee()=100 from the block env"
         );
-        // Ethereum returns the block base fee (0 in this env), not 100.
+
+        // It is genuinely env-driven, not a hardcoded constant: a different block
+        // basefee (what `vm.fee` sets) flows straight through.
+        let mut tron_env_7 = cancun_env();
+        tron_env_7.block_env.basefee = 7;
+        assert_eq!(
+            tron_returned_word_in(&basefee, tron_env_7),
+            U256::from(7u64),
+            "Tron BASEFEE is env-driven (vm.fee overrides it), not a constant"
+        );
+
+        // Mechanically identical to Ethereum now: with the default env's basefee 0
+        // both return 0. The Tron divergence lives in env-setup, not the opcode.
         assert_eq!(
             eth_returned_word(&basefee),
             U256::ZERO,
-            "Ethereum BASEFEE returns the block base fee"
+            "Ethereum BASEFEE returns the block base fee (0 in the default env)"
+        );
+        assert_eq!(
+            tron_returned_word(&basefee),
+            U256::ZERO,
+            "Tron BASEFEE with no seeded basefee also returns 0 (no constant override)"
         );
     }
 
@@ -566,6 +675,74 @@ mod tests {
             tron_returned_word(&blobbasefee),
             U256::ZERO,
             "Tron BLOBBASEFEE is stubbed to 0"
+        );
+    }
+
+    /// Builds a trace node with a given index, address and total (subtree) energy.
+    fn node(idx: usize, address: Address, gas_used: u64, children: Vec<usize>) -> CallTraceNode {
+        CallTraceNode {
+            idx,
+            children,
+            trace: CallTrace { address, gas_used, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    /// TIP-491 penalty is charged on each frame's *own* energy scaled by that
+    /// contract's factor: a parent burning 40k of its own 100k under the USDT
+    /// max factor 34000 (3.4x) contributes 40k * 3.4 = 136k; the unfactored
+    /// 60k child contributes nothing. This is the plan's worked example.
+    #[test]
+    fn dynamic_energy_penalty_scales_own_energy_by_factor() {
+        let parent_addr = Address::repeat_byte(0x11);
+        let child_addr = Address::repeat_byte(0x22);
+
+        // Parent: 100k total, 40k of it its own (60k spent in the child).
+        let parent = node(0, parent_addr, 100_000, vec![1]);
+        // Child: 60k, all its own, no factor.
+        let child = node(1, child_addr, 60_000, vec![]);
+
+        let mut arena = CallTraceArena::default();
+        let nodes = arena.nodes_mut();
+        nodes.clear();
+        nodes.push(parent);
+        nodes.push(child);
+
+        let mut factors = HashMap::default();
+        factors.insert(parent_addr, 34_000u32);
+
+        assert_eq!(dynamic_energy_penalty(&arena, &factors), 136_000, "40k own * 3.4");
+        assert_eq!(subtree_energy_penalty(arena.nodes(), 0, &factors), 136_000, "same via subtree");
+
+        // No factors at all ⇒ no penalty (the non-fork / cold-contract case).
+        assert_eq!(dynamic_energy_penalty(&arena, &HashMap::default()), 0);
+    }
+
+    /// A child with its own factor contributes independently of its parent, and a
+    /// subtree query rooted at that child sees only the child's penalty.
+    #[test]
+    fn dynamic_energy_penalty_sums_per_contract_factors() {
+        let parent_addr = Address::repeat_byte(0x11);
+        let child_addr = Address::repeat_byte(0x22);
+
+        let parent = node(0, parent_addr, 100_000, vec![1]);
+        let child = node(1, child_addr, 60_000, vec![]);
+
+        let mut arena = CallTraceArena::default();
+        let nodes = arena.nodes_mut();
+        nodes.clear();
+        nodes.push(parent);
+        nodes.push(child);
+
+        let mut factors = HashMap::default();
+        factors.insert(parent_addr, 34_000u32); // 40k own * 3.4 = 136_000.
+        factors.insert(child_addr, 10_000u32); //  60k own * 1.0 =  60_000.
+
+        assert_eq!(dynamic_energy_penalty(&arena, &factors), 196_000);
+        assert_eq!(
+            subtree_energy_penalty(arena.nodes(), 1, &factors),
+            60_000,
+            "child subtree only"
         );
     }
 }

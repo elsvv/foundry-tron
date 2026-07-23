@@ -8,8 +8,10 @@
 //! that the shim, the Tron network dispatch, and the Tron energy model all cooperate on a real
 //! mainnet fork.
 
+use foundry_config::SolcReq;
 use foundry_evm_networks::NetworkConfigs;
 use foundry_tron_solc::{binary_path, default_version};
+use semver::Version;
 
 /// True when the pinned native `tron-solc` binary is cached on this machine
 /// (`~/.foundry-tron/solc/tron-solc-<version>`), so an offline compile-and-run Tron test can build
@@ -56,7 +58,7 @@ forgetest_init!(
             config.networks = NetworkConfigs::with_tron();
             // The test template pins `solc = SOLC_VERSION` (currently 0.8.35), which the native
             // tron-solc resolver has no pinned build for. Clear it so the resolver falls back to
-            // its pinned default (0.8.27), matching the sandbox project.
+            // its pinned default (0.8.28), matching the sandbox project.
             config.solc = None;
         });
 
@@ -65,7 +67,7 @@ forgetest_init!(
             r#"
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Own pragma so the harness does not inject `=SOLC_VERSION` (0.8.35), for which no native
-// tron-solc build is pinned; the caret range is satisfied by the resolved tron-solc 0.8.27.
+// tron-solc build is pinned; the caret range is satisfied by the resolved tron-solc 0.8.28.
 pragma solidity ^0.8.0;
 
 import "forge-std/Test.sol";
@@ -240,7 +242,7 @@ forgetest_init!(
             r#"
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Own pragma so the harness does not inject `=SOLC_VERSION`, for which no native tron-solc build is
-// pinned; the caret range is satisfied by the resolved tron-solc 0.8.27.
+// pinned; the caret range is satisfied by the resolved tron-solc 0.8.28.
 pragma solidity ^0.8.0;
 
 import "forge-std/Test.sol";
@@ -296,7 +298,7 @@ forgetest_init!(
             config.networks = NetworkConfigs::with_tron();
             // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
             // back to its pinned default; the Counter's `^0.8.13` pragma is satisfied
-            // by tron-solc 0.8.27.
+            // by tron-solc 0.8.28.
             config.solc = None;
             config.gas_reports = vec!["*".to_string()];
             config.gas_reports_ignore = vec![];
@@ -364,10 +366,10 @@ contract CounterTest is Test {
         // Table: the deployment row is relabeled to "Deployment Energy" and gains a "Deployment
         // Bandwidth" cell (853 bytes for the 555-byte Counter init code), and each function gains a
         // "Bandwidth {Min,Avg,Median,Max}" block. Energy matches the plan-E golden (read `number()`
-        // 414, write `setNumber`/`increment` ~20438). Deployment Energy is 0 because the local Tron
-        // model does not meter create-frame energy (a pre-existing property of `trace.gas_used` for
-        // creates, unrelated to this report); deployment bandwidth is still exact from the init
-        // code.
+        // 414, write `setNumber`/`increment` ~20438). Deployment Energy is 101191: `setUp`'s
+        // `new Counter()` is a depth>1 create, so the create frame's metered TVM energy is now
+        // recorded by the I7 pre-guard write (before, the top-level depth guard dropped it and the
+        // row showed 0); deployment bandwidth is exact from the init code.
         cmd.forge_fuse().args(["test", "--gas-report"]).assert_success().stdout_eq(str![[r#"
 No files changed, compilation skipped
 
@@ -381,7 +383,7 @@ Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
 +=========================================================================================================================================================================+
 | Deployment Energy                | Deployment Size | Deployment Bandwidth |        |       |         |               |               |                  |               |
 |----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
-|                                0 |             555 |                  853 |        |       |         |               |               |                  |               |
+|                           101191 |             555 |                  853 |        |       |         |               |               |                  |               |
 |----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
 |                                  |                 |                      |        |       |         |               |               |                  |               |
 |----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
@@ -404,10 +406,398 @@ Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
         // `skip_serializing_if` so EVM `--gas-report --json` output is unaffected.
         cmd.forge_fuse().args(["test", "--gas-report", "--json"]).assert_success().stdout_eq(
             str![[r#"
-[{"contract":"src/Counter.sol:Counter","deployment":{"gas":0,"size":555,"bandwidth":853},"functions":{"increment()":{"calls":1,"min":20414,"mean":20414,"median":20414,"max":20414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"number()":{"calls":2,"min":414,"mean":414,"median":414,"max":414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"setNumber(uint256)":{"calls":1,"min":20438,"mean":20438,"median":20438,"max":20438,"bandwidth":{"min":314,"mean":314,"median":314,"max":314}}}}]
+[{"contract":"src/Counter.sol:Counter","deployment":{"gas":101191,"size":555,"bandwidth":853},"functions":{"increment()":{"calls":1,"min":20414,"mean":20414,"median":20414,"max":20414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"number()":{"calls":2,"min":414,"mean":414,"median":414,"max":414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"setNumber(uint256)":{"calls":1,"min":20438,"mean":20438,"median":20438,"max":20438,"bandwidth":{"min":314,"mean":314,"median":314,"max":314}}}}]
 
 
 "#]],
+        );
+    }
+);
+
+// Offline regression for the I7 "record deployment energy for nested creates" fix. A `Factory`
+// deploys a `Child` from inside a contract method (`new Child()` at depth>1), which the EVM gas
+// report pins to 0 (issue #9300) but the Tron path must meter: the fix records `contract_info.gas`
+// before the top-level depth guard, so `Child`'s **Deployment Energy** is the real create-frame
+// TVM energy, not 0. Deterministic (non-fuzz, pinned tron-solc 0.8.28), so the value is snapshot-
+// stable; gated on the cached native compiler and skipped cleanly when absent.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_gas_report_nested_create_deployment_energy,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_gas_report_nested_create_deployment_energy: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Clear the harness-pinned solc (0.8.35, no native tron build); the `^0.8.13` pragma is
+            // satisfied by the resolver's pinned default tron-solc 0.8.28.
+            config.solc = None;
+            config.gas_reports = vec!["*".to_string()];
+            config.gas_reports_ignore = vec![];
+        });
+
+        // A factory that deploys `Child` from inside a method: the `new Child()` create runs at
+        // depth>1, the case the I7 fix is about. Own `^0.8.13` pragma so the harness does not
+        // inject `=SOLC_VERSION` (0.8.35), which has no native tron-solc build.
+        prj.add_source(
+            "Factory.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+contract Child {
+    uint256 public value;
+
+    function setValue(uint256 newValue) public {
+        value = newValue;
+    }
+}
+
+contract Factory {
+    Child public last;
+
+    function make() public returns (address) {
+        last = new Child();
+        return address(last);
+    }
+}
+"#,
+        );
+
+        prj.add_test(
+            "Factory.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import {Test} from "forge-std/Test.sol";
+import {Factory, Child} from "../src/Factory.sol";
+
+contract FactoryTest is Test {
+    Factory public factory;
+
+    function setUp() public {
+        factory = new Factory();
+    }
+
+    function test_make() public {
+        address child = factory.make();
+        assertTrue(child != address(0));
+        // Touch the child so the trace decoder resolves its address to `Child`, which is what
+        // makes the runtime-deployed child appear as its own row in the gas report.
+        Child(child).setValue(42);
+        assertEq(Child(child).value(), 42);
+    }
+}
+"#,
+        );
+
+        // Warm the build cache so the `--gas-report` snapshot stays focused on the report.
+        cmd.forge_fuse().args(["build"]).assert_success();
+
+        // The `Child` row carries a non-zero **Deployment Energy** even though its `new Child()`
+        // runs at depth>1 (a true factory create, depth 3) — the exact behavior the fix restores
+        // (the EVM report pins depth>1 creates to 0). JSON keeps `deployment.gas` (= energy).
+        cmd.forge_fuse().args(["test", "--gas-report", "--json"]).assert_success().stdout_eq(
+            str![[r#"
+[{"contract":"src/Factory.sol:Child","deployment":{"gas":68961,"size":394,"bandwidth":690},"functions":{"setValue(uint256)":{"calls":1,"min":20460,"mean":20460,"median":20460,"max":20460,"bandwidth":{"min":314,"mean":314,"median":314,"max":314}},"value()":{"calls":1,"min":392,"mean":392,"median":392,"max":392,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}}}},{"contract":"src/Factory.sol:Factory","deployment":{"gas":196282,"size":1030,"bandwidth":1328},"functions":{"make()":{"calls":1,"min":121750,"mean":121750,"median":121750,"max":121750,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}}}}]
+
+
+"#]],
+        );
+    }
+);
+
+// Live, read-only mainnet fork test of the TIP-491 dynamic-energy penalty in `forge test
+// --gas-report`. Forking Tron mainnet, a `--gas-report` run that calls the hot USDT contract
+// fetches USDT's live per-contract energy factor from the fork node's `/wallet/getcontractinfo`
+// (USDT sits at the governance maximum 34000 = 3.4x) and renders the extra "Penalty Avg" column
+// (and a "Deployment Penalty" cell) that is absent on non-fork runs. USDT `transfer()` writes two
+// balance slots, so its own-energy penalty is strictly positive.
+//
+// The exact energy/penalty integers track the live factor and the fork block, so this asserts the
+// structural pipeline (the penalty column is rendered end-to-end from the node fetch) rather than
+// pinning a full snapshot; the numeric `base_local + penalty ==
+// triggerconstantcontract.energy_used` reconciliation is the plan's live-eyeball step (re-read the
+// factor within two attempts if it drifts between fetches). Gated on `TRON_LIVE=1` (read-only
+// mainnet; the fork execution burns no real TRX). The `fork` token in the name satisfies the
+// forking-test naming rule; the cached native `tron-solc` is also required to compile the
+// interface.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_mainnet_fork_gas_report_dynamic_energy_penalty,
+    |prj, cmd| {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!(
+                "skipped tron_mainnet_fork_gas_report_dynamic_energy_penalty: set TRON_LIVE=1 to run the live mainnet fork gas-report test"
+            );
+            return;
+        }
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_mainnet_fork_gas_report_dynamic_energy_penalty: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to compile the interface"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Resolve to the pinned native tron-solc (the template's SOLC_VERSION has no build).
+            config.solc = None;
+            config.gas_reports = vec!["*".to_string()];
+            config.gas_reports_ignore = vec![];
+            // The default; asserted here to make the penalty-model dependency explicit.
+            config.tron.dynamic_energy = true;
+        });
+
+        prj.add_test(
+            "TronUsdtEnergyFork.t.sol",
+            r#"
+// SPDX-License-Identifier: MIT OR Apache-2.0
+pragma solidity ^0.8.0;
+
+import "forge-std/Test.sol";
+
+interface IUSDT {
+    function transfer(address to, uint256 value) external returns (bool);
+    function balanceOf(address) external view returns (uint256);
+}
+
+contract TronUsdtEnergyForkTest is Test {
+    // Tron mainnet USDT (TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t), 0x41 prefix stripped.
+    IUSDT constant USDT = IUSDT(0xa614f803B6FD780986A42c78Ec9c7f77e6DeD13C);
+    // A large USDT holder on Tron mainnet (TWd4WrZ9wn84f5x1hZhL4DHvk738ns5jwb).
+    address constant RICH = 0xe28B3CfD4E0e909077821478E9FCB86B84be786e;
+
+    // A hot-contract call whose energy accrues USDT's max dynamic-energy factor. The fork
+    // execution only mutates the fork's in-memory state; no transaction is broadcast.
+    function test_tron_mainnet_fork_usdt_transfer_energy() public {
+        assertGt(USDT.balanceOf(RICH), 0);
+        vm.prank(RICH);
+        USDT.transfer(RICH, 1);
+    }
+}
+"#,
+        );
+
+        cmd.args([
+            "test",
+            "--mt",
+            "test_tron_mainnet_fork_usdt_transfer_energy",
+            "--gas-report",
+            "--fork-url",
+            TRON_MAINNET_JSONRPC,
+        ]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tron fork gas-report failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The penalty column renders only when the per-contract energy factor was fetched from the
+        // fork node — its presence proves the fork factor-fetch pipeline end-to-end.
+        assert!(
+            stdout.contains("Penalty Avg"),
+            "expected the TIP-491 penalty column on a Tron fork gas report\nstdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("Deployment Penalty"),
+            "expected the TIP-491 deployment-penalty column on a Tron fork gas report\nstdout: {stdout}"
+        );
+        // USDT `transfer()` writes storage under the max factor, so its function penalty must be
+        // strictly positive: at least one non-zero digit follows a "transfer" row. Assert the row
+        // is present; the exact penalty is reconciled by eye against the node per the plan.
+        assert!(stdout.contains("transfer"), "expected the USDT transfer row\nstdout: {stdout}");
+    }
+);
+
+// Offline: `forge test -vvvvv` on the Tron path renders addresses in decoded call arguments and
+// event logs as base58 (0x41-prefixed base58check), not hex. A `Sink.poke(address(0))` call at
+// full verbosity must show `poke(T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb)` — the base58 form of the zero
+// address (the "black hole" address, a pinned vector in foundry-tron-primitives) — and never the
+// hex `poke(0x...)` form. Known contracts keep their name label (the Sink node is still `Sink::`),
+// so this asserts the argument/log rendering seam. Compiling the contract needs the native
+// `tron-solc`, so this is gated on the cached compiler and skips cleanly when absent (no network,
+// no TRX). Passing tests only render traces at verbosity 5, hence `-vvvvv`.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_traces_render_addresses_as_base58,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_traces_render_addresses_as_base58: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            config.solc = None;
+        });
+
+        prj.add_test(
+            "Base58Trace.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import {Test} from "forge-std/Test.sol";
+
+contract Sink {
+    event Seen(address who);
+    function poke(address who) external {
+        emit Seen(who);
+    }
+}
+
+contract Base58TraceTest is Test {
+    Sink internal sink;
+
+    function setUp() public {
+        sink = new Sink();
+    }
+
+    function test_trace_base58() public {
+        // The zero address encodes to the pinned base58 "black hole" address.
+        sink.poke(address(0));
+    }
+}
+"#,
+        );
+
+        cmd.forge_fuse().args(["build"]).assert_success();
+
+        cmd.forge_fuse().args(["test", "--mt", "test_trace_base58", "-vvvvv"]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tron base58 trace test failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The decoded `poke` argument (and the `Seen` log) render base58, not hex.
+        assert!(
+            stdout.contains("T9yD14Nj9j7xAB4dbGeiX9h8unkKHxuWwb"),
+            "expected the zero address as base58 in the trace\nstdout: {stdout}"
+        );
+        assert!(
+            !stdout.contains("poke(0x"),
+            "the poke argument must not render as hex on tron\nstdout: {stdout}"
+        );
+    }
+);
+
+// Offline: network identity on the local (non-fork) Tron path — chain id, BASEFEE and the
+// honest no-op cheatcode warnings. A `network = "tron"` project with NO `chain_id` must default
+// `block.chainid` to Tron mainnet (728126428) so EIP-712 / permit domains resolve without pinning
+// it; `block.basefee` must default to `getEnergyFee()` (100 sun) and be overridable by `vm.fee`;
+// and `vm.prevrandao` / `vm.txGasPrice` must warn once on stderr that the TVM hardwires their
+// opcodes to 0 (a no-op, not an error). Compiling the contract needs the native `tron-solc`, so
+// this is gated on the cached compiler and skips cleanly when absent (no network, no TRX).
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_local_network_identity,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_local_network_identity: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Deliberately leave `chain_id` unset: the default must resolve to Tron mainnet.
+            // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
+            // back to its pinned default (0.8.28); the test's `^0.8.13` pragma is satisfied.
+            config.solc = None;
+        });
+
+        prj.add_test(
+            "TronIdentity.t.sol",
+            r#"
+// SPDX-License-Identifier: MIT
+// Own `^0.8.13` pragma so the harness does not inject `=SOLC_VERSION` (0.8.35), which has no
+// native tron-solc build; the caret range is satisfied by the resolved tron-solc 0.8.28.
+pragma solidity ^0.8.13;
+
+import "forge-std/Test.sol";
+
+contract TronIdentityTest is Test {
+    // No `chain_id` in foundry.toml -> the local Tron default (mainnet 728126428).
+    function test_chainid_defaults_to_tron_mainnet() public view {
+        assertEq(block.chainid, 728126428);
+    }
+
+    // BASEFEE returns getEnergyFee() (100 sun) by default on Tron.
+    function test_basefee_defaults_to_energy_fee() public view {
+        assertEq(block.basefee, 100);
+    }
+
+    // `vm.fee` now works on Tron: BASEFEE reads block.basefee, no longer a hardcoded constant.
+    function test_vm_fee_overrides_basefee() public {
+        vm.fee(7);
+        assertEq(block.basefee, 7);
+    }
+
+    // `vm.prevrandao` / `vm.txGasPrice` are no-ops on Tron (opcodes hardwired to 0); calling them
+    // must not revert. The CLI harness asserts the one-time stderr warning separately.
+    function test_prevrandao_and_gasprice_are_noop_warnings() public {
+        vm.prevrandao(bytes32(uint256(1)));
+        vm.txGasPrice(123);
+    }
+
+    // The point of the chain-id default: an EIP-712 permit domain bound to `block.chainid`
+    // verifies via ecrecover on the mainnet default (728126428) with NO `chain_id` in
+    // foundry.toml. Also exercises Tron's `0x01` ecrecover override, whose 21-byte (0x41-prefixed)
+    // output must still mask down to the correct 20-byte signer for the solidity builtin.
+    function test_eip712_permit_recovers_on_default_chainid() public {
+        uint256 pk = 0xA11CE;
+        address signer = vm.addr(pk);
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                ),
+                keccak256("TronPermit"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
+        bytes32 structHash =
+            keccak256(abi.encode(keccak256("Permit(address owner,uint256 value)"), signer, uint256(42)));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        assertEq(ecrecover(digest, v, r, s), signer);
+        // The domain was bound to the mainnet default without any manual chain_id.
+        assertEq(block.chainid, 728126428);
+    }
+}
+"#,
+        );
+
+        cmd.args(["test", "--mc", "TronIdentityTest"]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tron identity tests failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The no-op cheatcodes warn once on stderr (honest, not silent, not an error).
+        assert!(
+            stderr.contains("vm.prevrandao has no effect on tron: PREVRANDAO is hardwired to 0"),
+            "expected a one-time PREVRANDAO no-op warning on stderr\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("vm.txGasPrice has no effect on tron: GASPRICE is hardwired to 0"),
+            "expected a one-time GASPRICE no-op warning on stderr\nstderr: {stderr}"
         );
     }
 );
@@ -438,7 +828,7 @@ forgetest_init!(
             // `--verifier-url`; setting it exercises the real host-routing path offline.
             config.chain = Some(3_448_148_188u64.into());
             // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
-            // back to its pinned default (0.8.27); the Counter's `^0.8.13` pragma is satisfied.
+            // back to its pinned default (0.8.28); the Counter's `^0.8.13` pragma is satisfied.
             config.solc = None;
         });
 
@@ -524,9 +914,12 @@ forgetest_init!(
             // Nile chain id routes verification to nileapi.tronscan.org (mirrors the sandbox's
             // `chain_id = 3448148188`).
             config.chain = Some(3_448_148_188u64.into());
-            // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
-            // back to its pinned default (0.8.27); the Counter's `^0.8.13` pragma is satisfied.
-            config.solc = None;
+            // Pin the exact tron-solc whose TronScan compiler string was live-confirmed
+            // (`tron_v0.8.27+commit.19164bed`, Nile contract TDKFWYmx4D4makUGMg6kuVvWCjuXnCTJHQ).
+            // Both deploy and verify must share this version, and the toolchain default has since
+            // moved to 0.8.28, so pin explicitly rather than relying on the default. The harness's
+            // `=SOLC_VERSION` (0.8.35) has no native tron build; the Counter's `^0.8.13` is met.
+            config.solc = Some(SolcReq::Version(Version::new(0, 8, 27)));
         });
 
         // Own the Counter source with its own `^0.8.13` pragma so the harness does not inject

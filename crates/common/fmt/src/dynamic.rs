@@ -1,6 +1,6 @@
 use super::{format_int_exp, format_uint_exp};
 use alloy_dyn_abi::{DynSolType, DynSolValue};
-use alloy_primitives::hex;
+use alloy_primitives::{Address, hex};
 use eyre::Result;
 use serde_json::{Map, Value};
 use std::{
@@ -9,15 +9,22 @@ use std::{
 };
 
 /// [`DynSolValue`] formatter.
-struct DynValueFormatter {
+struct DynValueFormatter<'a> {
     raw: bool,
+    /// Optional address renderer (e.g. Tron base58). When `Some`, every address — including
+    /// those nested inside arrays, tuples and structs — is rendered through it instead of the
+    /// default hex `Display`. `None` keeps the default hex rendering byte-identical.
+    address_formatter: Option<&'a dyn Fn(&Address) -> String>,
 }
 
-impl DynValueFormatter {
+impl DynValueFormatter<'_> {
     /// Recursively formats a [`DynSolValue`].
     fn value(&self, value: &DynSolValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match value {
-            DynSolValue::Address(inner) => write!(f, "{inner}"),
+            DynSolValue::Address(inner) => match self.address_formatter {
+                Some(format_address) => f.write_str(&format_address(inner)),
+                None => write!(f, "{inner}"),
+            },
             DynSolValue::Function(inner) => write!(f, "{inner}"),
             DynSolValue::Bytes(inner) => f.write_str(&hex::encode_prefixed(inner)),
             DynSolValue::FixedBytes(word, size) => {
@@ -102,13 +109,13 @@ struct DynValueDisplay<'a> {
     /// The value to display.
     value: &'a DynSolValue,
     /// The formatter.
-    formatter: DynValueFormatter,
+    formatter: DynValueFormatter<'a>,
 }
 
 impl<'a> DynValueDisplay<'a> {
     /// Creates a new [`Display`](fmt::Display) wrapper for the given value.
     const fn new(value: &'a DynSolValue, raw: bool) -> Self {
-        Self { value, formatter: DynValueFormatter { raw } }
+        Self { value, formatter: DynValueFormatter { raw, address_formatter: None } }
     }
 }
 
@@ -138,6 +145,20 @@ pub fn format_tokens_raw(tokens: &[DynSolValue]) -> impl Iterator<Item = String>
 /// Pretty-prints the given value into a string suitable for user output.
 pub fn format_token(value: &DynSolValue) -> String {
     DynValueDisplay::new(value, false).to_string()
+}
+
+/// Like [`format_token`], but renders every address (including addresses nested inside arrays,
+/// tuples and structs) through `address_formatter` instead of the default hex `Display`. Used on
+/// Tron to print base58 addresses in decoded call arguments, returns and logs.
+pub fn format_token_with_address(
+    value: &DynSolValue,
+    address_formatter: &dyn Fn(&Address) -> String,
+) -> String {
+    DynValueDisplay {
+        value,
+        formatter: DynValueFormatter { raw: false, address_formatter: Some(address_formatter) },
+    }
+    .to_string()
 }
 
 /// Pretty-prints the given value into a string suitable for re-parsing as values later.
@@ -332,6 +353,32 @@ mod tests {
                 "0xFb6916095cA1Df60bb79ce92cE3EA74c37c5d359"
             ))),
             "0xFb6916095cA1Df60bb79ce92cE3EA74c37c5d359"
+        );
+    }
+
+    #[test]
+    fn format_token_with_address_renders_nested_addresses() {
+        // A stand-in address renderer (uppercase-hex tag) that is clearly distinct from the
+        // default `Display`, so the test does not depend on any Tron base58 implementation.
+        let tag = |addr: &Address| format!("T[{}]", hex::encode(&addr.as_slice()[..2]));
+        let a = address!("0x1111111111111111111111111111111111111111");
+        let b = address!("0x2222222222222222222222222222222222222222");
+
+        // Top-level address goes through the custom renderer.
+        assert_eq!(format_token_with_address(&DynSolValue::Address(a), &tag), "T[1111]");
+
+        // Addresses nested inside an array are rendered too, while non-address values are
+        // untouched (the uint keeps its default formatting).
+        let nested = DynSolValue::Tuple(vec![
+            DynSolValue::Array(vec![DynSolValue::Address(a), DynSolValue::Address(b)]),
+            DynSolValue::Uint(U256::from(7u64), 256),
+        ]);
+        assert_eq!(format_token_with_address(&nested, &tag), "([T[1111], T[2222]], 7)");
+
+        // Without the renderer the default hex Display is byte-identical to before.
+        assert_eq!(
+            format_token(&DynSolValue::Address(a)),
+            "0x1111111111111111111111111111111111111111"
         );
     }
 

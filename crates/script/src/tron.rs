@@ -36,7 +36,7 @@ use foundry_tron_primitives::{
 };
 use foundry_tron_provider::{
     TronError, TronProvider, TxInfo, TxOptions, build_create_raw, build_transfer_raw,
-    build_trigger_raw,
+    build_trigger_raw, check_fee_limit,
 };
 use foundry_wallets::WalletSigner;
 use std::{
@@ -125,6 +125,14 @@ impl BundledState<TronEvmNetwork> {
                 continue;
             }
 
+            // Reject a fee_limit the node would refuse (above getMaxFeeLimit) before
+            // broadcasting anything on this chain. Best-effort: fall back to the
+            // snapshot ceiling when the node cannot be reached.
+            let params = provider.get_chain_parameters().await.unwrap_or_default();
+            if let Err(msg) = check_fee_limit(opts.fee_limit, &params) {
+                bail!(msg);
+            }
+
             if !shell::is_json() {
                 sh_println!(
                     "\n## Broadcasting {} transaction(s) to Tron chain {chain}...",
@@ -135,10 +143,19 @@ impl BundledState<TronEvmNetwork> {
             // Maps an EVM-simulation deploy address to the real on-chain Tron address, so calls to
             // a just-deployed contract are retargeted from the simulated address to the real one.
             let mut remap: HashMap<Address, Address> = HashMap::new();
+            // Caches `getcontract` per resolved destination for this chain, so a value-only send to
+            // a contract is routed through `TriggerSmartContract` (see `upgrade_value_only_call`)
+            // with at most one lookup per address across the whole broadcast.
+            let mut contract_cache: HashMap<Address, bool> = HashMap::new();
 
             for index in already..total {
                 let (call, sim_addr, to_for_receipt, from) =
                     classify(&sequence.sequences()[i].transactions[index], &remap, &script_config)?;
+                // A value-only call (empty calldata) whose destination is a contract must use
+                // `TriggerSmartContract`, not `TransferContract`. Resolved here, after `classify`
+                // has applied the deploy remap, so a transfer to a just-deployed contract is
+                // upgraded against its real on-chain address.
+                let call = upgrade_value_only_call(&provider, call, &mut contract_cache).await?;
 
                 let signer = signers.get(&from).ok_or_else(|| {
                     eyre::eyre!("no wallet signer available for tron sender {from:#x}")
@@ -284,6 +301,35 @@ fn classify(
     };
 
     Ok((call, tx.contract_address, to_for_receipt, from))
+}
+
+/// Upgrades a value-only [`TronCall::Transfer`] whose destination is a deployed contract into an
+/// empty-`data` [`TronCall::Trigger`]. A `TriggerSmartContract` with empty `data` invokes the
+/// contract's payable `receive()`/`fallback()`, whereas a bare `TransferContract` only credits its
+/// balance without running code (and java-tron rejects a bare transfer to a contract outright once
+/// `ForbidTransferToContract`/`AllowTvmCompatibleEvm` governance is active). Every other call (a
+/// real trigger, a deploy, or a transfer to an ordinary account) passes through unchanged. `cache`
+/// collapses repeated `getcontract` lookups for the same destination to a single request across the
+/// whole broadcast.
+async fn upgrade_value_only_call(
+    provider: &TronProvider,
+    call: TronCall,
+    cache: &mut HashMap<Address, bool>,
+) -> Result<TronCall> {
+    let TronCall::Transfer { to, value } = call else { return Ok(call) };
+    let is_contract = match cache.get(&to) {
+        Some(&known) => known,
+        None => {
+            let resolved = is_contract_with_retry(provider, to).await?;
+            cache.insert(to, resolved);
+            resolved
+        }
+    };
+    if is_contract {
+        Ok(TronCall::Trigger { to, data: Vec::new(), value })
+    } else {
+        Ok(TronCall::Transfer { to, value })
+    }
 }
 
 /// Extra margin (ms) past a recorded expiration before a pending transaction is treated as
@@ -504,6 +550,21 @@ async fn broadcast_with_retry(
     }
 }
 
+/// Queries whether `to` is a contract, retrying transient HTTP failures with a short backoff.
+async fn is_contract_with_retry(provider: &TronProvider, to: Address) -> Result<bool> {
+    let mut attempt = 0u8;
+    loop {
+        match provider.is_contract(to).await {
+            Ok(v) => return Ok(v),
+            Err(TronError::Http(_)) if attempt < MAX_HTTP_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Cross-checks the locally derived deploy address against the node's `contract_address`.
 fn verify_deploy_address(local: Address, info: &TxInfo) -> Result<()> {
     match info.contract_address {
@@ -554,13 +615,35 @@ const fn tron_receipt(
 }
 
 /// Prints Tron transaction progress (energy and TRX fee, not ETH/gas) to stderr.
+/// The TIP-491 penalty portion, the caller/origin energy split and bandwidth
+/// usage are shown only when non-zero, so a penalty-free transaction prints
+/// exactly as before.
 fn report_progress(sent: &SentTx) -> Result<()> {
-    sh_status!(
-        "tron: {} confirmed ({} TRX fee, {} energy)",
-        hex::encode(sent.txid),
-        format_sun_as_trx(sent.info.fee_sun),
-        sent.info.energy_used
-    )?;
+    let info = &sent.info;
+    if info.energy_penalty_total > 0 {
+        sh_status!(
+            "tron: {} confirmed ({} TRX fee, {} energy incl. {} penalty)",
+            hex::encode(sent.txid),
+            format_sun_as_trx(info.fee_sun),
+            info.energy_used,
+            info.energy_penalty_total,
+        )?;
+    } else {
+        sh_status!(
+            "tron: {} confirmed ({} TRX fee, {} energy)",
+            hex::encode(sent.txid),
+            format_sun_as_trx(info.fee_sun),
+            info.energy_used,
+        )?;
+    }
+    if info.energy_usage_caller > 0 || info.origin_energy_usage > 0 {
+        sh_status!(
+            "tron:   caller/origin energy {} / {}, net {} bytes",
+            info.energy_usage_caller,
+            info.origin_energy_usage,
+            info.net_usage,
+        )?;
+    }
     if let Some(addr) = sent.contract_address {
         sh_status!("tron: deployed to {} ({})", to_base58(addr), to_hex41(addr))?;
     }
@@ -691,6 +774,67 @@ mod tests {
         assert_eq!(to_for_receipt, Some(real));
     }
 
+    /// A local [`TronProvider`] whose endpoint is never contacted: the upgrade tests below either
+    /// pre-seed the cache or exercise the non-transfer early-return, so no request is made.
+    fn offline_provider() -> TronProvider {
+        TronProvider::new("http://127.0.0.1:1").unwrap()
+    }
+
+    #[tokio::test]
+    async fn upgrade_promotes_contract_transfer_to_trigger() {
+        // A value-only transfer whose destination is a contract becomes an empty-data trigger.
+        let to = address!("0x2222222222222222222222222222222222222222");
+        let provider = offline_provider();
+        let mut cache = HashMap::from([(to, true)]);
+        let out = upgrade_value_only_call(
+            &provider,
+            TronCall::Transfer { to, value: 1_000_000 },
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(out, TronCall::Trigger { to: t, data, value: 1_000_000 } if t == to && data.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_leaves_eoa_transfer_as_transfer() {
+        // A value-only transfer to an ordinary account stays a native transfer.
+        let to = address!("0x2222222222222222222222222222222222222222");
+        let provider = offline_provider();
+        let mut cache = HashMap::from([(to, false)]);
+        let out = upgrade_value_only_call(
+            &provider,
+            TronCall::Transfer { to, value: 1_000_000 },
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, TronCall::Transfer { to: t, value: 1_000_000 } if t == to));
+    }
+
+    #[tokio::test]
+    async fn upgrade_leaves_trigger_with_calldata_untouched() {
+        // A real trigger (non-empty calldata) passes through unchanged, touching neither the
+        // cache nor the network.
+        let to = address!("0x2222222222222222222222222222222222222222");
+        let provider = offline_provider();
+        let mut cache = HashMap::new();
+        let data = hex::decode("3fb5c1cb").unwrap();
+        let out = upgrade_value_only_call(
+            &provider,
+            TronCall::Trigger { to, data: data.clone(), value: 5 },
+            &mut cache,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(out, TronCall::Trigger { to: t, data: d, value: 5 } if t == to && d == data)
+        );
+        assert!(cache.is_empty());
+    }
+
     #[test]
     fn value_to_sun_bounds() {
         assert_eq!(value_to_sun(None).unwrap(), 0);
@@ -721,6 +865,7 @@ mod tests {
             energy_used: 31_895,
             success: true,
             contract_address: Some(contract),
+            ..Default::default()
         };
         let r = tron_receipt(txid, from, &info, Some(contract), None, 0);
         assert_eq!(r.gas_used, 31_895);
@@ -754,6 +899,7 @@ mod tests {
             energy_used: 0,
             success: true,
             contract_address: Some(local),
+            ..Default::default()
         };
         assert!(verify_deploy_address(local, &ok).is_ok());
         let bad = TxInfo { contract_address: Some(other), ..ok };

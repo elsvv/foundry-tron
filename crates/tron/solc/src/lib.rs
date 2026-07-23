@@ -15,6 +15,14 @@
 //! - the cache lives at `~/.foundry-tron/solc/tron-solc-{version}` (Stage-1 convention, codified
 //!   here).
 //!
+//! Versions released after this toolchain shipped are not in the [`pins`] table.
+//! For those, an online resolve consults the same live `solc-bin` `list.json`
+//! the pins were snapshotted from, downloads the binary it points to, and
+//! verifies it against that list's own sha256. This lets a new `tron-solc`
+//! release be selected from config (`solc = "X.Y.Z"`) without shipping new
+//! toolchain code. Pins stay authoritative when present; the live list is only
+//! a fallback for unpinned versions, and never runs when `offline` is set.
+//!
 //! The public entrypoint is [`resolve_tron_solc`]. It never touches the network
 //! when `offline` is set or when a verified binary is already cached, and it
 //! always verifies sha256 before accepting a binary — a mismatch is a hard
@@ -23,8 +31,10 @@
 mod pins;
 
 use semver::Version;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -41,13 +51,25 @@ pub enum TronSolcError {
          Linux ARM and other non-amd64 targets are unsupported)"
     )]
     UnsupportedPlatform(&'static str),
-    /// No pinned checksum exists for this version/platform combination.
-    #[error("no pinned tron-solc checksum for version {version} on platform '{platform}'")]
+    /// No pinned checksum exists for this version/platform combination, and (when
+    /// `searched_solc_bin` is set) the live solc-bin list did not list it either.
+    #[error(
+        "no pinned tron-solc checksum for version {version} on platform '{platform}'{extra}",
+        extra = if *.searched_solc_bin {
+            ", and it is not in the tronprotocol solc-bin list either"
+        } else {
+            ""
+        }
+    )]
     NoPin {
         /// The requested version.
         version: Version,
         /// The solc-bin platform key that was looked up.
         platform: &'static str,
+        /// Whether the live solc-bin `list.json` was also consulted (online path)
+        /// and lacked this version. `false` means only the compile-time pin table
+        /// was checked (offline path).
+        searched_solc_bin: bool,
     },
     /// Download is disabled (offline) and no cached binary is present.
     #[error("tron-solc download disabled (offline) and no cached binary at {0}")]
@@ -154,7 +176,7 @@ impl Platform {
 
 /// The default `tron-solc` version (latest pinned release).
 pub const fn default_version() -> Version {
-    Version::new(0, 8, 27)
+    Version::new(0, 8, 28)
 }
 
 /// Returns the cache directory for `tron-solc` binaries: `~/.foundry-tron/solc`.
@@ -181,17 +203,36 @@ pub fn pinned_sha256(version: &Version, platform: Platform) -> Option<&'static s
         .map(|pin| pin.sha256)
 }
 
-/// Returns the pinned solc long version (`<version>+commit.<8hex>`) for a
-/// semantic version, or `None` if the version is not pinned.
+/// Returns the solc long version (`<version>+commit.<8hex>`) for a semantic
+/// version, or `None` if it is neither pinned nor cached.
 ///
-/// This is the platform-independent `builds[].longVersion` from the same
-/// `solc-bin` list.json the checksum table is sourced from.
-pub fn tron_solc_long_version(version: &Version) -> Option<&'static str> {
-    let version = version.to_string();
-    pins::LONG_VERSIONS
-        .iter()
-        .find(|entry| entry.version == version)
-        .map(|entry| entry.long_version)
+/// The value is the platform-independent `builds[].longVersion` from the same
+/// `solc-bin` list.json the checksum table is sourced from. Pinned versions
+/// resolve from the embedded table; a version resolved at runtime from the live
+/// list (see [`resolve_tron_solc`]) writes its long version to a sidecar next to
+/// the cached binary, so this lookup keeps working for versions newer than the
+/// pins — which TronScan verification needs to build its `compiler` field.
+pub fn tron_solc_long_version(version: &Version) -> Option<Cow<'static, str>> {
+    let version_str = version.to_string();
+    if let Some(entry) = pins::LONG_VERSIONS.iter().find(|entry| entry.version == version_str) {
+        return Some(Cow::Borrowed(entry.long_version));
+    }
+    read_cached_long_version(version).map(Cow::Owned)
+}
+
+/// Reads the long-version sidecar written by [`resolve_via_list`] for a version
+/// resolved from the live solc-bin list. Best-effort: any error yields `None`.
+fn read_cached_long_version(version: &Version) -> Option<String> {
+    let path = tron_solc_dir().ok()?.join(long_version_sidecar_name(version));
+    let contents = fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The sidecar filename holding the long version for a cached binary:
+/// `tron-solc-{version}.longversion`.
+fn long_version_sidecar_name(version: &Version) -> String {
+    format!("tron-solc-{version}.longversion")
 }
 
 /// Returns the TronScan `compiler` field for a pinned tron-solc version:
@@ -233,8 +274,21 @@ fn resolve_in(
     let Some(platform_key) = platform.list_key() else {
         return Err(TronSolcError::UnsupportedPlatform(platform.name()));
     };
-    let expected = pinned_sha256(version, platform)
-        .ok_or_else(|| TronSolcError::NoPin { version: version.clone(), platform: platform_key })?;
+
+    let Some(expected) = pinned_sha256(version, platform) else {
+        // Not compile-time pinned. Without a checksum, offline resolution is
+        // impossible, so fail exactly as before. Online, fall back to the live
+        // solc-bin list — the same source the pins were snapshotted from — so a
+        // `tron-solc` release newer than this toolchain resolves from config.
+        if offline {
+            return Err(TronSolcError::NoPin {
+                version: version.clone(),
+                platform: platform_key,
+                searched_solc_bin: false,
+            });
+        }
+        return resolve_via_list(dir, version, platform);
+    };
 
     let path = dir.join(format!("tron-solc-{version}"));
     if path.is_file() {
@@ -261,6 +315,111 @@ fn resolve_in(
     }
     atomic_write_executable(&path, &bytes)?;
     Ok(path)
+}
+
+/// The solc-bin base URL. Both `list.json` and the binaries it references live
+/// under `{SOLC_BIN_BASE}/{list_key}/`.
+const SOLC_BIN_BASE: &str = "https://tronprotocol.github.io/solc-bin";
+
+/// A solc-bin `list.json` document (only the fields this crate consumes).
+#[derive(Debug, Deserialize)]
+struct SolcBinList {
+    /// The per-version build entries.
+    builds: Vec<SolcBinBuild>,
+}
+
+/// A single `builds[]` entry from a solc-bin `list.json`.
+#[derive(Debug, Deserialize)]
+struct SolcBinBuild {
+    /// Binary filename relative to the platform directory, e.g.
+    /// `solc-windows-amd64-v0.8.28+commit.9c4253d2.exe`.
+    path: String,
+    /// Semantic version, e.g. `0.8.28`.
+    version: String,
+    /// Full long version, e.g. `0.8.28+commit.9c4253d2`.
+    #[serde(rename = "longVersion")]
+    long_version: String,
+    /// sha256 of the binary, `0x`-prefixed in the list.
+    sha256: String,
+}
+
+/// Parses a solc-bin `list.json` body and returns the `builds[]` entry whose
+/// `version` matches `version` exactly, or `None` when the list omits it.
+fn find_list_build(
+    list_json: &[u8],
+    version: &Version,
+) -> Result<Option<SolcBinBuild>, TronSolcError> {
+    let list: SolcBinList = serde_json::from_slice(list_json)
+        .map_err(|err| TronSolcError::Http(format!("invalid solc-bin list.json: {err}")))?;
+    let want = version.to_string();
+    Ok(list.builds.into_iter().find(|build| build.version == want))
+}
+
+/// Normalizes a solc-bin sha256 (`0x`-prefixed, possibly mixed case) to the
+/// lowercase hex, no-`0x` form used everywhere else in this crate.
+fn normalize_sha256(raw: &str) -> String {
+    raw.strip_prefix("0x").unwrap_or(raw).to_ascii_lowercase()
+}
+
+/// Resolves a `tron-solc` binary for a version that is not compile-time pinned by
+/// consulting the live solc-bin `list.json` for `platform`.
+///
+/// This is the same authoritative source the [`pins`] table was snapshotted
+/// from, so it lets a `tron-solc` release published after this toolchain shipped
+/// be resolved from config. The binary is still sha256-verified against the
+/// list's own checksum before it is accepted — a mismatch is a hard error, never
+/// a silent fallback. On success the binary's long version is recorded in a
+/// sidecar next to the cache entry so [`tron_solc_long_version`] (hence TronScan
+/// verification) keeps working for the unpinned version.
+fn resolve_via_list(
+    dir: &Path,
+    version: &Version,
+    platform: Platform,
+) -> Result<PathBuf, TronSolcError> {
+    let Some(list_key) = platform.list_key() else {
+        return Err(TronSolcError::UnsupportedPlatform(platform.name()));
+    };
+
+    let list_url = format!("{SOLC_BIN_BASE}/{list_key}/list.json");
+    let list_json = download_bytes(&list_url, 3)?;
+    let Some(build) = find_list_build(&list_json, version)? else {
+        return Err(TronSolcError::NoPin {
+            version: version.clone(),
+            platform: list_key,
+            searched_solc_bin: true,
+        });
+    };
+    let expected = normalize_sha256(&build.sha256);
+
+    let path = dir.join(format!("tron-solc-{version}"));
+    if path.is_file() {
+        let actual = sha256_hex(&fs::read(&path)?);
+        if actual != expected {
+            return Err(TronSolcError::CorruptedCache { path, expected, actual });
+        }
+        write_cached_long_version(dir, version, &build.long_version);
+        return Ok(path);
+    }
+
+    let bin_url = format!("{SOLC_BIN_BASE}/{list_key}/{}", build.path);
+    let bytes = download_bytes(&bin_url, 3)?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        return Err(TronSolcError::ChecksumMismatch { version: version.clone(), expected, actual });
+    }
+    atomic_write_executable(&path, &bytes)?;
+    write_cached_long_version(dir, version, &build.long_version);
+    Ok(path)
+}
+
+/// Writes the long-version sidecar (`tron-solc-{version}.longversion`) next to a
+/// cached binary. Best-effort: filesystem errors are swallowed so a failed
+/// sidecar write never fails an otherwise-successful resolve.
+fn write_cached_long_version(dir: &Path, version: &Version, long_version: &str) {
+    if let Err(_err) = fs::create_dir_all(dir) {
+        return;
+    }
+    let _ = fs::write(dir.join(long_version_sidecar_name(version)), long_version);
 }
 
 /// Computes the lowercase hex sha256 of `bytes`.
@@ -362,9 +521,17 @@ impl BlockingRuntime {
 mod tests {
     use super::*;
 
+    /// A trimmed but byte-real solc-bin `windows-amd64/list.json` (builds
+    /// 0.8.26–0.8.28), captured 2026-07-23, for offline list-parsing tests.
+    const WINDOWS_LIST_FIXTURE: &str = include_str!("../testdata/list-windows-amd64.json");
+
     #[test]
-    fn default_version_is_0_8_27() {
-        assert_eq!(default_version(), Version::new(0, 8, 27));
+    fn default_version_is_0_8_28() {
+        assert_eq!(default_version(), Version::new(0, 8, 28));
+        // The default must always be a pinned version so it resolves offline.
+        assert!(pinned_sha256(&default_version(), Platform::MacOs).is_some());
+        assert!(pinned_sha256(&default_version(), Platform::LinuxAmd64).is_some());
+        assert!(pinned_sha256(&default_version(), Platform::WindowsAmd64).is_some());
     }
 
     #[test]
@@ -433,6 +600,20 @@ mod tests {
             pinned_sha256(&v24, Platform::WindowsAmd64),
             Some("35957118ebcb217903138e65fa1ded0a8dceffe6994d2ba7554c92cee81dad0a")
         );
+        // 0.8.28 pins (fetched from list.json 2026-07-23), all three platforms.
+        let v28 = Version::new(0, 8, 28);
+        assert_eq!(
+            pinned_sha256(&v28, Platform::MacOs),
+            Some("e492e14fd3da07e65830c1189758ac34f8a3f06c3f59df42f5c5f6a744e0dbd2")
+        );
+        assert_eq!(
+            pinned_sha256(&v28, Platform::LinuxAmd64),
+            Some("0eba121b08e9fbc1019e71bb6d36467a7f653929af9f51a793a17688d859f856")
+        );
+        assert_eq!(
+            pinned_sha256(&v28, Platform::WindowsAmd64),
+            Some("000b24310f0b849d886b280908fde4c2dd63658bca3ffb4909ac7d9c6ab647e9")
+        );
         // Unknown version and unsupported platform have no pin.
         assert_eq!(pinned_sha256(&Version::new(0, 8, 99), Platform::MacOs), None);
         assert_eq!(pinned_sha256(&v27, Platform::LinuxAarch64), None);
@@ -464,12 +645,23 @@ mod tests {
             tronscan_compiler_string(&Version::new(0, 8, 24)).as_deref(),
             Some("tron_v0.8.24+commit.7d902c66")
         );
-        assert_eq!(tron_solc_long_version(&Version::new(0, 8, 23)), Some("0.8.23+commit.8ed33446"));
+        assert_eq!(
+            tron_solc_long_version(&Version::new(0, 8, 23)).as_deref(),
+            Some("0.8.23+commit.8ed33446")
+        );
         // The long version alone (no tron_v prefix) is also exposed.
-        assert_eq!(tron_solc_long_version(&Version::new(0, 8, 27)), Some("0.8.27+commit.19164bed"));
-        // Unpinned versions have no compiler string.
-        assert_eq!(tronscan_compiler_string(&Version::new(0, 8, 99)), None);
-        assert_eq!(tron_solc_long_version(&Version::new(0, 4, 25)), None);
+        assert_eq!(
+            tron_solc_long_version(&Version::new(0, 8, 27)).as_deref(),
+            Some("0.8.27+commit.19164bed")
+        );
+        // 0.8.28 is the newest pinned release.
+        assert_eq!(
+            tronscan_compiler_string(&Version::new(0, 8, 28)).as_deref(),
+            Some("tron_v0.8.28+commit.9c4253d2")
+        );
+        // Unpinned versions have no compiler string (absent any list-resolve sidecar).
+        assert_eq!(tronscan_compiler_string(&Version::new(0, 4, 25)), None);
+        assert_eq!(tron_solc_long_version(&Version::new(0, 4, 25)).as_deref(), None);
     }
 
     #[test]
@@ -529,7 +721,113 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let version = Version::new(0, 8, 99);
         let err = resolve_in(dir.path(), &version, Platform::MacOs, true).unwrap_err();
-        assert!(matches!(err, TronSolcError::NoPin { .. }), "unexpected error: {err:?}");
+        // Offline: only the compile-time pin table was checked, never the network.
+        match err {
+            TronSolcError::NoPin { searched_solc_bin, .. } => assert!(
+                !searched_solc_bin,
+                "offline resolve must not claim the solc-bin list was consulted"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_list_build_selects_exact_version() {
+        let build = find_list_build(WINDOWS_LIST_FIXTURE.as_bytes(), &Version::new(0, 8, 28))
+            .unwrap()
+            .expect("0.8.28 present in fixture");
+        assert_eq!(build.version, "0.8.28");
+        assert_eq!(build.long_version, "0.8.28+commit.9c4253d2");
+        assert_eq!(build.path, "solc-windows-amd64-v0.8.28+commit.9c4253d2.exe");
+        assert_eq!(
+            build.sha256,
+            "0x000b24310f0b849d886b280908fde4c2dd63658bca3ffb4909ac7d9c6ab647e9"
+        );
+        // A version absent from the list resolves to None, not an error.
+        assert!(
+            find_list_build(WINDOWS_LIST_FIXTURE.as_bytes(), &Version::new(0, 9, 99))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn find_list_build_rejects_malformed_json() {
+        let err = find_list_build(b"{not json", &Version::new(0, 8, 28)).unwrap_err();
+        assert!(matches!(err, TronSolcError::Http(_)), "unexpected error: {err:?}");
+    }
+
+    #[test]
+    fn normalize_sha256_strips_prefix_and_lowercases() {
+        assert_eq!(normalize_sha256("0x000B24310F"), "000b24310f");
+        assert_eq!(normalize_sha256("ABCDEF"), "abcdef");
+        assert_eq!(normalize_sha256("already0xfree"), "already0xfree");
+    }
+
+    #[test]
+    fn list_resolve_urls_follow_solc_bin_layout() {
+        let build = find_list_build(WINDOWS_LIST_FIXTURE.as_bytes(), &Version::new(0, 8, 28))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            format!("{SOLC_BIN_BASE}/windows-amd64/list.json"),
+            "https://tronprotocol.github.io/solc-bin/windows-amd64/list.json"
+        );
+        assert_eq!(
+            format!("{SOLC_BIN_BASE}/windows-amd64/{}", build.path),
+            "https://tronprotocol.github.io/solc-bin/windows-amd64/\
+             solc-windows-amd64-v0.8.28+commit.9c4253d2.exe"
+        );
+    }
+
+    /// The list.json checksum is the exact source the pins were snapshotted from,
+    /// so for every version present in both, the fixture's sha256 must equal the
+    /// embedded pin. Guards against the pin table and the live list drifting.
+    #[test]
+    fn fixture_sha256_matches_embedded_pins() {
+        for version in [Version::new(0, 8, 26), Version::new(0, 8, 27), Version::new(0, 8, 28)] {
+            let build =
+                find_list_build(WINDOWS_LIST_FIXTURE.as_bytes(), &version).unwrap().unwrap();
+            assert_eq!(
+                normalize_sha256(&build.sha256),
+                pinned_sha256(&version, Platform::WindowsAmd64).unwrap(),
+                "list.json sha256 must equal the embedded pin for {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn nopin_message_mentions_solc_bin_only_when_searched() {
+        let searched = TronSolcError::NoPin {
+            version: Version::new(0, 8, 99),
+            platform: "macosx-amd64",
+            searched_solc_bin: true,
+        };
+        assert!(
+            searched.to_string().contains("not in the tronprotocol solc-bin list either"),
+            "message: {searched}"
+        );
+        let offline = TronSolcError::NoPin {
+            version: Version::new(0, 8, 99),
+            platform: "macosx-amd64",
+            searched_solc_bin: false,
+        };
+        assert!(
+            !offline.to_string().contains("solc-bin list either"),
+            "offline message must not claim the list was consulted: {offline}"
+        );
+    }
+
+    /// An unpinned version resolved from the live list writes a long-version
+    /// sidecar; [`tron_solc_long_version`] then finds it via the real cache dir.
+    /// This drives the sidecar read/write pair without any network.
+    #[test]
+    fn long_version_sidecar_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let version = Version::new(0, 8, 44);
+        write_cached_long_version(dir.path(), &version, "0.8.44+commit.deadbeef");
+        let contents = fs::read_to_string(dir.path().join("tron-solc-0.8.44.longversion")).unwrap();
+        assert_eq!(contents.trim(), "0.8.44+commit.deadbeef");
     }
 
     /// Offline cache hit against the real Stage-1 binary on this machine. Skips
@@ -602,6 +900,41 @@ mod tests {
             actual,
             pinned_sha256(&version, platform).unwrap(),
             "downloaded windows tron-solc 0.8.27 sha256 must match the embedded pin"
+        );
+    }
+
+    /// Real network resolve through the live solc-bin `list.json`, gated on
+    /// `TRON_SOLC_DOWNLOAD=1`. Calls [`resolve_via_list`] directly to force the
+    /// unpinned branch — 0.8.28 is pinned, so `resolve_in` would otherwise take
+    /// the pinned GitHub-release path. Downloads the ~10 MB Windows build hosted
+    /// under solc-bin, cross-checks its sha256 against the embedded pin (proving
+    /// the solc-bin-hosted binary is byte-identical to the release), and asserts
+    /// the long-version sidecar was written next to the cache entry.
+    #[test]
+    fn tron_solc_resolve_via_list_downloads_verifies_and_records_long_version() {
+        if std::env::var("TRON_SOLC_DOWNLOAD").is_err() {
+            eprintln!(
+                "skipping list-resolve download test: set TRON_SOLC_DOWNLOAD=1 to run the \
+                 real solc-bin list.json resolve + checksum test"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let version = Version::new(0, 8, 28);
+        let platform = Platform::WindowsAmd64;
+        let path = resolve_via_list(dir.path(), &version, platform).unwrap();
+        assert!(path.is_file(), "resolved binary must exist at {}", path.display());
+        let actual = sha256_hex(&fs::read(&path).unwrap());
+        assert_eq!(
+            actual,
+            pinned_sha256(&version, platform).unwrap(),
+            "solc-bin-hosted 0.8.28 windows binary sha256 must equal the embedded pin"
+        );
+        let sidecar = dir.path().join("tron-solc-0.8.28.longversion");
+        assert_eq!(
+            fs::read_to_string(&sidecar).unwrap().trim(),
+            "0.8.28+commit.9c4253d2",
+            "resolve_via_list must record the long version in a sidecar"
         );
     }
 }

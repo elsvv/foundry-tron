@@ -173,6 +173,11 @@ impl<FEN: FoundryEvmNetwork> ChiselDispatcher<FEN> {
             .with_tempo_hardfork(
                 is_tempo.then(|| session_config.foundry_config.evm_spec_id::<TempoHardfork>()),
             )
+            // On Tron, render unlabeled contracts and decoded address values as base58.
+            .with_tron_address_formatter(session_config.evm_opts.networks.is_tron().then_some(
+                foundry_tron_primitives::address::to_base58
+                    as fn(alloy_primitives::Address) -> String,
+            ))
             .build();
 
         let mut identifier =

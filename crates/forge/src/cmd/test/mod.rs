@@ -2757,6 +2757,9 @@ impl TestArgs {
         // printed once by the caller after all passes complete.
         let is_multi_pass = !runner.tcfg.multi_network.all_override_networks.is_empty();
         let is_tempo_network = runner.tcfg.evm_opts.networks.is_tempo();
+        // Capture the Tron fork URL (for the gas report's TIP-491 dynamic-energy penalty model)
+        // before `runner` is moved into the spawn task below.
+        let tron_gas_report_fork_url = runner.tcfg.evm_opts.fork_url.clone();
 
         // Run tests in a streaming fashion.
         let (tx, rx) = channel::<(String, SuiteResult)>();
@@ -2786,7 +2789,12 @@ impl TestArgs {
             .with_tempo_hardfork(
                 (is_tempo_network || remote_chain.is_some_and(|chain| chain.is_tempo()))
                     .then(|| config.evm_spec_id::<TempoHardfork>()),
-            );
+            )
+            // On Tron, render unlabeled contracts and decoded address values as base58.
+            .with_tron_address_formatter(config.networks.is_tron().then_some(
+                foundry_tron_primitives::address::to_base58
+                    as fn(alloy_primitives::Address) -> String,
+            ));
         // Signatures are of no value for gas reports.
         if !self.gas_report {
             builder =
@@ -2809,7 +2817,20 @@ impl TestArgs {
             // On a Tron run, relabel the report to energy and add the bandwidth (bytes) column.
             // Gated on the run-level network: a per-test network override combined with
             // `--gas-report` is unsupported (the report is built once for the whole run).
-            if config.networks.is_tron() { report.with_tron(&config.tron) } else { report }
+            if config.networks.is_tron() {
+                let mut report = report.with_tron(&config.tron);
+                // On a Tron fork, point the TIP-491 dynamic-energy penalty model at the fork
+                // node's `/wallet` API (derived from the `/jsonrpc` fork URL) so the report can
+                // fetch each contract's live energy factor.
+                if let Some(fork_url) = &tron_gas_report_fork_url {
+                    let api_key =
+                        std::env::var("TRON_PRO_API_KEY").ok().filter(|key| !key.is_empty());
+                    report = report.with_tron_fork(fork_url, api_key);
+                }
+                report
+            } else {
+                report
+            }
         });
 
         let mut gas_snapshots = BTreeMap::<String, BTreeMap<String, String>>::new();
@@ -2983,6 +3004,11 @@ impl TestArgs {
                 }
 
                 if let Some(gas_report) = &mut gas_report {
+                    // Tron fork only: fetch the TIP-491 energy factor for every contract in these
+                    // arenas before analyzing them (no-op off a fork; cached across suites).
+                    gas_report
+                        .collect_tron_factors(result.traces.iter().map(|(_, a)| &a.arena))
+                        .await;
                     gas_report.analyze(result.traces.iter().map(|(_, a)| &a.arena), &decoder).await;
 
                     for trace in &result.gas_report_traces {
@@ -2998,6 +3024,7 @@ impl TestArgs {
 
                         for arena in trace {
                             decoder.identify(arena, &mut identifier);
+                            gas_report.collect_tron_factors(std::iter::once(arena)).await;
                             gas_report.analyze([arena], &decoder).await;
                         }
                     }
