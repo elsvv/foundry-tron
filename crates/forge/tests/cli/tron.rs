@@ -414,6 +414,116 @@ Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
     }
 );
 
+// Offline: network identity on the local (non-fork) Tron path — chain id, BASEFEE and the
+// honest no-op cheatcode warnings. A `network = "tron"` project with NO `chain_id` must default
+// `block.chainid` to Tron mainnet (728126428) so EIP-712 / permit domains resolve without pinning
+// it; `block.basefee` must default to `getEnergyFee()` (100 sun) and be overridable by `vm.fee`;
+// and `vm.prevrandao` / `vm.txGasPrice` must warn once on stderr that the TVM hardwires their
+// opcodes to 0 (a no-op, not an error). Compiling the contract needs the native `tron-solc`, so
+// this is gated on the cached compiler and skips cleanly when absent (no network, no TRX).
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_local_network_identity,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_local_network_identity: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Deliberately leave `chain_id` unset: the default must resolve to Tron mainnet.
+            // Clear the harness-pinned solc (0.8.35, no native tron build) so the resolver falls
+            // back to its pinned default (0.8.28); the test's `^0.8.13` pragma is satisfied.
+            config.solc = None;
+        });
+
+        prj.add_test(
+            "TronIdentity.t.sol",
+            r#"
+// SPDX-License-Identifier: MIT
+// Own `^0.8.13` pragma so the harness does not inject `=SOLC_VERSION` (0.8.35), which has no
+// native tron-solc build; the caret range is satisfied by the resolved tron-solc 0.8.28.
+pragma solidity ^0.8.13;
+
+import "forge-std/Test.sol";
+
+contract TronIdentityTest is Test {
+    // No `chain_id` in foundry.toml -> the local Tron default (mainnet 728126428).
+    function test_chainid_defaults_to_tron_mainnet() public view {
+        assertEq(block.chainid, 728126428);
+    }
+
+    // BASEFEE returns getEnergyFee() (100 sun) by default on Tron.
+    function test_basefee_defaults_to_energy_fee() public view {
+        assertEq(block.basefee, 100);
+    }
+
+    // `vm.fee` now works on Tron: BASEFEE reads block.basefee, no longer a hardcoded constant.
+    function test_vm_fee_overrides_basefee() public {
+        vm.fee(7);
+        assertEq(block.basefee, 7);
+    }
+
+    // `vm.prevrandao` / `vm.txGasPrice` are no-ops on Tron (opcodes hardwired to 0); calling them
+    // must not revert. The CLI harness asserts the one-time stderr warning separately.
+    function test_prevrandao_and_gasprice_are_noop_warnings() public {
+        vm.prevrandao(bytes32(uint256(1)));
+        vm.txGasPrice(123);
+    }
+
+    // The point of the chain-id default: an EIP-712 permit domain bound to `block.chainid`
+    // verifies via ecrecover on the mainnet default (728126428) with NO `chain_id` in
+    // foundry.toml. Also exercises Tron's `0x01` ecrecover override, whose 21-byte (0x41-prefixed)
+    // output must still mask down to the correct 20-byte signer for the solidity builtin.
+    function test_eip712_permit_recovers_on_default_chainid() public {
+        uint256 pk = 0xA11CE;
+        address signer = vm.addr(pk);
+        bytes32 domainSeparator = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+                ),
+                keccak256("TronPermit"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
+        bytes32 structHash =
+            keccak256(abi.encode(keccak256("Permit(address owner,uint256 value)"), signer, uint256(42)));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        assertEq(ecrecover(digest, v, r, s), signer);
+        // The domain was bound to the mainnet default without any manual chain_id.
+        assertEq(block.chainid, 728126428);
+    }
+}
+"#,
+        );
+
+        cmd.args(["test", "--mc", "TronIdentityTest"]);
+        let output = cmd.execute();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "tron identity tests failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        // The no-op cheatcodes warn once on stderr (honest, not silent, not an error).
+        assert!(
+            stderr.contains("vm.prevrandao has no effect on tron: PREVRANDAO is hardwired to 0"),
+            "expected a one-time PREVRANDAO no-op warning on stderr\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("vm.txGasPrice has no effect on tron: GASPRICE is hardwired to 0"),
+            "expected a one-time GASPRICE no-op warning on stderr\nstderr: {stderr}"
+        );
+    }
+);
+
 // Offline: `forge create --verify` on Tron no longer bails at argument validation. Before plan H
 // (task H4) the Tron path rejected `--verify` up front ("--verify is not supported on tron yet").
 // It now assembles a `VerifyArgs` and routes the deployed contract to the TronScan provider, with a

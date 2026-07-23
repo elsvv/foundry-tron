@@ -634,6 +634,9 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
 
     /// Deprecated cheatcodes mapped to the reason. Used to report warnings on test results.
     pub deprecated: HashMap<&'static str, Option<&'static str>>,
+    /// Names of Tron no-op cheatcodes already warned about this run, so
+    /// [`Cheatcodes::warn_tron_noop`] emits at most once per cheatcode per run.
+    pub tron_noop_warned: HashSet<&'static str>,
     /// Unlocked wallets used in scripts and testing of scripts.
     pub wallets: Option<Wallets>,
     /// Parsed secp256k1 private-key signers for repeated `vm.addr` / `vm.sign` calls.
@@ -689,6 +692,18 @@ impl Default for Cheatcodes {
 }
 
 impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
+    /// On the Tron network, emits a one-time stderr warning that `cheat` has no
+    /// effect because its corresponding TVM block/tx opcode is hardwired to a
+    /// constant (`OperationActions.java`). This is a no-op on every other network
+    /// (`FEN::IS_TRON` is a compile-time `false`) and on repeat calls within a run,
+    /// so general-library tests never see it and it is never an error.
+    pub(crate) fn warn_tron_noop(&mut self, cheat: &'static str, opcode: &'static str) {
+        if FEN::IS_TRON && self.tron_noop_warned.insert(cheat) {
+            let _ =
+                sh_warn!("{cheat} has no effect on tron: {opcode} is hardwired to 0 by the TVM");
+        }
+    }
+
     /// Creates a new `Cheatcodes` with the given settings.
     pub fn new(config: Arc<CheatsConfig>) -> Self {
         Self {
@@ -731,6 +746,7 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             ignored_traces: Default::default(),
             arbitrary_storage: Default::default(),
             deprecated: Default::default(),
+            tron_noop_warned: Default::default(),
             wallets: Default::default(),
             private_key_signers: Default::default(),
             signatures_identifier: Default::default(),

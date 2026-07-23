@@ -347,6 +347,21 @@ result could diverge:
   init-code metering and the EIP-170 code-size cap are removed. Golden energy
   parity is confirmed exact against Nile (read `number()` = 414, write
   `setNumber(7)` = 20438 energy).
+- **Chain id.** A local (non-fork) `network = "tron"` run defaults `block.chainid`
+  to Tron mainnet (`728126428`), so EIP-712 / permit domains resolve without
+  pinning it. Set `chain_id = 3448148188` in `foundry.toml` to target Nile; a fork
+  takes the node's id.
+- **BASEFEE / `vm.fee`.** `block.basefee` returns `getEnergyFee()` (100 sun) by
+  default — Tron's BASEFEE opcode is the energy price, not the Ethereum base fee.
+  `vm.fee(x)` overrides it like on any other network. On a fork the local energy
+  price (100 sun) is used, not the `/jsonrpc` block's Ethereum `baseFee`.
+- **COINBASE.** Locally `block.coinbase` defaults to `0x0` and is settable with
+  `vm.coinbase` (env-driven, works). On live Tron it is the block's SR address in
+  `0x41`-prefixed form; foundry does not override it.
+- **No-op cheatcodes.** `vm.prevrandao` / `vm.difficulty` and `vm.txGasPrice` have
+  no observable effect on Tron because the TVM hardwires DIFFICULTY/PREVRANDAO and
+  GASPRICE to `0`. Calling them is not an error; foundry prints a one-time stderr
+  warning per run so the no-op is visible rather than silent.
 - **CREATE2** uses the Tron formula:
   `address = keccak256(0x41 ‖ sender20 ‖ salt ‖ keccak256(initcode))[12..]`, and
   the `computeCreate2Address*` cheatcodes are specialized accordingly.
