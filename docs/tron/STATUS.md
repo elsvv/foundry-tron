@@ -126,8 +126,9 @@ energy (`trace.gas_used` = TVM energy на tron) и добавляет bandwidth
 Точно для нашего broadcast-пути (билдер НЕ ставит `ref_block_num`; чужие кошельки
 могут отличаться на пару байт). EVM-вывод gas-report — БАЙТ-В-БАЙТ без изменений
 (гейт is_tron; JSON-поля — `Option` + `#[serde(default, skip_serializing_if)]`).
-Deployment energy = 0 локально (create-frame `gas_used` currently 0), deployment
-bandwidth точен из initcode. Тесты: оффлайн-юниты оценщика против committed-фикстур —
+Deployment energy = метеринг create-фрейма (Counter в `setUp` — depth>1 create —
+даёт **101191**; I7-фикс пишет `contract_info.gas` до depth-guard'а, раньше guard ронял
+его в 0), deployment bandwidth точен из initcode. Тесты: оффлайн-юниты оценщика против committed-фикстур —
 mainnet trigger → **345**, Nile create → **853** (точные значения, без допусков);
 CLI `tron_gas_report_energy_and_bandwidth` (гейт: tron-solc в кэше) —
 детерминированные bandwidth-константы `increment()` → 280, `setNumber(uint256)` → 314;

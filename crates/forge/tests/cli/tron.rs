@@ -366,10 +366,10 @@ contract CounterTest is Test {
         // Table: the deployment row is relabeled to "Deployment Energy" and gains a "Deployment
         // Bandwidth" cell (853 bytes for the 555-byte Counter init code), and each function gains a
         // "Bandwidth {Min,Avg,Median,Max}" block. Energy matches the plan-E golden (read `number()`
-        // 414, write `setNumber`/`increment` ~20438). Deployment Energy is 0 because the local Tron
-        // model does not meter create-frame energy (a pre-existing property of `trace.gas_used` for
-        // creates, unrelated to this report); deployment bandwidth is still exact from the init
-        // code.
+        // 414, write `setNumber`/`increment` ~20438). Deployment Energy is 101191: `setUp`'s
+        // `new Counter()` is a depth>1 create, so the create frame's metered TVM energy is now
+        // recorded by the I7 pre-guard write (before, the top-level depth guard dropped it and the
+        // row showed 0); deployment bandwidth is exact from the init code.
         cmd.forge_fuse().args(["test", "--gas-report"]).assert_success().stdout_eq(str![[r#"
 No files changed, compilation skipped
 
@@ -383,7 +383,7 @@ Suite result: ok. 2 passed; 0 failed; 0 skipped; [ELAPSED]
 +=========================================================================================================================================================================+
 | Deployment Energy                | Deployment Size | Deployment Bandwidth |        |       |         |               |               |                  |               |
 |----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
-|                                0 |             555 |                  853 |        |       |         |               |               |                  |               |
+|                           101191 |             555 |                  853 |        |       |         |               |               |                  |               |
 |----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
 |                                  |                 |                      |        |       |         |               |               |                  |               |
 |----------------------------------+-----------------+----------------------+--------+-------+---------+---------------+---------------+------------------+---------------|
@@ -406,7 +406,105 @@ Ran 1 test suite [ELAPSED]: 2 tests passed, 0 failed, 0 skipped (2 total tests)
         // `skip_serializing_if` so EVM `--gas-report --json` output is unaffected.
         cmd.forge_fuse().args(["test", "--gas-report", "--json"]).assert_success().stdout_eq(
             str![[r#"
-[{"contract":"src/Counter.sol:Counter","deployment":{"gas":0,"size":555,"bandwidth":853},"functions":{"increment()":{"calls":1,"min":20414,"mean":20414,"median":20414,"max":20414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"number()":{"calls":2,"min":414,"mean":414,"median":414,"max":414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"setNumber(uint256)":{"calls":1,"min":20438,"mean":20438,"median":20438,"max":20438,"bandwidth":{"min":314,"mean":314,"median":314,"max":314}}}}]
+[{"contract":"src/Counter.sol:Counter","deployment":{"gas":101191,"size":555,"bandwidth":853},"functions":{"increment()":{"calls":1,"min":20414,"mean":20414,"median":20414,"max":20414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"number()":{"calls":2,"min":414,"mean":414,"median":414,"max":414,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}},"setNumber(uint256)":{"calls":1,"min":20438,"mean":20438,"median":20438,"max":20438,"bandwidth":{"min":314,"mean":314,"median":314,"max":314}}}}]
+
+
+"#]],
+        );
+    }
+);
+
+// Offline regression for the I7 "record deployment energy for nested creates" fix. A `Factory`
+// deploys a `Child` from inside a contract method (`new Child()` at depth>1), which the EVM gas
+// report pins to 0 (issue #9300) but the Tron path must meter: the fix records `contract_info.gas`
+// before the top-level depth guard, so `Child`'s **Deployment Energy** is the real create-frame
+// TVM energy, not 0. Deterministic (non-fuzz, pinned tron-solc 0.8.28), so the value is snapshot-
+// stable; gated on the cached native compiler and skipped cleanly when absent.
+forgetest_init!(
+    #[expect(clippy::disallowed_macros)]
+    tron_gas_report_nested_create_deployment_energy,
+    |prj, cmd| {
+        if !tron_solc_cached() {
+            eprintln!(
+                "skipped tron_gas_report_nested_create_deployment_energy: native tron-solc is not cached at ~/.foundry-tron/solc; set up the pinned binary (or TRON_SOLC_DOWNLOAD=1) to run this offline compile test"
+            );
+            return;
+        }
+
+        prj.update_config(|config| {
+            config.networks = NetworkConfigs::with_tron();
+            // Clear the harness-pinned solc (0.8.35, no native tron build); the `^0.8.13` pragma is
+            // satisfied by the resolver's pinned default tron-solc 0.8.28.
+            config.solc = None;
+            config.gas_reports = vec!["*".to_string()];
+            config.gas_reports_ignore = vec![];
+        });
+
+        // A factory that deploys `Child` from inside a method: the `new Child()` create runs at
+        // depth>1, the case the I7 fix is about. Own `^0.8.13` pragma so the harness does not
+        // inject `=SOLC_VERSION` (0.8.35), which has no native tron-solc build.
+        prj.add_source(
+            "Factory.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+contract Child {
+    uint256 public value;
+
+    function setValue(uint256 newValue) public {
+        value = newValue;
+    }
+}
+
+contract Factory {
+    Child public last;
+
+    function make() public returns (address) {
+        last = new Child();
+        return address(last);
+    }
+}
+"#,
+        );
+
+        prj.add_test(
+            "Factory.t.sol",
+            r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+import {Test} from "forge-std/Test.sol";
+import {Factory, Child} from "../src/Factory.sol";
+
+contract FactoryTest is Test {
+    Factory public factory;
+
+    function setUp() public {
+        factory = new Factory();
+    }
+
+    function test_make() public {
+        address child = factory.make();
+        assertTrue(child != address(0));
+        // Touch the child so the trace decoder resolves its address to `Child`, which is what
+        // makes the runtime-deployed child appear as its own row in the gas report.
+        Child(child).setValue(42);
+        assertEq(Child(child).value(), 42);
+    }
+}
+"#,
+        );
+
+        // Warm the build cache so the `--gas-report` snapshot stays focused on the report.
+        cmd.forge_fuse().args(["build"]).assert_success();
+
+        // The `Child` row carries a non-zero **Deployment Energy** even though its `new Child()`
+        // runs at depth>1 (a true factory create, depth 3) — the exact behavior the fix restores
+        // (the EVM report pins depth>1 creates to 0). JSON keeps `deployment.gas` (= energy).
+        cmd.forge_fuse().args(["test", "--gas-report", "--json"]).assert_success().stdout_eq(
+            str![[r#"
+[{"contract":"src/Factory.sol:Child","deployment":{"gas":68961,"size":394,"bandwidth":690},"functions":{"setValue(uint256)":{"calls":1,"min":20460,"mean":20460,"median":20460,"max":20460,"bandwidth":{"min":314,"mean":314,"median":314,"max":314}},"value()":{"calls":1,"min":392,"mean":392,"median":392,"max":392,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}}}},{"contract":"src/Factory.sol:Factory","deployment":{"gas":196282,"size":1030,"bandwidth":1328},"functions":{"make()":{"calls":1,"min":121750,"mean":121750,"median":121750,"max":121750,"bandwidth":{"min":280,"mean":280,"median":280,"max":280}}}}]
 
 
 "#]],
