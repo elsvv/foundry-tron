@@ -142,6 +142,12 @@ impl GasReport {
                     tron.consume_user_resource_percent,
                     &tron.opts,
                 ));
+                // On Tron, record deployment energy here — before the top-level guard — so a
+                // nested create (a factory's `new Child()`, depth>1) reports its energy instead
+                // of 0. The EVM path records create gas only for top-level creates, after the
+                // guard (see `gas_report_size_for_nested_create` / issue #9300, which pins
+                // depth>1 EVM creates to 0); Tron-gating this write keeps EVM reports identical.
+                contract_info.gas = trace.gas_used;
             }
         }
 
