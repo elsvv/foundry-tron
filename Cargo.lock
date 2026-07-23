@@ -5720,6 +5720,7 @@ dependencies = [
  "foundry-fork-db",
  "foundry-test-utils",
  "foundry-tron-primitives",
+ "foundry-tron-provider",
  "futures",
  "itertools 0.15.0",
  "op-alloy-consensus",

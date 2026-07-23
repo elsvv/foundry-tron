@@ -71,6 +71,61 @@ pub struct ConstantResult {
     pub success: bool,
 }
 
+/// Governance chain parameters read from `/wallet/getchainparameters`. These are
+/// the live economics — energy price, fee-limit ceiling, bandwidth price, memo
+/// fee — and the TIP-491 dynamic-energy knobs the estimate loop (`cast estimate`,
+/// fee-limit validation, the gas-report penalty model) depends on. The node
+/// returns a `chainParameter` array of `{key, value}` entries; a parameter left
+/// at its protobuf default is *omitted* from the array, so a missing key reads as
+/// the field's [`Default`] value (which is that live default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TronChainParams {
+    /// `getEnergyFee`: SUN burned per energy unit. This is what BASEFEE returns on
+    /// Tron and the price used to convert an energy estimate to burned TRX.
+    pub energy_fee_sun: u64,
+    /// `getMaxFeeLimit`: the ceiling the node accepts for a transaction's
+    /// `fee_limit`; a higher `fee_limit` is rejected outright.
+    pub max_fee_limit_sun: u64,
+    /// `getTransactionFee`: bandwidth price in SUN per byte.
+    pub transaction_fee_sun: u64,
+    /// `getMemoFee`: SUN charged for a transaction that carries a memo.
+    pub memo_fee_sun: u64,
+    /// `getDynamicEnergyThreshold`: TIP-491 per-contract energy threshold above
+    /// which a maintenance cycle raises the contract's energy factor.
+    pub dynamic_threshold: u64,
+    /// `getDynamicEnergyIncreaseFactor`: TIP-491 per-cycle increase factor
+    /// (precision 10000, i.e. 2000 = +20%).
+    pub dynamic_increase_factor: u32,
+    /// `getDynamicEnergyMaxFactor`: TIP-491 maximum energy factor (precision
+    /// 10000, i.e. 34000 = 3.4, so up to 4.4x total charged energy).
+    pub dynamic_max_factor: u32,
+    /// `getAllowTvmOsaka`: whether the node runs the Osaka TVM upgrade (0/1). The
+    /// local energy/precompile model is pre-Osaka, so a `true` here means the
+    /// local simulation may diverge from the node.
+    pub allow_tvm_osaka: bool,
+}
+
+impl Default for TronChainParams {
+    /// Live mainnet values, probed 2026-07-23 via `api.trongrid.io`
+    /// `/wallet/getchainparameters`. These are the offline defaults used when the
+    /// node cannot be reached (best-effort fetch) and the compile-time baseline
+    /// the estimate loop falls back to. Governance can move any of them; the live
+    /// staleness sensor (`I5` live-gated test / tron-live CI) prints a diff when
+    /// the node no longer matches.
+    fn default() -> Self {
+        Self {
+            energy_fee_sun: 100,
+            max_fee_limit_sun: 15_000_000_000,
+            transaction_fee_sun: 1_000,
+            memo_fee_sun: 1_000_000,
+            dynamic_threshold: 5_000_000_000,
+            dynamic_increase_factor: 2_000,
+            dynamic_max_factor: 34_000,
+            allow_tvm_osaka: false,
+        }
+    }
+}
+
 pub struct TronProvider {
     base_url: String,
     api_key: Option<String>,
@@ -198,6 +253,16 @@ impl TronProvider {
         });
         let v: serde_json::Value = self.post_json("/wallet/triggerconstantcontract", body).await?;
         parse_constant_result(&v)
+    }
+
+    /// Fetches the node's governance chain parameters (`/wallet/getchainparameters`).
+    /// Any parameter the node left at its protobuf default is omitted from the
+    /// response and reads as the corresponding [`TronChainParams`] default, so the
+    /// returned struct always carries a usable value for every field.
+    pub async fn get_chain_parameters(&self) -> Result<TronChainParams, TronError> {
+        let v: serde_json::Value =
+            self.post_json("/wallet/getchainparameters", serde_json::json!({})).await?;
+        Ok(parse_chain_parameters(&v))
     }
 
     /// Broadcasts a signed transaction via `/wallet/broadcasthex`. On rejection
@@ -586,6 +651,50 @@ pub(crate) fn parse_constant_result(v: &serde_json::Value) -> Result<ConstantRes
     })
 }
 
+/// Parses a `/wallet/getchainparameters` response into [`TronChainParams`],
+/// starting from the live defaults and overriding each field whose `key` is
+/// present in the `chainParameter` array. A key the node omits (its value equals
+/// the protobuf default) leaves the field at its default, which is that same live
+/// value.
+pub(crate) fn parse_chain_parameters(v: &serde_json::Value) -> TronChainParams {
+    let mut params = TronChainParams::default();
+    let Some(entries) = v.get("chainParameter").and_then(|c| c.as_array()) else {
+        return params;
+    };
+    let get = |key: &str| -> Option<i64> {
+        entries
+            .iter()
+            .find(|e| e.get("key").and_then(|k| k.as_str()) == Some(key))
+            .and_then(|e| e.get("value"))
+            .and_then(|val| val.as_i64())
+    };
+    if let Some(x) = get("getEnergyFee") {
+        params.energy_fee_sun = x as u64;
+    }
+    if let Some(x) = get("getMaxFeeLimit") {
+        params.max_fee_limit_sun = x as u64;
+    }
+    if let Some(x) = get("getTransactionFee") {
+        params.transaction_fee_sun = x as u64;
+    }
+    if let Some(x) = get("getMemoFee") {
+        params.memo_fee_sun = x as u64;
+    }
+    if let Some(x) = get("getDynamicEnergyThreshold") {
+        params.dynamic_threshold = x as u64;
+    }
+    if let Some(x) = get("getDynamicEnergyIncreaseFactor") {
+        params.dynamic_increase_factor = x as u32;
+    }
+    if let Some(x) = get("getDynamicEnergyMaxFactor") {
+        params.dynamic_max_factor = x as u32;
+    }
+    // Osaka is omitted (protobuf default 0) until governance activates it; a
+    // present, non-zero value flips it on.
+    params.allow_tvm_osaka = get("getAllowTvmOsaka").unwrap_or(0) != 0;
+    params
+}
+
 /// Parses a `/wallet/broadcasthex` response. `result == true` is success;
 /// otherwise the node returns a `code` and a hex-encoded `message` which is
 /// decoded back to its UTF-8 form (falling back to the raw string).
@@ -790,6 +899,73 @@ mod tests {
         assert!(cr.success);
         assert_eq!(cr.result.len(), 32);
         assert!(alloy_primitives::U256::from_be_slice(&cr.result) > alloy_primitives::U256::ZERO);
+    }
+
+    /// The chain-parameters parser maps the real mainnet `getchainparameters`
+    /// response onto every `TronChainParams` field. Fixture: the verbatim mainnet
+    /// reply captured 2026-07-23 (all ~75 governance keys), so the parser is
+    /// proven to find its keys among the full set the node returns.
+    #[test]
+    fn parses_chain_parameters_mainnet_fixture() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/mainnet_getchainparameters.json"))
+                .unwrap();
+        let p = parse_chain_parameters(&v);
+        assert_eq!(p.energy_fee_sun, 100, "getEnergyFee");
+        assert_eq!(p.max_fee_limit_sun, 15_000_000_000, "getMaxFeeLimit");
+        assert_eq!(p.transaction_fee_sun, 1_000, "getTransactionFee (bandwidth sun/byte)");
+        assert_eq!(p.memo_fee_sun, 1_000_000, "getMemoFee");
+        assert_eq!(p.dynamic_threshold, 5_000_000_000, "getDynamicEnergyThreshold");
+        assert_eq!(p.dynamic_increase_factor, 2_000, "getDynamicEnergyIncreaseFactor");
+        assert_eq!(p.dynamic_max_factor, 34_000, "getDynamicEnergyMaxFactor");
+        // getAllowTvmOsaka is absent from the mainnet response (protobuf default),
+        // so it reads as pre-Osaka.
+        assert!(!p.allow_tvm_osaka, "getAllowTvmOsaka is absent => pre-Osaka");
+    }
+
+    /// A missing key keeps the field at its live default; the whole parser falls
+    /// back to defaults when the `chainParameter` array is absent.
+    #[test]
+    fn chain_parameters_default_on_missing_keys() {
+        // Empty body => every field is the offline default.
+        assert_eq!(parse_chain_parameters(&serde_json::json!({})), TronChainParams::default());
+        // Only getEnergyFee present (governance moved it to 210) and Osaka on: the
+        // named keys change, all others stay at the default.
+        let v = serde_json::json!({
+            "chainParameter": [
+                { "key": "getEnergyFee", "value": 210 },
+                { "key": "getAllowTvmOsaka", "value": 1 },
+            ]
+        });
+        let p = parse_chain_parameters(&v);
+        assert_eq!(p.energy_fee_sun, 210, "present key overrides the default");
+        assert!(p.allow_tvm_osaka, "present, non-zero Osaka flips it on");
+        assert_eq!(p.max_fee_limit_sun, 15_000_000_000, "absent key keeps the default");
+        assert_eq!(p.dynamic_max_factor, 34_000, "absent key keeps the default");
+    }
+
+    /// Live (mainnet, read-only) staleness sensor for the chain-parameter
+    /// constants: the fetched values are compared against the plan's 2026-07
+    /// snapshot (`TronChainParams::default()`) and the diff is PRINTED, not
+    /// asserted equal, so the tron-live CI surfaces a governance drift without a
+    /// hard failure. `getEnergyFee` is additionally asserted `> 0` (a sanity floor
+    /// the estimate loop relies on).
+    #[tokio::test]
+    async fn live_chain_parameters_match_snapshot_on_mainnet() {
+        if std::env::var("TRON_LIVE").is_err() {
+            eprintln!("skipped: set TRON_LIVE=1 to run live mainnet read-only tests");
+            return;
+        }
+        let p = TronProvider::new("https://api.trongrid.io").unwrap();
+        let live = p.get_chain_parameters().await.unwrap();
+        let snap = TronChainParams::default();
+        if live != snap {
+            eprintln!(
+                "chain-parameter drift vs 2026-07 snapshot:\n live: {live:?}\n snap: {snap:?}"
+            );
+        }
+        assert!(live.energy_fee_sun > 0, "getEnergyFee must be positive");
+        assert!(live.max_fee_limit_sun > 0, "getMaxFeeLimit must be positive");
     }
 
     #[test]

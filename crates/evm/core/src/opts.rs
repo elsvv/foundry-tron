@@ -212,6 +212,15 @@ impl EvmOpts {
             "creating fork environment"
         );
 
+        // Best-effort probe of the Tron node's live chain parameters, run before the
+        // fork env (which carries the non-`Send` generic `SPEC`) is built so nothing
+        // generic is held across its await. Warns only; never fails the fork setup.
+        if self.networks.is_tron()
+            && let Some(fork_url) = self.fork_url.as_deref()
+        {
+            maybe_warn_tron_chain_params(fork_url).await;
+        }
+
         let bn = match self.fork_block_number {
             Some(bn) => BlockNumberOrTag::Number(bn),
             None => BlockNumberOrTag::Latest,
@@ -271,8 +280,9 @@ impl EvmOpts {
 
         // Tron's BASEFEE returns `getEnergyFee()` (SUN per energy), not the ethereum
         // baseFee the `/jsonrpc` block header carries. Overwrite the header value with
-        // the faithful energy price so BASEFEE stays correct on a fork. (I5 will swap
-        // the constant for the node's live `getEnergyFee`.)
+        // the faithful energy price so BASEFEE stays correct on a fork. The local
+        // model keeps the compile-time constant for determinism; the best-effort
+        // chain-parameter probe above only *warns* when the node has drifted.
         if self.networks.is_tron() {
             evm_env.block_env.set_basefee(TRON_ENERGY_FEE_SUN);
         }
@@ -498,6 +508,54 @@ async fn option_try_or_else<T, E>(
     f: impl AsyncFnOnce() -> Result<T, E>,
 ) -> Result<T, E> {
     if let Some(value) = option { Ok(value) } else { f().await }
+}
+
+/// Environment variable carrying the TronGrid API key, forwarded as the
+/// `TRON-PRO-API-KEY` header on the best-effort wallet probe.
+const TRON_API_KEY_ENV: &str = "TRON_PRO_API_KEY";
+
+/// Best-effort probe of a Tron fork node's live governance chain parameters,
+/// emitting a warning (never an error) when they have drifted from the local
+/// model's assumptions:
+///
+/// - the node's `getEnergyFee` no longer matches the compile-time [`TRON_ENERGY_FEE_SUN`], so the
+///   local BASEFEE and every energy→TRX cost the simulation reports are stale;
+/// - the node runs the Osaka TVM (`getAllowTvmOsaka`), which the local pre-Osaka precompile/energy
+///   model does not yet mirror.
+///
+/// The wallet base is the fork's JSON-RPC URL with its `/jsonrpc` read endpoint
+/// swapped for the `/wallet` broadcast host (which serves `getchainparameters`);
+/// a URL without that suffix, an unreachable node, or any network error is
+/// silently ignored so a fork run never fails on this diagnostic.
+async fn maybe_warn_tron_chain_params(fork_url: &str) {
+    let Some(base) = fork_url.trim_end_matches('/').strip_suffix("/jsonrpc") else {
+        return;
+    };
+    let Ok(mut provider) = foundry_tron_provider::TronProvider::new(base) else {
+        return;
+    };
+    if let Ok(key) = std::env::var(TRON_API_KEY_ENV)
+        && !key.is_empty()
+    {
+        provider = provider.with_api_key(key);
+    }
+    let Ok(params) = provider.get_chain_parameters().await else {
+        return;
+    };
+    if params.energy_fee_sun != TRON_ENERGY_FEE_SUN {
+        let _ = foundry_common::sh_warn!(
+            "tron fork: node energy price is {} SUN but the local model uses {} SUN; \
+             the reported BASEFEE and energy→TRX costs may be stale",
+            params.energy_fee_sun,
+            TRON_ENERGY_FEE_SUN,
+        );
+    }
+    if params.allow_tvm_osaka {
+        let _ = foundry_common::sh_warn!(
+            "tron fork: node runs the Osaka TVM; the local precompile/energy model is \
+             pre-Osaka and may diverge from the node",
+        );
+    }
 }
 
 #[cfg(test)]

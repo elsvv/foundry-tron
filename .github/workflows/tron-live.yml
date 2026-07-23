@@ -49,6 +49,11 @@ jobs:
       - name: Live mainnet fork reads (keyless, read-only)
         shell: bash
         run: cargo nextest run --locked -p forge -E 'test(tron_mainnet_fork_reads_usdt)'
+      # Keyless, read-only mainnet staleness sensor: prints a diff when governance
+      # has moved a chain parameter away from the plan's 2026-07 snapshot.
+      - name: Live chain-parameter snapshot (keyless, read-only)
+        shell: bash
+        run: cargo nextest run --locked -p foundry-tron-provider -E 'test(live_chain_parameters_match_snapshot_on_mainnet)'
 
   # Full Nile golden set. Deploys fresh contracts and spends test TRX on every run,
   # so it is manual-only (`workflow_dispatch`) and never on the weekly cron.
