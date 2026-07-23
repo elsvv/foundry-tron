@@ -3,9 +3,13 @@
 //! Source: `https://tronprotocol.github.io/solc-bin/{platform}/list.json`,
 //! platform ∈ {`linux-amd64`, `macosx-amd64`, `windows-amd64`}. The
 //! `0.8.25`–`0.8.27` pins were fetched 2026-07-12; the `0.8.23` / `0.8.24` pins
-//! were fetched 2026-07-16. The list is a checksum table only (no download
-//! URLs); the binaries themselves come from the GitHub releases of
-//! `tronprotocol/solidity` (tag `tv_{version}`).
+//! were fetched 2026-07-16; the `0.8.28` pins were fetched 2026-07-23. The list
+//! is a checksum table only (no download URLs); the binaries themselves come
+//! from the GitHub releases of `tronprotocol/solidity` (tag `tv_{version}`).
+//!
+//! Versions released after this toolchain shipped are not pinned here; they are
+//! resolved at runtime from the same live `list.json` (see `resolve_via_list`),
+//! sha256-verified against that list's own checksum.
 //!
 //! macOS ARM is served by the universal fat `solc-macos` binary, whose
 //! checksum lives under the `macosx-amd64` list. There is no native Linux ARM
@@ -44,7 +48,8 @@ pub(crate) struct LongVersion {
 /// Embedded long-version table for the supported tron-solc versions.
 ///
 /// Source: `list.json` `builds[].longVersion` (0.8.25/0.8.26/0.8.27 fetched
-/// 2026-07-14; 0.8.23/0.8.24 fetched 2026-07-16). The 0.8.25 entry is
+/// 2026-07-14; 0.8.23/0.8.24 fetched 2026-07-16; 0.8.28 fetched 2026-07-23).
+/// The 0.8.25 entry is
 /// additionally confirmed live: TronScan stores
 /// `compiler="tron_v0.8.25+commit.77bd169f"` for the verified mainnet contract
 /// `TMv7hAfswe2EvXG4nUeNFGEgNWE8Joedtu`.
@@ -54,6 +59,7 @@ pub(crate) const LONG_VERSIONS: &[LongVersion] = &[
     LongVersion { version: "0.8.25", long_version: "0.8.25+commit.77bd169f" },
     LongVersion { version: "0.8.26", long_version: "0.8.26+commit.733b4d28" },
     LongVersion { version: "0.8.27", long_version: "0.8.27+commit.19164bed" },
+    LongVersion { version: "0.8.28", long_version: "0.8.28+commit.9c4253d2" },
 ];
 
 /// Embedded checksum table for the supported tron-solc versions and platforms.
@@ -84,6 +90,11 @@ pub(crate) const PINS: &[Pin] = &[
         platform: "linux-amd64",
         sha256: "7a3dfc3d987bbe447c0eba89e5fd89a1fc053e8629799e167810367196a3281e",
     },
+    Pin {
+        version: "0.8.28",
+        platform: "linux-amd64",
+        sha256: "0eba121b08e9fbc1019e71bb6d36467a7f653929af9f51a793a17688d859f856",
+    },
     // macosx-amd64 (solc-macos, universal fat binary covering arm64 + x86_64).
     Pin {
         version: "0.8.23",
@@ -110,6 +121,11 @@ pub(crate) const PINS: &[Pin] = &[
         platform: "macosx-amd64",
         sha256: "9e369b442b3a835320cf1450a21ce5e8acf0d319a50d10a10a2001aac7ce17aa",
     },
+    Pin {
+        version: "0.8.28",
+        platform: "macosx-amd64",
+        sha256: "e492e14fd3da07e65830c1189758ac34f8a3f06c3f59df42f5c5f6a744e0dbd2",
+    },
     // windows-amd64 (solc-windows.exe).
     Pin {
         version: "0.8.23",
@@ -135,5 +151,10 @@ pub(crate) const PINS: &[Pin] = &[
         version: "0.8.27",
         platform: "windows-amd64",
         sha256: "6c387a01ac81ad044c0f37816c059828c1080cc38f5882fd1f08d58f990ac7e0",
+    },
+    Pin {
+        version: "0.8.28",
+        platform: "windows-amd64",
+        sha256: "000b24310f0b849d886b280908fde4c2dd63658bca3ffb4909ac7d9c6ab647e9",
     },
 ];
