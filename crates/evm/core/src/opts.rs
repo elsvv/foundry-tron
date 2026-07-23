@@ -566,8 +566,7 @@ mod tests {
 
     #[test]
     fn local_tron_env_defaults_chain_id_to_mainnet() {
-        let mut opts = EvmOpts::default();
-        opts.networks = NetworkConfigs::with_tron();
+        let opts = EvmOpts { networks: NetworkConfigs::with_tron(), ..Default::default() };
         let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
         assert_eq!(env.cfg_env.chain_id, TRON_MAINNET_CHAIN_ID);
     }
@@ -581,8 +580,7 @@ mod tests {
 
     #[test]
     fn local_tron_env_explicit_chain_id_wins() {
-        let mut opts = EvmOpts::default();
-        opts.networks = NetworkConfigs::with_tron();
+        let mut opts = EvmOpts { networks: NetworkConfigs::with_tron(), ..Default::default() };
         opts.env.chain_id = Some(foundry_evm_networks::tron::TRON_NILE_CHAIN_ID);
         let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
         assert_eq!(env.cfg_env.chain_id, foundry_evm_networks::tron::TRON_NILE_CHAIN_ID);
@@ -590,8 +588,7 @@ mod tests {
 
     #[test]
     fn local_tron_env_defaults_basefee_to_energy_fee() {
-        let mut opts = EvmOpts::default();
-        opts.networks = NetworkConfigs::with_tron();
+        let opts = EvmOpts { networks: NetworkConfigs::with_tron(), ..Default::default() };
         let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
         // BASEFEE reads block.basefee; the faithful getEnergyFee()=100 is seeded here.
         assert_eq!(env.block_env.basefee, TRON_ENERGY_FEE_SUN);
@@ -599,8 +596,7 @@ mod tests {
 
     #[test]
     fn local_tron_env_explicit_basefee_wins() {
-        let mut opts = EvmOpts::default();
-        opts.networks = NetworkConfigs::with_tron();
+        let mut opts = EvmOpts { networks: NetworkConfigs::with_tron(), ..Default::default() };
         opts.env.block_base_fee_per_gas = 7;
         let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
         assert_eq!(env.block_env.basefee, 7);
