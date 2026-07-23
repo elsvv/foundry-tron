@@ -1,6 +1,7 @@
 use crate::{
     EvmEnv, FoundryBlock, FoundryTransaction,
     constants::DEFAULT_CREATE2_DEPLOYER,
+    evm::tron::TRON_ENERGY_FEE_SUN,
     fork::CreateFork,
     utils::{apply_chain_and_block_specific_env_changes, block_env_from_header},
 };
@@ -261,12 +262,20 @@ impl EvmOpts {
         };
 
         let block_number = block.header().number();
-        let mut evm_env = EvmEnv {
+        let mut evm_env: EvmEnv<SPEC, BLOCK> = EvmEnv {
             cfg_env: self.cfg_env(chain_id),
             block_env: block_env_from_header(block.header()),
         };
 
         apply_chain_and_block_specific_env_changes::<N, _, _>(&mut evm_env, &block, self.networks);
+
+        // Tron's BASEFEE returns `getEnergyFee()` (SUN per energy), not the ethereum
+        // baseFee the `/jsonrpc` block header carries. Overwrite the header value with
+        // the faithful energy price so BASEFEE stays correct on a fork. (I5 will swap
+        // the constant for the node's live `getEnergyFee`.)
+        if self.networks.is_tron() {
+            evm_env.block_env.set_basefee(TRON_ENERGY_FEE_SUN);
+        }
 
         Ok((evm_env, block_number))
     }
@@ -291,7 +300,16 @@ impl EvmOpts {
         block_env.set_timestamp(self.env.block_timestamp);
         block_env.set_difficulty(U256::from(self.env.block_difficulty));
         block_env.set_prevrandao(Some(self.env.block_prevrandao));
-        block_env.set_basefee(self.env.block_base_fee_per_gas);
+        // Tron's BASEFEE opcode returns `getEnergyFee()` in SUN (the block base fee),
+        // not the ethereum base fee. Seed the faithful default so BASEFEE reads 100
+        // unless the user set an explicit base fee (which `vm.fee` can still override
+        // at runtime). Non-tron networks keep the configured base fee verbatim.
+        let basefee = if self.networks.is_tron() && self.env.block_base_fee_per_gas == 0 {
+            TRON_ENERGY_FEE_SUN
+        } else {
+            self.env.block_base_fee_per_gas
+        };
+        block_env.set_basefee(basefee);
         block_env.set_gas_limit(self.gas_limit());
         EvmEnv::new(cfg_env, block_env)
     }
@@ -510,6 +528,31 @@ mod tests {
         opts.env.chain_id = Some(foundry_evm_networks::tron::TRON_NILE_CHAIN_ID);
         let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
         assert_eq!(env.cfg_env.chain_id, foundry_evm_networks::tron::TRON_NILE_CHAIN_ID);
+    }
+
+    #[test]
+    fn local_tron_env_defaults_basefee_to_energy_fee() {
+        let mut opts = EvmOpts::default();
+        opts.networks = NetworkConfigs::with_tron();
+        let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
+        // BASEFEE reads block.basefee; the faithful getEnergyFee()=100 is seeded here.
+        assert_eq!(env.block_env.basefee, TRON_ENERGY_FEE_SUN);
+    }
+
+    #[test]
+    fn local_tron_env_explicit_basefee_wins() {
+        let mut opts = EvmOpts::default();
+        opts.networks = NetworkConfigs::with_tron();
+        opts.env.block_base_fee_per_gas = 7;
+        let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
+        assert_eq!(env.block_env.basefee, 7);
+    }
+
+    #[test]
+    fn local_non_tron_env_keeps_configured_basefee() {
+        let opts = EvmOpts::default();
+        let env: EvmEnv<SpecId, BlockEnv> = opts.local_evm_env();
+        assert_eq!(env.block_env.basefee, opts.env.block_base_fee_per_gas);
     }
 
     #[tokio::test(flavor = "multi_thread")]

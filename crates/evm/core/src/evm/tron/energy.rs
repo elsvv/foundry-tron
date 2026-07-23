@@ -139,6 +139,11 @@ pub(super) fn apply_tron_energy<DB: Database, I>(
     instructions.insert_gas(opcode::MLOAD, TRON_MEMORY_OP_ENERGY);
     instructions.insert_gas(opcode::MSTORE, TRON_MEMORY_OP_ENERGY);
     instructions.insert_gas(opcode::MSTORE8, TRON_MEMORY_OP_ENERGY);
+    // BASEFEE keeps the stock revm instruction (reads `block.basefee`) rather than
+    // a Tron-specific opcode override, so its static tier is no longer set by
+    // `insert_instruction`. The FRONTIER `gas_table` already carries BASE=2 for it;
+    // re-assert here so the tier is pinned regardless of any future table drift.
+    instructions.insert_gas(opcode::BASEFEE, 2);
 
     // 2. Dynamic gas: FRONTIER GasParams + the Tron-specific overrides.
     inner.ctx.cfg.set_gas_params(tron_gas_params());
@@ -266,6 +271,21 @@ mod tests {
             EthEvmFactory::default().create_evm(CacheDB::<EmptyDB>::default(), cancun_env());
         let out = evm.transact_raw(create_tx(code.to_vec())).unwrap();
         assert!(out.result.is_success(), "eth exec must succeed: {:?}", out.result);
+        U256::from_be_slice(out.result.output().unwrap())
+    }
+
+    /// Runs `code` as a creation tx on the Tron factory in an explicit env and
+    /// returns the deployed runtime bytes as a big-endian word. Used to prove the
+    /// block-op reads come from the block env (not a hardcoded constant). Disables
+    /// the base-fee check because these snippets run a zero-gas-price creation tx
+    /// against a non-zero `block.basefee`; the real forge path passes validation
+    /// with a zeroed env and only restores the true base fee inside
+    /// `initialize_interp` (see `EnvOverrides` / `Executor::build_test_env`).
+    fn tron_returned_word_in(code: &[u8], mut env: EvmEnv) -> U256 {
+        env.cfg_env.disable_base_fee = true;
+        let mut evm = TronEvmFactory.create_evm(CacheDB::<EmptyDB>::default(), env);
+        let out = evm.transact_raw(create_tx(code.to_vec())).unwrap();
+        assert!(out.result.is_success(), "tron exec must succeed: {:?}", out.result);
         U256::from_be_slice(out.result.output().unwrap())
     }
 
@@ -434,16 +454,40 @@ mod tests {
     fn basefee_returns_tron_energy_fee() {
         // 48 BASEFEE | 5f 52 MSTORE | 60 20 5f f3 RETURN 32 bytes
         let basefee = hex::decode("485f5260205ff3").unwrap();
+
+        // Tron's BASEFEE now reads `block.basefee` (stock revm), so the faithful
+        // `getEnergyFee()`=100 default is supplied by the block env, exactly as
+        // `EvmOpts::local_evm_env` seeds it for a real local Tron run. With that
+        // env, BASEFEE returns 100.
+        let mut tron_env = cancun_env();
+        tron_env.block_env.basefee = TRON_ENERGY_FEE_SUN;
         assert_eq!(
-            tron_returned_word(&basefee),
+            tron_returned_word_in(&basefee, tron_env),
             U256::from(TRON_ENERGY_FEE_SUN),
-            "Tron BASEFEE is getEnergyFee()=100"
+            "Tron BASEFEE reads the seeded getEnergyFee()=100 from the block env"
         );
-        // Ethereum returns the block base fee (0 in this env), not 100.
+
+        // It is genuinely env-driven, not a hardcoded constant: a different block
+        // basefee (what `vm.fee` sets) flows straight through.
+        let mut tron_env_7 = cancun_env();
+        tron_env_7.block_env.basefee = 7;
+        assert_eq!(
+            tron_returned_word_in(&basefee, tron_env_7),
+            U256::from(7u64),
+            "Tron BASEFEE is env-driven (vm.fee overrides it), not a constant"
+        );
+
+        // Mechanically identical to Ethereum now: with the default env's basefee 0
+        // both return 0. The Tron divergence lives in env-setup, not the opcode.
         assert_eq!(
             eth_returned_word(&basefee),
             U256::ZERO,
-            "Ethereum BASEFEE returns the block base fee"
+            "Ethereum BASEFEE returns the block base fee (0 in the default env)"
+        );
+        assert_eq!(
+            tron_returned_word(&basefee),
+            U256::ZERO,
+            "Tron BASEFEE with no seeded basefee also returns 0 (no constant override)"
         );
     }
 
