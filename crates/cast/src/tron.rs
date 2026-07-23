@@ -10,7 +10,10 @@ use alloy_ens::NameOrAddress;
 use alloy_json_abi::Function;
 use alloy_primitives::{Address, B256, U256, hex};
 use eyre::{Result, WrapErr};
-use foundry_common::abi::{encode_function_args, encode_function_args_raw, get_func};
+use foundry_common::{
+    abi::{encode_function_args, encode_function_args_raw, get_func},
+    shell,
+};
 use foundry_config::{Config, TronConfig};
 use foundry_tron_primitives::{
     address::parse as parse_tron, to_base58, to_hex41, units::format_sun_as_trx,
@@ -172,13 +175,83 @@ pub fn verify_deploy_address(local: Address, info: &TxInfo) -> Result<()> {
     }
 }
 
+/// A Tron energy/bandwidth/fee estimate for a contract call — the result
+/// `cast estimate` prints on Tron.
+#[derive(Debug, Clone, Copy)]
+pub struct TronEstimate {
+    /// Total energy the call would consume (TIP-491 penalty included).
+    pub energy_used: u64,
+    /// TIP-491 penalty portion of `energy_used` (0 when taken from
+    /// `estimateenergy`, which reports no breakdown).
+    pub energy_penalty: u64,
+    /// On-chain bandwidth, in bytes, the signed transaction would occupy.
+    pub bandwidth_bytes: u64,
+    /// Suggested `fee_limit` in SUN (energy cost + buffer, clamped to
+    /// `getMaxFeeLimit`).
+    pub suggested_fee_limit_sun: u64,
+    /// Estimated burned cost in SUN: `energy × energy_fee + bandwidth × transaction_fee`.
+    pub est_cost_sun: u64,
+}
+
+/// Prints a Tron call estimate. The estimate is the command's primary result, so
+/// it goes to stdout: a labeled table in text mode, the same fields as an object
+/// under `--json`.
+pub fn print_tron_estimate(est: &TronEstimate) -> Result<()> {
+    if shell::is_json() {
+        let obj = serde_json::json!({
+            "energy_used": est.energy_used,
+            "energy_penalty": est.energy_penalty,
+            "bandwidth_bytes": est.bandwidth_bytes,
+            "suggested_fee_limit_sun": est.suggested_fee_limit_sun,
+            "est_cost_trx": format_sun_as_trx(est.est_cost_sun),
+        });
+        sh_println!("{}", serde_json::to_string_pretty(&obj)?)?;
+    } else {
+        sh_println!("energy used:         {}", est.energy_used)?;
+        sh_println!("energy penalty:      {}", est.energy_penalty)?;
+        sh_println!("bandwidth (bytes):   {}", est.bandwidth_bytes)?;
+        sh_println!("suggested fee_limit: {} SUN", est.suggested_fee_limit_sun)?;
+        sh_println!("est. cost:           {} TRX", format_sun_as_trx(est.est_cost_sun))?;
+    }
+    Ok(())
+}
+
+/// Prints the extended TIP-491 energy/resource breakdown of a confirmed receipt
+/// to stderr (status text). Total energy is annotated with its penalty portion
+/// and base only when a penalty was charged; the caller/origin energy split and
+/// bandwidth usage print only when non-zero, so an ordinary transfer stays terse
+/// and existing penalty-free output is unchanged.
+pub fn print_tron_resource_usage(info: &TxInfo) -> Result<()> {
+    if info.energy_used > 0 {
+        if info.energy_penalty_total > 0 {
+            sh_status!(
+                "energy used: {} (penalty {}, base {})",
+                info.energy_used,
+                info.energy_penalty_total,
+                info.energy_used.saturating_sub(info.energy_penalty_total),
+            )?;
+        } else {
+            sh_status!("energy used: {}", info.energy_used)?;
+        }
+        if info.energy_usage_caller > 0 || info.origin_energy_usage > 0 {
+            sh_status!(
+                "  caller/origin: {} / {}",
+                info.energy_usage_caller,
+                info.origin_energy_usage
+            )?;
+        }
+    }
+    if info.net_usage > 0 {
+        sh_status!("bandwidth:   {} bytes", info.net_usage)?;
+    }
+    Ok(())
+}
+
 /// Prints a confirmed Tron transaction: status, energy and fee prose on stderr,
 /// the txID (machine-readable primary result) on stdout.
 pub fn print_tron_tx(txid: B256, info: &TxInfo) -> Result<()> {
     sh_status!("status:      {}", if info.success { "success" } else { "failed" })?;
-    if info.energy_used > 0 {
-        sh_status!("energy used: {}", info.energy_used)?;
-    }
+    print_tron_resource_usage(info)?;
     sh_status!("fee:         {} TRX", format_sun_as_trx(info.fee_sun))?;
     sh_status!("block:       {}", info.block_number)?;
     sh_println!("{}", hex::encode(txid))?;
@@ -191,9 +264,7 @@ pub fn print_tron_tx(txid: B256, info: &TxInfo) -> Result<()> {
 pub fn print_tron_deploy(txid: B256, addr: Address, info: &TxInfo) -> Result<()> {
     sh_status!("txID:        {}", hex::encode(txid))?;
     sh_status!("status:      {}", if info.success { "success" } else { "failed" })?;
-    if info.energy_used > 0 {
-        sh_status!("energy used: {}", info.energy_used)?;
-    }
+    print_tron_resource_usage(info)?;
     sh_status!("fee:         {} TRX", format_sun_as_trx(info.fee_sun))?;
     sh_status!("deployed to: {} ({})", to_base58(addr), to_hex41(addr))?;
     sh_println!("{}", to_base58(addr))?;
