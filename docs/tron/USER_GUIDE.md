@@ -358,10 +358,13 @@ result could diverge:
 - **COINBASE.** Locally `block.coinbase` defaults to `0x0` and is settable with
   `vm.coinbase` (env-driven, works). On live Tron it is the block's SR address in
   `0x41`-prefixed form; foundry does not override it.
-- **No-op cheatcodes.** `vm.prevrandao` / `vm.difficulty` and `vm.txGasPrice` have
-  no observable effect on Tron because the TVM hardwires DIFFICULTY/PREVRANDAO and
-  GASPRICE to `0`. Calling them is not an error; foundry prints a one-time stderr
-  warning per run so the no-op is visible rather than silent.
+- **No-op cheatcodes.** `vm.prevrandao` and `vm.txGasPrice` have no observable
+  effect on Tron because the TVM hardwires the PREVRANDAO/DIFFICULTY and GASPRICE
+  opcodes to `0`. Calling them is not an error; foundry prints a one-time stderr
+  warning per run so the no-op is visible rather than silent. `vm.difficulty` is
+  not in this group: as on any post-Merge chain it hard-errors (`use 'prevrandao'
+  instead`), because Tron runs a Cancun-based spec — so it never reaches, and
+  never prints, the no-op warning.
 - **CREATE2** uses the Tron formula:
   `address = keccak256(0x41 ‖ sender20 ‖ salt ‖ keccak256(initcode))[12..]`, and
   the `computeCreate2Address*` cheatcodes are specialized accordingly.
