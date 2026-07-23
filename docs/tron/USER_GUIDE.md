@@ -322,10 +322,16 @@ Text output (stdout is the result; `--json` emits the same fields):
 ```
 energy used:         64285
 energy penalty:      49635
-bandwidth (bytes):   345
+bandwidth (bytes):   346
 suggested fee_limit: 7714200 SUN
-est. cost:           7.71 TRX
+est. cost:           6.774500 TRX
 ```
+
+`est. cost` is `energy × getEnergyFee + bandwidth × getTransactionFee`, formatted
+to six-decimal TRX (SUN precision). Bandwidth here is `346` bytes — one more than
+the `345`-byte fixture in the section above — because the estimate serializes the
+default 1000-TRX `fee_limit` (a 5-byte varint) where the fixture carried 50 TRX (a
+4-byte varint); a different `--tron.fee-limit` shifts the byte count accordingly.
 
 The suggested `fee_limit` applies a safety buffer and is clamped to the node's
 ceiling (`getMaxFeeLimit`, 15,000 TRX):
